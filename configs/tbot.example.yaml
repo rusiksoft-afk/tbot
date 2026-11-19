@@ -1,0 +1,67 @@
+# Пример конфигурации (без секретов). Реальный файл создаётся на площадке:
+#   cp configs/tbot.example.yaml /etc/tbot/tbot.yaml
+# Значения секретов сюда не вписываются: они приходят из переменных окружения (TBOT_*)
+# или из файлов в каталоге secrets_dir (REQ-config-02, docs/runbook/telegram-token.md).
+#
+# Приоритет: переменные окружения > этот YAML > значения по умолчанию в коде.
+# Неизвестные ключи приводят к ошибке запуска: опечатка не должна «молча» работать по умолчанию.
+
+instance_name: dev
+contour: sandbox            # sandbox | paper | production
+secrets_dir: /etc/tbot/secrets
+
+# Потолки риска. Конфигурация вправе только уменьшать значения ядра (docs/tz/06 §6.3):
+# доля капитала на стратегию ≤ 0.05, дневной убыток ≤ 0.05, уровней сетки ≤ 6,
+# множитель ≤ 1.3. Попытка указать больше — ошибка запуска, а не «тихое» ограничение.
+limits:
+  max_capital_share_per_strategy: 0.05
+  max_daily_loss_share: 0.03
+  max_grid_levels: 6
+  max_grid_multiplier: 1.3
+  margin_allowed: false     # маржинальная торговля включается отдельно и с 2FA (docs/tz/06 §6.6)
+
+# Сроки хранения. Для площадки 2 vCPU / 3.8 GiB (OQ-11) минутные свечи — 12 месяцев;
+# увеличение возможно только вместе с пересмотром размеров площадки.
+retention:
+  minute_candles_months: 12
+  audit_log_days: 1095
+  backup_keep_count: 14
+
+telegram:
+  api_base: https://api.telegram.org
+  # Путь к Bot API выбирается явно: `tunnel` — через SOCKS-клиент туннеля площадки
+  # (единственный рабочий вариант для боевой ВМ, docs/research/03 §3.4), `direct` — напрямую
+  # (dev-машина, резервный узел). Автоматического выбора нет: у путей разные предупреждения
+  # в /readyz и разные метки в метриках (docs/tz/10 §10.6).
+  transport: tunnel
+  # Трансляция через локальный SOCKS-клиент туннеля (docs/runbook/telegram-egress-proxy.md).
+  # `socks5h` выбирается приложением: разрешение имени api.telegram.org обязано происходить
+  # на стороне узла B, потому что DNS площадки отдаёт недоступный адрес (docs/research/03 §3.4).
+  socks_host: 127.0.0.1
+  socks_port: 10800
+  socks_user: tgbot
+  # Пароль SOCKS — отдельный секрет: файл secrets_dir/tg_socks_password
+  tls_verify: true          # отключить нельзя (валидатор откажет загрузке)
+  egress_probe_url: https://api.ip.sb/jsonip
+
+broker:
+  production_host: invest-public-api.tbank.ru
+  sandbox_host: sandbox-invest-public-api.tbank.ru
+  ssl_tbank_verify: true    # отключить нельзя; нужен корневой сертификат НУЦ (T-709)
+  request_rate_per_second: 20   # мягкий лимит; жёсткий IP-лимит брокера 1000 запросов/мин
+
+log_level: INFO
+log_json: true
+
+# web слушает только loopback: наружу выходит только Caddy с TLS (TZ §14.5)
+web_host: 127.0.0.1
+web_port: 8080
+engine_health_port: 9101
+tgbot_health_port: 9102
+jobs_health_port: 9103
+
+# Секреты задаются переменными окружения или файлами в secrets_dir:
+#   TBOT_DB_URL=postgresql://...                или файл secrets_dir/db_url
+#   TBOT_TG_BOT_TOKEN=...                       или файл secrets_dir/tg_bot_token
+#   TBOT_TG_SOCKS_PASSWORD=...                  или файл secrets_dir/tg_socks_password
+# Для боевого контура дополнительно обязателен TBOT_CONFIRM_PRODUCTION=true.

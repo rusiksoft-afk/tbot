@@ -22,6 +22,10 @@ kek*.json
 configs/local.yaml
 configs/*.local.yaml
 configs/secrets/
+# Секреты compose-стенда: compose разрешает `./secrets/...` относительно deploy/compose.yaml,
+# поэтому каталог лежит в deploy/, а не в корне репозитория.
+deploy/secrets/
+secrets/
 
 # Данные и артефакты
 backups/
@@ -43,6 +47,8 @@ venv/
 .coverage
 coverage.xml
 htmlcov/
+# артефакты локальной установки пакета в dev-режиме (`pip install -e .`)
+*.egg-info/
 *.log
 
 # Инструменты и IDE

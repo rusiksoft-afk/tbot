@@ -1,0 +1,31 @@
+# Настройка gitleaks для CI (шаг «secret-scan» в .github/workflows/ci.yml).
+#
+# Правила открытые и объяснимые: из проверок исключаются только явные плейсхолдеры и
+# синтетические «канареечные» значения из тестов, проверяющих маскирование логов. Реальные
+# секреты (токен бота, ключи Xray, пароли, приватные ключи) должны оставаться в зоне поиска.
+
+title = "gitleaks config for tbot"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "плейсхолдеры документации и канарейки тестов"
+regexes = [
+  '''<[^>\s]{2,64}>''',
+  '''(?i)(плейсхолдер|placeholder|canary|канарей|not-a-real|dev-not-a-real|dev-only)''',
+  # Заведомо вымышленные значения из тестовых фикстур: они проверяют маскирование и контракт
+  # compose'а, но не являются секретами. Перечень открыт — новое значение добавляется вместе
+  # с тестом, который его использует.
+  '''(?i)(localParol1234567890|dbParol1234567890|dbParol|secretvalue|ci-stand-)''',
+  '''\*\*\*''',
+  '''<МАСКА>''',
+]
+regexTarget = "line"
+paths = [
+  '''tests/unit/test_logging_masking\.py''',
+  '''tests/unit/test_tgbot_transport\.py''',
+  '''tests/integration/test_web_app\.py''',
+  '''tests/contract/test_no_forbidden_references\.py''',
+  '''docs/runbook/telegram-egress-proxy\.md''',
+]

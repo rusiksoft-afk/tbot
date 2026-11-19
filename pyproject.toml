@@ -1,0 +1,133 @@
+[project]
+name = "tbot"
+version = "0.0.0"
+description = "Торговая система для брокера Т-Банк (T-Invest API): закрытый клуб, 2FA, web-консоль, Telegram-канал управления"
+requires-python = ">=3.12,<3.13"
+license = { text = "Proprietary" }
+dependencies = [
+    "fastapi>=0.115,<0.116",
+    "uvicorn[standard]>=0.32,<0.33",
+    "jinja2>=3.1,<3.2",
+    "pydantic>=2.9,<2.10",
+    "pydantic-settings>=2.6,<2.7",
+    "structlog>=24.4,<25.0",
+    "PyYAML>=6.0,<6.1",
+    "SQLAlchemy>=2.0.36,<2.1",
+    "alembic>=1.14,<1.15",
+    "psycopg[binary,pool]>=3.2,<3.3",
+    "httpx[socks]>=0.27,<0.28",
+    "cryptography>=43.0,<44.0",
+    "prometheus-client>=0.21,<0.22",
+]
+
+# Все зависимости для разработки и проверок — в dev: `make lint`/`make test`/CI ставят их
+# одними и теми же командами. Отдельного «dev-requirements.txt» нет намеренно.
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3,<8.4",
+    "pytest-cov>=6.0,<6.1",
+    "pytest-asyncio>=0.24,<0.25",
+    "ruff>=0.8,<0.9",
+    "mypy>=1.13,<1.14",
+    "types-PyYAML>=6.0,<6.1",
+    "bandit[toml]>=1.7.10,<1.8",
+    "pip-audit>=2.7,<2.8",
+]
+
+[project.entry-points."tbot.apps"]
+web = "apps.web.main:run"
+engine = "apps.engine.main:run"
+tgbot = "apps.tgbot.main:run"
+jobs = "apps.jobs.main:run"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["apps*", "packages*"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+extend-exclude = ["migrations/versions", "docs/research/raw"]
+
+[tool.ruff.lint]
+# Набор правил фиксирован как часть контракта качества (CONSTRAINTS: см. docs/tz/13).
+# Любое отключение в коде — только с комментарием `# noqa: <код> (<причина>)` и не чаще,
+# чем разрешает конвейер (см. .github/workflows/ci.yml: шаг «suppress-growth»).
+select = [
+    "E", "W", "F", "I", "UP", "B", "SIM", "C4", "RUF",
+    "S", "DTZ", "ANN", "TRY", "RET", "PTH", "ARG", "SLF", "ASYNC", "PT",
+]
+ignore = [
+    # Валидационные сообщения и тексты ошибок — на русском; длинные строки допустимы.
+    "E501",
+    # TRY003/EM101: однострочные сообщения с контекстом удобнее, чем отдельные переменные.
+    "TRY003", "EM101", "EM102",
+    # ARG002 конфликтует с контрактными сигнатурами обработчиков.
+    "ARG002",
+    # Проект русскоязычный: комментарии, сообщения и докстринги пишутся кириллицей намеренно.
+    # Правила о «похожих на латиницу» символах (RUF001–RUF003) здесь только мешают: они
+    # срабатывают на обычном русском тексте и не находят настоящих ошибок.
+    "RUF001", "RUF002", "RUF003",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "S603", "ANN001", "ANN201", "PLR2004", "B011"]
+"scripts/**" = ["S603", "S607", "ANN201"]
+"apps/*/main.py" = ["ANN401"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
+
+[tool.ruff.lint.flake8-type-checking]
+runtime-evaluated-base-classes = ["pydantic.BaseModel", "pydantic_settings.BaseSettings"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+plugins = ["pydantic.mypy"]
+warn_unreachable = true
+show_error_codes = true
+pretty = true
+mypy_path = "."
+packages = ["apps", "packages"]
+
+# Внешние пакеты без собственных описаний типов перечисляются явно: шаблонного
+# `ignore_missing_imports = true` по всем модулям в проекте быть не должно.
+[[tool.mypy.overrides]]
+module = ["t_tech.*", "prometheus_client.*"]
+ignore_missing_imports = true
+
+[tool.pydantic-mypy]
+init_forbid_extra = true
+init_typed = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "live_api: требует реального обращения в песочницу (TBOT_SANDBOX_TOKEN); в обычном прогоне исключается",
+    "e2e: Playwright против развёрнутого dev-стенда",
+    "fault: сценарии отказа и восстановления (docs/tz/13)",
+    "sandbox: только контур песочницы брокера",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["apps", "packages"]
+
+[tool.coverage.report]
+# Порог зафиксирован техзаданием (docs/tz/13). Снижать его можно только отдельным
+# согласованным решением заказчика — правка этого числа в файле намеренно попадает в ревью.
+fail_under = 80
+show_missing = true
+exclude_lines = [
+    "pragma: no cover",
+    "if __name__ == .__main__.:",
+    "raise NotImplementedError  # milestone-gated",
+]
+
+[tool.bandit]
+exclude_dirs = ["tests", "docs", "migrations"]

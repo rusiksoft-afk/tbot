@@ -1,0 +1,236 @@
+# Базовый compose-файл dev-стенда (TZ §14.2, docs/tz/02 §2.1).
+#
+# Принципы, которые здесь закреплены:
+#   * PostgreSQL не имеет исходящего трафика вообще: сеть `tbot-backend` помечена internal,
+#     порты наружу не публикуются (приёмка T-005: «egress для БД закрыт»);
+#   * секреты монтируются только в те контейнеры, которым они нужны, только read-only;
+#   * процессы работают от непривилегированного пользователя, без новых привилегий,
+#     с ограничением CPU/памяти (площадка 2 vCPU / 3.8 GiB — OQ-11);
+#   * у каждого процесса есть healthcheck, поэтому `depends_on` опирается на готовность,
+#     а не на «поспать десять секунд».
+#
+# Локальные отличия (публикация портов, каталоги dev-секретов) — в compose.override.yaml.
+
+name: tbot
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+x-runtime: &default-runtime
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  pids_limit: 256
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+  logging: *default-logging
+
+x-app-env: &app-env
+  TBOT_SECRETS_DIR: /run/secrets
+  TBOT_LOG_JSON: "true"
+
+services:
+  postgres:
+    image: postgres:16.4
+    environment:
+      POSTGRES_DB: tbot
+      POSTGRES_USER: tbot
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_password
+      # Время в базе — UTC: прикладной слой работает в UTC (TZ §2.7)
+      TZ: UTC
+      PGTZ: UTC
+    command:
+      - postgres
+      - -c
+      - config_file=/etc/postgresql/tbot.conf
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/postgres/tbot.conf:/etc/postgresql/tbot.conf:ro
+    secrets:
+      - db_password
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tbot -d tbot"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - tbot-backend
+    <<: *default-runtime
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      args:
+        APP: web
+    image: tbot-web:dev
+    environment:
+      <<: *app-env
+      TBOT_WEB_HOST: 0.0.0.0
+    # Секреты монтируются только туда, где их читают: web ходит в базу, но не знает токен бота.
+    secrets:
+      - db_url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - tbot-edge
+      - tbot-backend
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -m
+        - packages.common.health_probe
+        - --url
+        - http://127.0.0.1:8080/readyz
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    <<: *default-runtime
+
+  engine:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      args:
+        APP: engine
+    image: tbot-engine:dev
+    environment:
+      <<: *app-env
+    secrets:
+      - db_url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - tbot-backend
+      - tbot-egress
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -m
+        - packages.common.health_probe
+        - --url
+        - http://127.0.0.1:9101/readyz
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    <<: *default-runtime
+
+  tgbot:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      args:
+        APP: tgbot
+    image: tbot-tgbot:dev
+    environment:
+      <<: *app-env
+      # Туннель-клиент живёт на хосте площадки (tbot-tunnel.service), поэтому из контейнера
+      # SOCKS-адрес — шлюз docker, а не 127.0.0.1 контейнера (docs/runbook/telegram-egress-proxy.md).
+      TBOT_TELEGRAM__SOCKS_HOST: host.docker.internal
+    secrets:
+      - tg_bot_token
+      - tg_socks_password
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    networks:
+      - tbot-backend
+      - tbot-egress
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -m
+        - packages.common.health_probe
+        - --url
+        - http://127.0.0.1:9102/readyz
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 45s
+    <<: *default-runtime
+
+  jobs:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      args:
+        APP: jobs
+    image: tbot-jobs:dev
+    environment:
+      <<: *app-env
+    secrets:
+      - db_url
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - tbot-backend
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -m
+        - packages.common.health_probe
+        - --url
+        - http://127.0.0.1:9103/readyz
+      interval: 20s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    <<: *default-runtime
+
+  migrate:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile
+      args:
+        APP: web
+    image: tbot-web:dev
+    profiles: ["tools"]
+    environment:
+      <<: *app-env
+    secrets:
+      - db_url
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - tbot-backend
+    <<: *default-runtime
+
+networks:
+  tbot-backend:
+    internal: true
+  tbot-edge:
+    internal: true
+  tbot-egress:
+    # Единственная сеть с выходом наружу: брокер и туннель. БД в неё не подключена.
+    driver: bridge
+
+secrets:
+  db_password:
+    file: ./secrets/db_password
+  db_url:
+    file: ./secrets/db_url
+  tg_bot_token:
+    file: ./secrets/tg_bot_token
+  tg_socks_password:
+    file: ./secrets/tg_socks_password
+
+volumes:
+  pgdata:
