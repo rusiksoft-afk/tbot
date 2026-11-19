@@ -34,7 +34,7 @@
   - Файлы: `packages/common/clock.py`, `packages/common/ids.py`, тесты
   - Статус 2026-11-19: выполнено. Разметка бит UUIDv7 (версия в битах 76..63, вариант в 63..62)
     закреплена тестами: первый вариант с случайностью поверх поля версии давал `version == 3`.
-- [ ] **T-005** Docker/Compose dev: postgres + web + engine + tgbot + jobs, сети, healthchecks, non-root, ротация логов
+- [x] **T-005** Docker/Compose dev: postgres + web + engine + tgbot + jobs, сети, healthchecks, non-root, ротация логов
   - Приёмка: `make dev` → `/readyz` 200 у web и engine; egress для БД закрыт
   - Проверка: `docker compose config`, ручной/CI-прогон `compose up && curl`
   - Файлы: `deploy/compose.yaml`, `deploy/compose.override.yaml`, Dockerfile'ы
@@ -59,8 +59,17 @@
     хостового пути короткой формы делает пустой каталог — postgres падал с «input in flex
     scanner failed at file /etc/postgresql/tbot.conf line 1».
     Каждое закрыто контрактным тестом (`tests/integration/test_compose_contract.py`,
-    `tests/contract/test_ci_workflows.py`). Приёмка всё ещё не закрыта: Docker на dev-машине нет,
-    нужен первый зелёный прогон job'а `compose-smoke` в CI.
+    `tests/contract/test_ci_workflows.py`.
+  - Статус 2026-11-20 (приёмка закрыта): первый зелёный `compose-smoke` — run `44641201161` на
+    `29c9ace` (полный `CI` из 7 job'ов зелёный, `Image` — run `44641201349`). Фактически:
+    `up -d --wait` дал `Healthy` у postgres/web/engine/jobs, `run --rm migrate` прогнал ревизию
+    `0001`, `/readyz` web = 200 с проверкой базы («postgres доступен»), `/readyz` engine = 200
+    (контур + потолки риска), `/healthz` engine и jobs = 200, проба исходящего трафика у базы
+    не прошла: `OK: исходящий трафик базы заблокирован (внутренняя сеть)`. Протокол с логами,
+    таблицей гарантий и границами — `docs/acceptance/m0-stand.md`. Границы приёмки: `tgbot` в
+    CI-стенде не запускается (его `/readyz` требует пробы Bot API; приёмка канала управления — M3),
+    `make dev` как команда на dev-машине не выполнялась (нет Docker) — стенд поднимался той же
+    парой `-f`-файлов, что и в стенде разработчика.
 - [ ] **T-006** Сертификат НУЦ Минцифры в образе + `SSL_TBANK_VERIFY` + коннект-тест контуров
   - Приёмка: `REQ-broker-gateway-02`, `AC-broker-gateway-02`
   - Проверка: `make deploy-check` (TLS-часть), тест с mock
@@ -72,7 +81,7 @@
   - Статус 2026-11-19: выполнено в объёме M0. Общий `HealthServer` и пробник `health_probe`
     (его вызывают healthcheck'и контейнеров), метрики сборки и транспорта Telegram; возраст
     доставки (`tg_last_delivery_age_s`) намеренно остаётся нулевым до M3.
-- [ ] **T-008** CI: lint, typecheck, test, coverage-порог, gitleaks, pip-audit, bandit, build+push в GHCR по digest
+- [x] **T-008** CI: lint, typecheck, test, coverage-порог, gitleaks, pip-audit, bandit, build+push в GHCR по digest
   - Приёмка: все шаги на зелёном коммите проходят; пороги покрытия 80%
   - Проверка: прогон workflow на тестовой ветке
   - Файлы: `.github/workflows/ci.yml`, `.github/workflows/image.yml`
@@ -84,8 +93,15 @@
     starlette 1.10.0, `cryptography>=50.0,<51.0`): нижняя граница взята из версии, в которой
     закрыт самый старший из известных advisory, понижать порог и исключать advisory не пришлось.
     Локально шаг воспроизведён без CI (venv только с продакшн-зависимостями + `pip-audit --strict`
-    по `pip freeze --exclude-editable`) — «No known vulnerabilities found». Задача остаётся
-    открытой, пока весь workflow не станет зелёным.
+    по `pip freeze --exclude-editable`) — «No known vulnerabilities found».
+  - Статус 2026-11-20 (приёмка закрыта): весь workflow зелёный на `29c9ace` — run `44641201161`
+    (7 job'ов из 7: quality+suppress-growth, тесты+покрытие, миграции up/down/up, gitleaks,
+    audit+bandit, compose-smoke, проверка площадки) и `Image` run `44641201349` — 4 образа в GHCR
+    по digest (web `9f8ef8e6…`, engine `6b8cb501…`, tgbot `eb72d243…`, jobs `7ba8d0d8…`).
+    Фактическое покрытие 95.07% при пороге 80%, 212 тестов, подавлений 14 (базовый уровень).
+    Все восемь падений (7 в `compose-smoke` + `pip-audit`) закрыты фиксами в исходниках:
+    новых подавлений нет, пороги не снижались, advisory не исключались. Протокол:
+    `docs/acceptance/m0-stand.md` (§6 — зависимости, §7 — digest'ы, §8 — локальные гейты).
 - [ ] **T-009** `storage`: Alembic + первые миграции (users, sessions, invitations, totp, backup_codes, audit_log с append-only правами)
   - Приёмка: `REQ-identity-04`, `REQ-storage-01/02`; `upgrade head` → `downgrade base` → `upgrade head`
   - Проверка: `make migrate`, `test_audit_append_only_role`
