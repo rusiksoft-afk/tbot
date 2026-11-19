@@ -57,9 +57,10 @@ SH
 
 Runtime-профиль базы
 
-`postgres` получает ровно четыре capability сверх сброшенного списка — `CHOWN`, `FOWNER`,
-`SETGID`, `SETUID`: без них entrypoint официального образа не может ни подготовить каталоги
-данных и unix-сокета, ни переключиться на пользователя postgres (`gosu`). Остальное
+`postgres` получает ровно пять capability сверх сброшенного списка — `CHOWN`, `DAC_OVERRIDE`,
+`FOWNER`, `SETGID`, `SETUID`: без них entrypoint официального образа не может ни войти в
+каталог данных (он сам же переводит его в `0700`, а владелец тома — uid 999), ни подготовить
+каталоги данных и unix-сокета, ни переключиться на пользователя postgres (`gosu`). Остальное
 жёстко закреплено контрактным тестом `tests/integration/test_compose_contract.py`:
 `no-new-privileges`, `cap_drop: ALL`, read-only rootfs и отдельный tmpfs на
 `/var/run/postgresql` сохраняются, а прикладные процессы (`web`, `engine`, `tgbot`, `jobs`,

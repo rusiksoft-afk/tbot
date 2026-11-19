@@ -16,9 +16,10 @@ from tests.paths import COMPOSE_BASE, COMPOSE_OVERRIDE, DOCKERFILE
 LONG_RUNNING = ("web", "engine", "tgbot", "jobs")
 
 # Минимальный набор capability, который нужен entrypoint официального образа postgres:
-# chown/chmod каталога данных и каталога unix-сокета (CHOWN, FOWNER) и переключение на
-# пользователя postgres через gosu — setgroups/setgid/setuid (SETGID, SETUID).
-DB_CAPS_ALLOWED: frozenset[str] = frozenset({"CHOWN", "FOWNER", "SETGID", "SETUID"})
+# вход в каталог данных после `chmod 00700` (DAC_OVERRIDE), chmod этих каталогов (FOWNER),
+# chown каталога данных и unix-сокета (CHOWN) и переключение на пользователя postgres через
+# gosu — setgroups/setgid/setuid (SETGID, SETUID).
+DB_CAPS_ALLOWED: frozenset[str] = frozenset({"CHOWN", "DAC_OVERRIDE", "FOWNER", "SETGID", "SETUID"})
 
 
 def _postgres_conf_values() -> dict[str, str]:
@@ -188,10 +189,12 @@ def test_база_слушает_не_только_loopback_внутри_кон�
 def test_база_получает_только_те_capability_которые_нужны_entrypoint() -> None:
     """Исключение из `cap_drop: ALL` разрешено только базе и только в этом наборе.
 
-    Без CHOWN/FOWNER entrypoint не может подготовить каталоги, а без SETGID/SETUID он
-    падает на `failed switching to \"postgres\"` (gosu делает setgroups/setgid/setuid).
-    Всё остальное обязано оставаться сброшенным; `no-new-privileges` и read-only rootfs
-    сохраняются и у базы — исключение не должно превратиться в «обычный» контейнер.
+    Без CHOWN/FOWNER entrypoint не может подготовить каталоги, без DAC_OVERRIDE он не может
+    войти в каталог данных, который сам же перевёл в режим 0700 (владелец-то postgres), а без
+    SETGID/SETUID он падает на `failed switching to \"postgres\"` (gosu делает
+    setgroups/setgid/setuid). Всё остальное обязано оставаться сброшенным; `no-new-privileges`
+    и read-only rootfs сохраняются и у базы — исключение не должно превратиться в «обычный»
+    контейнер.
     """
     postgres = _base()["services"]["postgres"]
     assert postgres.get("cap_drop") == ["ALL"], "у базы список capability сбрасывается целиком"

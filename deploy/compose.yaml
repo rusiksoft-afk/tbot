@@ -40,19 +40,28 @@ x-db-runtime: &db-runtime
   cap_drop:
     - ALL
   # Единственное точечное исключение в стенде — и только для базы.
-  # Entrypoint официального образа postgres (см. /usr/local/bin/docker-entrypoint.sh):
-  #   * CHOWN, FOWNER — меняет владельца каталога данных и каталога unix-сокета
-  #     (`chown … '{}' +`, `chmod 03775 /var/run/postgresql`);
+  # Entrypoint официального образа postgres (/usr/local/bin/docker-entrypoint.sh) работает под
+  # root и рассчитывает на дефолтный набор capability Docker'а. Из него нужны ровно пять:
+  #   * DAC_OVERRIDE — вход в каталог данных: entrypoint сначала делает `chmod 00700 $PGDATA`,
+  #     а владельцем том `pgdata` приходит из образа (uid 999), и без DAC_OVERRIDE следующий
+  #     `find "$PGDATA" \! -user postgres -exec chown postgres` падает с «Permission denied»
+  #     (ровно это и было в прогоне CI от 2026-11-20);
+  #   * FOWNER — `chmod` каталога данных (владелец — не root) и `chmod 03775 /var/run/postgresql`;
+  #   * CHOWN — `chown postgres` каталога данных и каталога unix-сокета;
   #   * SETGID, SETUID — `gosu postgres` делает setgroups/setgid/setuid и только после этого
   #     exec'ит сервер; без них контейнер падает на `failed switching to "postgres"`.
-  # Границы исключения: `no-new-privileges` сохранён (gosu — не setuid-бинарник, привилегии
-  # он получает системными вызовами, а `postgres` после переключения пользователя работает
-  # вообще без capability); исходящего трафика у базы по-прежнему нет (сеть `internal`,
-  # порты наружу не публикуются), поэтому SETUID/SETGID не добавляют ни сетевой доступ,
-  # ни доступа к хосту. Держимся минимального набора — он закреплен контрактом
-  # `test_база_получает_только_те_capability_которые_нужны_entrypoint`.
+  # Границы исключения: `no-new-privileges` сохранён (gosu — не setuid-бинарник, привилегии он
+  # получает системными вызовами, а сервер `postgres` после переключения пользователя работает
+  # вообще без capability); исходящего трафика у базы по-прежнему нет (сеть `internal`, порты
+  # наружу не публикуются). Остальной дефолтный набор сброшен: entrypoint и сервер не
+  # используют NET_RAW, NET_ADMIN, SYS_CHROOT, MKNOD, KILL, SETPCAP, SETFCAP, NET_BIND_SERVICE
+  # (порт 5432 выше привилегированного диапазона) и AUDIT_WRITE. FSETID намеренно не просим:
+  # у /var/run/postgresql просто не проставятся спецбиты из `chmod 03775`, на работу это не
+  # влияет — каталог принадлежит пользователю postgres. Минимальность набора закреплена
+  # контрактом `test_база_получает_только_те_capability_которые_нужны_entrypoint`.
   cap_add:
     - CHOWN
+    - DAC_OVERRIDE
     - FOWNER
     - SETGID
     - SETUID

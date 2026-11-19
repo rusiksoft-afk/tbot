@@ -35,43 +35,51 @@
 Предыдущий прогон job'а падал на `up --wait`: `tbot-postgres-1 is unhealthy`
 (`chmod: … Operation not permitted`, `chmod: /var/run/postgresql: Read-only file system`,
 `error: failed switching to "postgres": operation not permitted`). Разбор дал **пять** независимых
-причин, все закрыты; проверка — только в CI (Docker на dev-машине нет).
+причин, плюс шестая нашлась уже в починенном прогоне; все закрыты, но проверка — только в CI
+(Docker на dev-машине нет).
 
 1. **Capability у базы.** Entrypoint официального образа `postgres:16.4` под root делает
-   `chmod` каталога данных и каталога unix-сокета (нужны `FOWNER`), `chown` этих каталогов
-   (`CHOWN`) и `exec gosu postgres …`, где gosu вызывает setgroups/setgid/setuid (`SETGID`,
-   `SETUID`). Без них контейнер умирал ровно с тем сообщением из лога. Решение — якорь
-   `x-db-runtime`: те же `cap_drop: ALL`, `no-new-privileges:true`, `read_only: true`, `pids_limit`,
-   что и у всех, плюс ровно четыре `cap_add` только у `postgres`. `gosu` — не setuid-бинарник,
-   поэтому `no-new-privileges` не мешает; сервер `postgres` после переключения пользователя
-   работает вообще без capability. Исключение закреплено тестом
-   `test_база_получает_только_те_capability_которые_нужны_entrypoint` (набор == {CHOWN, FOWNER,
-   SETGID, SETUID}) и `test_прикладные_процессы_не_получают_capability`.
-2. **Каталог unix-сокета.** На read-only rootFS postgres не может создать сокет в
+   `chmod` каталога данных и каталога unix-сокета (`FOWNER`), `chown` этих каталогов (`CHOWN`)
+   и `exec gosu postgres …`, где gosu вызывает setgroups/setgid/setuid (`SETGID`, `SETUID`).
+   Без них контейнер умирал ровно с тем сообщением из лога. Решение — якорь `x-db-runtime`: те же
+   `cap_drop: ALL`, `no-new-privileges:true`, `read_only: true`, `pids_limit`, что и у всех,
+   плюс несколько `cap_add` только у `postgres`. `gosu` — не setuid-бинарник, поэтому
+   `no-new-privileges` не мешает; сервер `postgres` после переключения пользователя работает
+   вообще без capability. Исключение закреплено тестом
+   `test_база_получает_только_те_capability_которые_нужны_entrypoint` и
+   `test_прикладные_процессы_не_получают_capability`.
+2. **DAC_OVERRIDE для каталога данных.** Первый прогон после правки 1 показал
+   `find: '/var/lib/postgresql/data': Permission denied`, контейнер умирал за секунду:
+   entrypoint сам переводит каталог данных в `0700`, а владельцем том `pgdata` приходит из
+   образа (uid 999), поэтому root без DAC_OVERRIDE не может в него войти — а следующим шагом
+   идёт `find "$PGDATA" … chown postgres`. Итоговый набор: `CHOWN, DAC_OVERRIDE, FOWNER,
+   SETGID, SETUID` (это подмножество дефолтного набора Docker'а; NET_RAW, SYS_CHROOT, MKNOD,
+   KILL, SETPCAP, SETFCAP, NET_BIND_SERVICE, AUDIT_WRITE, FSETID остаются сброшенными).
+3. **Каталог unix-сокета.** На read-only rootFS postgres не может создать сокет в
    `/var/run/postgresql` → добавлен `tmpfs` (`/var/run/postgresql:size=16m,mode=1777`). Вариант
    «перенести сокет в /tmp» не годился: временный сервер, который entrypoint поднимает во время
    `initdb` (`pg_ctl -o "-c listen_addresses=''"`), использует каталог сокета по умолчанию.
    Короткая форма tmpfs с опциями корректна: `docker/compose` режет строку по первому `:`
    (`strings.Cut`) и отдаёт опции движку; дефолт Docker для tmpfs — `mode=1777`.
-3. **`listen_addresses = 'localhost'`** в `deploy/postgres/tbot.conf` — это только loopback самого
+4. **`listen_addresses = 'localhost'`** в `deploy/postgres/tbot.conf` — это только loopback самого
    контейнера: web/engine/jobs получили бы `connection refused`, а наружу это выглядело бы как
    «unhealthy web». Теперь `'*'` (наружу порт не смотрит: база только в `internal`-сети,
    публикация портов — лишь в dev-дополнении и только на 127.0.0.1). Держится тестом
    `test_база_слушает_не_только_loopback_внутри_контейнера`.
-4. **healthcheck `jobs`** был на `/readyz`, а готовность `jobs` на M0 честно отвечает «исполнителей
+5. **healthcheck `jobs`** был на `/readyz`, а готовность `jobs` на M0 честно отвечает «исполнителей
    задач ещё нет» (это охрана от вранья в `/readyz`, см.
    `test_исполнители_задач_появятся_не_раньше_своей_логики`) → контейнер никогда не стал бы
    healthy. Healthcheck переведён на `/healthz` + `--liveness`; приёмка T-005 требует `/readyz` 200
    только у web и engine. Тест: `test_процесс_jobs_проверяется_liveness_а_не_readiness`.
-5. **Шаг CI «у контейнера базы нет исходящего трафика» запускал `python3` внутри контейнера базы**,
+6. **Шаг CI «у контейнера базы нет исходящего трафика» запускал `python3` внутри контейнера базы**,
    а в образе `postgres` (debian-slim без recommends) Python нет вовсе — приёмка egress падала бы
    на «executable file not found». Проба переписана на `bash` + `/dev/tcp` + `timeout`
    (то же в `deploy/README.md`), страховка от повторения —
    `tests/contract/test_ci_workflows.py::test_пробы_внутри_контейнера_базы_не_требуют_инструментов_которых_в_нём_нет`.
 
-Остаточный риск: ни одна из правок 1–5 не проверена реальным `docker compose up` — только
-статическими контрактами и чтением entrypoint/Dockerfile образа. Следующий прогон CI может
-показать ещё одну причину (шаг `журнал контейнеров при неудаче` в job `compose-smoke` её и печатает).
+Остаточный риск: правки 1–6 не проверены локальным `docker compose up` — только контрактами,
+чтением entrypoint/Dockerfile образа и прогонами CI. Шаг `журнал контейнеров при неудаче` в job
+`compose-smoke` печатает `logs --tail=200` — если стенд снова не поднимется, смотреть надо там.
 
 ### 1.3 Отдельная ловушка: тексты тоже проверяются контрактом
 
