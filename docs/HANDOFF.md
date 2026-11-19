@@ -35,8 +35,8 @@
 Предыдущий прогон job'а падал на `up --wait`: `tbot-postgres-1 is unhealthy`
 (`chmod: … Operation not permitted`, `chmod: /var/run/postgresql: Read-only file system`,
 `error: failed switching to "postgres": operation not permitted`). Разбор дал **пять** независимых
-причин, плюс шестая нашлась уже в починенном прогоне; все закрыты, но проверка — только в CI
-(Docker на dev-машине нет).
+причин, плюс ещё две нашлись уже в починенных прогонах (всего семь); все закрыты, но
+проверка — только в CI (Docker на dev-машине нет).
 
 1. **Capability у базы.** Entrypoint официального образа `postgres:16.4` под root делает
    `chmod` каталога данных и каталога unix-сокета (`FOWNER`), `chown` этих каталогов (`CHOWN`)
@@ -76,8 +76,16 @@
    на «executable file not found». Проба переписана на `bash` + `/dev/tcp` + `timeout`
    (то же в `deploy/README.md`), страховка от повторения —
    `tests/contract/test_ci_workflows.py::test_пробы_внутри_контейнера_базы_не_требуют_инструментов_которых_в_нём_нет`.
+7. **Монтирование конфига базы шло не туда.** В `volumes` стояло `./deploy/postgres/tbot.conf`,
+   а относительные пути compose разрешает относительно каталога compose-файла (`deploy/`) →
+   путь `deploy/deploy/postgres/tbot.conf`. Несуществующий хостовый путь в короткой форме Docker
+   молча становится пустым каталогом, и `postgres` падал с `input in flex scanner failed at file
+   "/etc/postgresql/tbot.conf" line 1` (после успешно прошедшего initdb — то есть выглядит как
+   «битый» конфиг, им не будучи). Правильно: `./postgres/tbot.conf`. Держится тестом
+   `test_хостовые_пут_и_монтирований_существуют`; контексты сборок проверяет соседний тест
+   `test_контекст_сборки_и_dockerfile_существуют`.
 
-Остаточный риск: правки 1–6 не проверены локальным `docker compose up` — только контрактами,
+Остаточный риск: правки 1–7 не проверены локальным `docker compose up` — только контрактами,
 чтением entrypoint/Dockerfile образа и прогонами CI. Шаг `журнал контейнеров при неудаче` в job
 `compose-smoke` печатает `logs --tail=200` — если стенд снова не поднимется, смотреть надо там.
 

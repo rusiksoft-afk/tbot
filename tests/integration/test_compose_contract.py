@@ -137,6 +137,27 @@ def test_контекст_сборки_и_dockerfile_существуют() -> N
         )
 
 
+def test_хостовые_пут_и_монтирований_существуют() -> None:
+    """Относительные пути в `volumes` разрешаются относительно каталога compose-файла.
+
+    `./deploy/postgres/tbot.conf` внутри `deploy/compose.yaml` — это `deploy/deploy/...`, а
+    несуществующий хостовый путь в короткой форме Docker молча заменяет на пустой каталог.
+    Для базы это выглядело бы как `config_file=…`, которым оказался каталог, и падение с
+    `input in flex scanner failed at file "/etc/postgresql/tbot.conf" line 1` — в сообщении
+    нет ни слова про пропущенный монтаж, поэтому проверка здесь.
+    """
+    project_dir = COMPOSE_BASE.parent
+    broken: list[str] = []
+    for name, spec in _base()["services"].items():
+        for mount in spec.get("volumes", []):
+            source = str(mount).split(":", 1)[0]
+            if not source.startswith(("./", "../")):
+                continue  # именованный том (`pgdata`) или абсолютный путь — проверять нечего
+            if not (project_dir / source).exists():
+                broken.append(f"{name}: {source} -> {project_dir / source}")
+    assert not broken, f"монтируемых файлов/каталогов нет на месте: {broken}"
+
+
 def test_докерфайл_объявляет_синтаксис_buildkit_корректно() -> None:
     """Директива `# syntax=` обязана быть первой строкой и в форме образа, а не контекста.
 

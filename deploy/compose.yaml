@@ -94,7 +94,11 @@ services:
       - config_file=/etc/postgresql/tbot.conf
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./deploy/postgres/tbot.conf:/etc/postgresql/tbot.conf:ro
+      # Относительный путь монтирования разрешается относительно каталога compose-файла
+      # (deploy/), а не репозитория: `./deploy/postgres/...` дал бы deploy/deploy/postgres/...,
+      # несуществующий путь в короткой форме Docker заменяет на пустой каталог, и postgres
+      # падал бы с бессмысленным «input in flex scanner failed at ... line 1».
+      - ./postgres/tbot.conf:/etc/postgresql/tbot.conf:ro
     secrets:
       - db_password
     healthcheck:

@@ -44,7 +44,7 @@
     При написании найдена реальная ошибка: сервисам не были выданы секреты (`/run/secrets`
     пуст), из-за чего `/readyz` web не проходил проверку базы; исправлено точечной выдачей
     секретов по процессам (контрактный тест это теперь фиксирует).
-  - Статус 2026-11-20: в `compose-smoke` разобрано шесть причин (все — только с реальным Docker,
+  - Статус 2026-11-20: в `compose-smoke` разобрано семь причин (все — только с реальным Docker,
     локально их было не увидеть): capability базы против entrypoint/gosu, DAC_OVERRIDE для
     каталога данных (том приходит из образа владельцем uid 999, а entrypoint сам ставит на нём
     `0700`), каталог unix-сокета на read-only rootFS, `listen_addresses = 'localhost'` (база не
@@ -53,7 +53,11 @@
     контейнера базы, где Python вообще не установлен. Исправлено: якорь `x-db-runtime` (ровно
     `CHOWN/DAC_OVERRIDE/FOWNER/SETGID/SETUID` только у базы, всё остальное hardening сохранено),
     tmpfs на `/var/run/postgresql`, `listen_addresses = '*'`, healthcheck `jobs` на
-    `/healthz --liveness`, проба egress на `bash`.
+    `/healthz --liveness`, проба egress на `bash`, и путь монтирования конфига базы: compose
+    разрешает относительные пути `volumes` относительно каталога compose-файла, поэтому
+    `./deploy/postgres/tbot.conf` вёл к `deploy/deploy/...`, а Docker из несуществующего
+    хостового пути короткой формы делает пустой каталог — postgres падал с «input in flex
+    scanner failed at file /etc/postgresql/tbot.conf line 1».
     Каждое закрыто контрактным тестом (`tests/integration/test_compose_contract.py`,
     `tests/contract/test_ci_workflows.py`). Приёмка всё ещё не закрыта: Docker на dev-машине нет,
     нужен первый зелёный прогон job'а `compose-smoke` в CI.
