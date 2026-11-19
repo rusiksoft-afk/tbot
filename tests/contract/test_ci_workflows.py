@@ -121,3 +121,21 @@ def test_пробы_внутри_контейнера_базы_не_требую
         assert "postgres bash" in script, "проба внутри базы должна запускать bash"
         for missing in ("python3", "curl", "wget", "nc "):
             assert missing not in script, f"в образе postgres нет {missing.strip()}"
+
+
+def test_приёмка_стенда_требует_readyz_у_web_и_engine() -> None:
+    """Приёмка T-005 — «/readyz 200 у web и engine»: пробы должны быть явными.
+
+    Healthcheck engine тоже ходит на `/readyz`, но выводить приёмку из этого косвенно нельзя:
+    `up --wait` прошёл бы и при liveness-ручке, если бы шаг приёмки её подменил.
+    """
+    steps = _load(CI_FILE)["jobs"]["compose-smoke"]["steps"]
+    runs = [str(step.get("run", "")) for step in steps if step.get("run")]
+    joined = "\n".join(runs)
+    probe = "python -m packages.common.health_probe"
+    for svc, port in (("web", 8080), ("engine", 9101)):
+        assert (
+            f"exec -T {svc} {probe} --url http://127.0.0.1:{port}/readyz" in joined
+        ), f"в compose-smoke нет строгой readiness-пробы {svc}:{port}/readyz"
+    for port in (9101, 9103):
+        assert f"{probe} --liveness --url http://127.0.0.1:{port}/healthz" in joined, port

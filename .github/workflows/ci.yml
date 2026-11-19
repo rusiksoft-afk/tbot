@@ -188,6 +188,12 @@ jobs:
             exec -T web python -m packages.common.health_probe --url http://127.0.0.1:8080/readyz
       - name: engine и jobs живы
         run: |
+          # Приёмка T-005 требует «/readyz 200 у web и engine», поэтому у engine проверяются
+          # обе ручки: liveness (процесс жив) и readiness (контур + конфигурация). Разница
+          # осмысленна: /readyz у engine на M0 может быть 503 при неверном контуре, тогда как
+          # /healthz остаётся 200.
+          docker compose -f deploy/compose.yaml -f deploy/compose.override.yaml \
+            exec -T engine python -m packages.common.health_probe --url http://127.0.0.1:9101/readyz
           docker compose -f deploy/compose.yaml -f deploy/compose.override.yaml \
             exec -T engine python -m packages.common.health_probe --liveness --url http://127.0.0.1:9101/healthz
           docker compose -f deploy/compose.yaml -f deploy/compose.override.yaml \
