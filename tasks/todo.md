@@ -6,42 +6,71 @@
 
 ## M0 — каркас и окружение
 
-- [ ] **T-001** Каркас репозитория: структура TZ §5, `pyproject.toml`, ruff/mypy/pytest/coverage, `Makefile` со всеми командами TZ §4
+- [x] **T-001** Каркас репозитория: структура TZ §5, `pyproject.toml`, ruff/mypy/pytest/coverage, `Makefile` со всеми командами TZ §4
   - Приёмка: команды TZ §4 существуют и исполняются; `mypy --strict` на пустом проекте зелёный
   - Проверка: `make lint`, `make test` (0 тестов → exit 0 с предупреждением)
   - Файлы: `pyproject.toml`, `Makefile`, `ruff.toml`, `mypy.ini`, `.gitignore`, `.editorconfig`
-- [ ] **T-002** Конфигурация и секреты: pydantic-settings, `configs/tbot.example.yaml`, загрузка ENV/файлов, запрет секретов в YAML
+  - Статус 2026-11-19: выполнено. На dev-машине нет `make`, поэтому команды продублированы
+    обёртками `make.ps1` и `scripts/dev.py` (единый реестр команд + контрактный тест
+    `test_dev_cli_contract`); `Makefile` остаётся для Linux и CI.
+- [x] **T-002** Конфигурация и секреты: pydantic-settings, `configs/tbot.example.yaml`, загрузка ENV/файлов, запрет секретов в YAML
   - Приёмка: `REQ-config-01` (диапазоны риска), отсутствие секретов в git (`gitleaks`)
   - Проверка: `make lint`, тест `test_config_ranges`
   - Файлы: `packages/common/config.py`, `configs/tbot.example.yaml`, `.github/workflows/ci.yml`
-- [ ] **T-003** Логирование: structlog JSON + фильтр маскирования секретов + `trace_id`
+  - Статус 2026-11-19: выполнено. Порядок приоритетов закреплён явно: аргументы > ENV > YAML
+    (`settings_customise_sources`); секреты — только ENV или файлы `secrets_dir`. Дополнительно:
+    отключение проверки TLS (брокер, Telegram) запрещено валидаторами, а контур `production`
+    требует явного `confirm_production`.
+- [x] **T-003** Логирование: structlog JSON + фильтр маскирования секретов + `trace_id`
   - Приёмка: «канареечный» токен не попадает в вывод; формат полей TZ §12.1
   - Проверка: `test_logging_masking` (несколько шаблонов токена/ключей)
   - Файлы: `packages/common/logging.py`, `tests/unit/test_logging_masking.py`
-- [ ] **T-004** Время и идентификаторы: `common/clock.py` (UTC/МСК), UUIDv7, ключ идемпотентности
+  - Статус 2026-11-19: выполнено. Один конвейер для записей приложения и сторонних библиотек
+    (`ProcessorFormatter` + `foreign_pre_chain`); маскируются поля по именам, `ключ=значение`,
+    URI с учётными данными, Bearer, куки, PEM. 16 тестов на канареечных значениях.
+- [x] **T-004** Время и идентификаторы: `common/clock.py` (UTC/МСК), UUIDv7, ключ идемпотентности
   - Приёмка: нет `datetime.now()` вне `clock`; ключ ≤36 симв., уникален
   - Проверка: `test_clock`, `test_client_key_format`
   - Файлы: `packages/common/clock.py`, `packages/common/ids.py`, тесты
+  - Статус 2026-11-19: выполнено. Разметка бит UUIDv7 (версия в битах 76..63, вариант в 63..62)
+    закреплена тестами: первый вариант с случайностью поверх поля версии давал `version == 3`.
 - [ ] **T-005** Docker/Compose dev: postgres + web + engine + tgbot + jobs, сети, healthchecks, non-root, ротация логов
   - Приёмка: `make dev` → `/readyz` 200 у web и engine; egress для БД закрыт
   - Проверка: `docker compose config`, ручной/CI-прогон `compose up && curl`
   - Файлы: `deploy/compose.yaml`, `deploy/compose.override.yaml`, Dockerfile'ы
+  - Статус 2026-11-19: код и проверки написаны — контрактные тесты на compose и job
+    `compose-smoke` в CI (сборка, `up --wait`, `/readyz`, запрет исходящего трафика БД).
+    Приёмка не закрыта: на dev-машине нет Docker, нужен первый зелёный прогон job'а в CI.
+    При написании найдена реальная ошибка: сервисам не были выданы секреты (`/run/secrets`
+    пуст), из-за чего `/readyz` web не проходил проверку базы; исправлено точечной выдачей
+    секретов по процессам (контрактный тест это теперь фиксирует).
 - [ ] **T-006** Сертификат НУЦ Минцифры в образе + `SSL_TBANK_VERIFY` + коннект-тест контуров
   - Приёмка: `REQ-broker-gateway-02`, `AC-broker-gateway-02`
   - Проверка: `make deploy-check` (TLS-часть), тест с mock
   - Файлы: `deploy/ca/`, `deploy/Dockerfile.engine`, `scripts/deploy_check.py`
-- [ ] **T-007** Базовые health/metrics: `/healthz`, `/readyz`, `/metrics`, `tbot_build_info`
+- [x] **T-007** Базовые health/metrics: `/healthz`, `/readyz`, `/metrics`, `tbot_build_info`
   - Приёмка: метрики TZ §12.2 (базовый набор); compose-зависимости по health
   - Проверка: интеграционный тест `test_health_readyz`, ручной `curl /metrics`
   - Файлы: `apps/*/health.py`, `packages/common/metrics.py`
+  - Статус 2026-11-19: выполнено в объёме M0. Общий `HealthServer` и пробник `health_probe`
+    (его вызывают healthcheck'и контейнеров), метрики сборки и транспорта Telegram; возраст
+    доставки (`tg_last_delivery_age_s`) намеренно остаётся нулевым до M3.
 - [ ] **T-008** CI: lint, typecheck, test, coverage-порог, gitleaks, pip-audit, bandit, build+push в GHCR по digest
   - Приёмка: все шаги на зелёном коммите проходят; пороги покрытия 80%
   - Проверка: прогон workflow на тестовой ветке
   - Файлы: `.github/workflows/ci.yml`, `.github/workflows/image.yml`
+  - Статус 2026-11-19: workflow'ы написаны (quality + `suppress-growth`, tests + coverage 80%,
+    миграции up/down/up, gitleaks, bandit, pip-audit, compose-smoke, deploy-check, build/push
+    по digest). Приёмка — по первому фактическому прогону на зелёном коммите; локально
+    183 теста и 94.95% покрытия (инвентаризация подавлений: `docs/acceptance/m0-quality.md`).
 - [ ] **T-009** `storage`: Alembic + первые миграции (users, sessions, invitations, totp, backup_codes, audit_log с append-only правами)
   - Приёмка: `REQ-identity-04`, `REQ-storage-01/02`; `upgrade head` → `downgrade base` → `upgrade head`
   - Проверка: `make migrate`, `test_audit_append_only_role`
   - Файлы: `migrations/versions/0001_*.py`, `deploy/postgres/roles.sql`
+  - Статус 2026-11-19: часть выполнена — каркас Alembic (`env.py`, `script.py.mako`) и ревизия
+    `0001_app_meta` есть, цикл up/down/up проверяется в CI job'ом `migrations`. Таблицы
+    идентичности и `roles.sql` переносятся в M1 (T-101…T-106): выдумывать схему доступа раньше
+    модели доступа смысла нет.
 - [ ] **T-010** Инфраструктура test-стенда (`192.168.1.40`): параметры Postgres под 2.9 ГБ RAM, swap, ретенция-конфиг, алерты диска
   - Приёмка: TZ §14.2 (все ограничения применены), замеры задокументированы
   - Проверка: `nproc/free -h/df -h` → протокол; `make dev` на стенде
@@ -328,6 +357,13 @@
   - Приёмка: `docs/runbook/telegram-egress-proxy.md` шаги 1–6, `docs/research/03 §3.7.1, §3.9`, `AC-telegram-07`. С прод-ВМ: `curl -x socks5h://127.0.0.1:10800 …/getMe` даёт 401/404 при корректной проверке цепочки; прямой заход падает; через туннель нет доступа к `127.0.0.1`, приватным и link-local сетям и к портам прода; медиана задержки и IP, который видит Telegram, записаны
   - Проверка: `scripts/tg_egress_probe.sh` (A напрямую / C′ через SOCKS / поддельный CA отклоняется + `tg_tls_mismatch` / приложение не резолвит `api.telegram.org` заранее); тесты `tests/integration/test_tg_transport.py`
   - Файлы: `docs/adr/ADR-0xx-tg-egress-via-node-b.md`, `deploy/vps/tbot-tunnel/{config.yaml.example,systemd.service}`, `configs/telegram/transport.yaml`, `scripts/tg_egress_probe.sh`
+  - Статус 2026-11-19 (вечер, часть по коду): приложение выбирает путь **явно** —
+    `telegram.transport = tunnel | direct` (`TBOT_TELEGRAM__TRANSPORT`), при `tunnel` клиент
+    идёт через `socks5h://…@127.0.0.1:10800` (имя разрешается на узле B), пароль читается из
+    файла секрета `tg_socks_password`. Логика пробы транспорта и проверок готовности покрыта
+    тестами без сети: `tests/unit/test_tgbot_transport.py` (9 проверок: нет токена / успех /
+    401 при живой связности / сетевой сбой / замер выхода / состояние до пробы / путь direct /
+    маска пароля SOCKS). `scripts/tg_egress_probe.sh` и ADR пока не написаны.
   - Примечание: вариант B (контейнер `tgbot` на узле) в backlog не ставится — только резерв ради изоляции процесса управления (`docs/tz/10 §10.7`); `AC-telegram-05/06` тогда и применяются.
 - [ ] **T-712** Docker Engine + compose на прод (из репозитариев дистрибутива), pull образов GHCR по digest, non-root, сети, tmpfs для секретов, ротация логов
   - Приёмка: TZ §14.6; `docker compose config` валиден; конвейер `pull → migrate → restart` воспроизведён
