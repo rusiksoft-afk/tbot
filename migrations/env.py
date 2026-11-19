@@ -18,6 +18,7 @@ from sqlalchemy import MetaData, engine_from_config, pool
 from sqlalchemy.engine import Connection
 
 from packages.common.config import ConfigError, load_settings
+from packages.common.db import sqlalchemy_url
 
 config = context.config
 
@@ -47,7 +48,10 @@ def _database_url() -> str:
             "миграции не запускаются: не задана база данных "
             "(TBOT_DB_URL или файл db_url в secrets_dir)"
         )
-    return settings.db_url.get_secret_value()
+    # Диалект указывает явно (`postgresql+psycopg`): в конфигурации адрес хранится в обычной
+    # форме `postgresql://…`, а SQLAlchemy выбрал бы psycopg2, которого в образе нет —
+    # падение произошло бы только в CI (проверка `test_db_url`).
+    return sqlalchemy_url(settings.db_url.get_secret_value())
 
 
 def run_migrations_offline() -> None:

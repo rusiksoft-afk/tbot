@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -19,10 +21,6 @@ import yaml
 ROOT = Path(__file__).resolve().parents[2]
 CI_FILE = ROOT / ".github" / "workflows" / "ci.yml"
 IMAGE_FILE = ROOT / ".github" / "workflows" / "image.yml"
-
-# Те же признаки подавления, что ищит шаг `suppress-growth` в CI.
-SUPPRESSION_RE = re.compile(r"#\s*(noqa|type:\s*ignore|pragma:\s*no cover)")
-EXCLUDED_DIR_PARTS: frozenset[str] = frozenset({".git", ".venv", "__pycache__", ".mypy_cache"})
 
 REQUIRED_JOBS: tuple[str, ...] = (
     "quality",
@@ -39,15 +37,6 @@ def _load(path: Path) -> dict[str, Any]:
     payload = yaml.safe_load(path.read_text(encoding="utf-8"))
     assert isinstance(payload, dict), f"{path.name}: ожидаем отображение верхнего уровня"
     return payload
-
-
-def _count_suppressions() -> int:
-    total = 0
-    for path in ROOT.rglob("*.py"):
-        if EXCLUDED_DIR_PARTS & set(path.parts):
-            continue
-        total += len(SUPPRESSION_RE.findall(path.read_text(encoding="utf-8")))
-    return total
 
 
 @pytest.mark.parametrize("path", [CI_FILE, IMAGE_FILE], ids=["ci.yml", "image.yml"])
@@ -74,10 +63,19 @@ def test_базовый_уровень_подавлений_совпадает_�
 
     Рост без объяснения запрещён (см. `docs/acceptance/m0-quality.md §2`), но и занижать
     базовый уровень молча нельзя: тогда шаг `suppress-growth` перестанет что-то охранять.
+    Счётчик один — `scripts/count_suppressions.py`; он же используется в CI, поэтому проверка
+    не зависит от совпадения двух копий регулярного выражения.
     """
     env = _load(CI_FILE).get("env", {})
     declared = int(str(env["SUPPRESSION_BASELINE"]))
-    actual = _count_suppressions()
+    completed = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "count_suppressions.py")],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    actual = int(completed.stdout.strip().splitlines()[-1])
     assert declared == actual, (
         f"SUPPRESSION_BASELINE={declared}, а в дереве {actual} — обнови значение вместе "
         "с объяснением в описании PR и в инвентаризации подавлений"

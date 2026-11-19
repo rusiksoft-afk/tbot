@@ -20,7 +20,7 @@ concurrency:
 env:
   PYTHON_VERSION: "3.12"
   # Порог подавления проверок (см. job quality / suppress-growth). Обновляется только вместе
-  # с объяснением в описании PR. Текущий уровень = 10, инвентаризация — docs/acceptance/m0-quality.md:
+  # с объяснением в описании PR. Текущий уровень = 14, инвентаризация — docs/acceptance/m0-quality.md:
   #   2 × `noqa: ARG003` — состав аргументов `settings_customise_sources` задаёт pydantic-settings,
   #       переименование сломает вызов библиотеки (аргументы передаются по именам);
   #   8 × `pragma: no cover` — процессная обвязка четырёх процессов (`run()` и `__main__`):
@@ -28,7 +28,11 @@ env:
   #       сигналов, а job'ом `compose-smoke` (реальный `docker compose up --wait` + опрос
   #       /healthz и /readyz). Логика внутри этих модулей (проверки готовности, охрана контуров,
   #       проба транспорта) покрыта тестами и в исключение не входит.
-  SUPPRESSION_BASELINE: "10"
+  #   4 × `nosec` в `scripts/{dev,deploy_check}.py` — bandit ругается на сам факт использования
+  #       `subprocess` в dev/ops-скриптах: вызовы идут со `shell=False` и фиксированным списком
+  #       аргументов; замечание B607 (частичный путь исполняемого файла) не подавлялось, а
+  #       исправлено — путь берётся из `shutil.which`.
+  SUPPRESSION_BASELINE: "14"
 
 jobs:
   quality:
@@ -52,20 +56,13 @@ jobs:
         run: bandit -c pyproject.toml -r apps packages scripts
       - name: suppress-growth
         run: |
-          python - <<'PY'
-          import os, pathlib, re, sys
-          pattern = re.compile(r"#\s*(noqa|type:\s*ignore|pragma:\s*no cover)")
-          count = 0
-          for path in pathlib.Path(".").rglob("*.py"):
-              if {".git", ".venv", "__pycache__"} & set(path.parts):
-                  continue
-              count += len(pattern.findall(path.read_text(encoding="utf-8")))
-          baseline = int(os.environ["SUPPRESSION_BASELINE"])
-          print(f"подавлений проверок: {count} (базовый уровень {baseline})")
-          if count > baseline:
-              print("рост числа подавлений недопустим без явного решения заказчика")
-              sys.exit(1)
-          PY
+          count=$(python scripts/count_suppressions.py)
+          echo "подавлений проверок: ${count} (базовый уровень ${SUPPRESSION_BASELINE})"
+          if [ "${count}" -gt "${SUPPRESSION_BASELINE}" ]; then
+            echo "рост числа подавлений недопустим без явного решения заказчика"
+            python scripts/count_suppressions.py --list
+            exit 1
+          fi
 
   tests:
     name: тесты и покрытие
@@ -145,11 +142,19 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
       - run: python -m pip install --upgrade pip
-      # Аудит ровно продакшн-зависимостей: отдельное окружение без dev-пакетов.
+      # Аудит ровно продакшн-зависимостей: отдельное окружение, в котором ставится только
+      # пакет приложения (без dev-зависимостей), и список зависимостей без самого пакета —
+      # иначе pip-audit ищет в PyPI наш `tbot (0.0.0)` и падает с `--strict`.
       - run: python -m venv .venv-audit
-      - run: .venv-audit/bin/pip install -e . pip-audit
+      - run: .venv-audit/bin/pip install -e .
+      - name: список продакшн-зависимостей
+        run: |
+          .venv-audit/bin/pip freeze --exclude-editable > deps-audit.txt
+          echo "аудит по списку ($(wc -l < deps-audit.txt) пакетов):"; cat deps-audit.txt
       - name: pip-audit
-        run: .venv-audit/bin/pip-audit --strict --local
+        run: |
+          python -m pip install pip-audit
+          pip-audit --strict -r deps-audit.txt
 
   compose-smoke:
     name: 'dev-стенд: сборка, готовность, изоляция базы'

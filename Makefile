@@ -5,7 +5,7 @@ PY ?= python
 COMPOSE = docker compose -f deploy/compose.yaml -f deploy/compose.override.yaml
 
 .PHONY: help dev lint fmt typecheck test test-live e2e migrate revision seed-dev \
-        history-load backtest deploy-check backup restore-verify deploy ci-local clean
+        history-load backtest deploy-check suppressions backup restore-verify deploy ci-local clean
 
 help:  ## список команд
 	@$(PY) scripts/dev.py --list
@@ -48,6 +48,9 @@ backtest:  ## прогон бэктеста: CFG=configs/backtests/grid_sber.yam
 
 deploy-check:  ## проверка конфигурации/сертификатов/времени перед боевым контуром
 	@$(PY) scripts/dev.py deploy-check
+
+suppressions:  ## посчитать подавления проверок (noqa / nosec / pragma: no cover)
+	@$(PY) scripts/dev.py suppressions
 
 backup:  ## pg_dump в ./backups + чек-сумма
 	@$(PY) scripts/dev.py backup

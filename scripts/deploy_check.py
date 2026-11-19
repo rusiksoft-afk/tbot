@@ -19,7 +19,7 @@ import platform
 import shutil
 import socket
 import ssl
-import subprocess
+import subprocess  # nosec B404 — ниже только вызовы с фиксированным списком аргументов
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -119,15 +119,16 @@ def _severity(settings: Settings | None, *, production_fatal: bool = True) -> st
 
 def check_time_sync() -> CheckResult:
     """Синхронизация времени: расхождение ломает границы сессий и метки биржевых данных."""
-    if not shutil.which("timedatectl"):
+    timedatectl = shutil.which("timedatectl")
+    if timedatectl is None:
         return CheckResult(
             "time_sync",
             True,
             "timedatectl недоступен (не Linux) — проверка на площадке обязательна",
             WARN,
         )
-    completed = subprocess.run(
-        ["timedatectl", "show", "-p", "NTPSynchronized", "--value"],
+    completed = subprocess.run(  # nosec B603 — абсолютный путь из shutil.which, аргументы фиксированы
+        [timedatectl, "show", "-p", "NTPSynchronized", "--value"],
         capture_output=True,
         text=True,
         check=False,

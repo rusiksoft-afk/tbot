@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import shutil
-import subprocess
+import subprocess  # nosec B404 — обёрпка dev-команд: argv строятся в этом файле, shell не используется
 import sys
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -39,7 +39,7 @@ def run(argv: Sequence[str], *, env: dict[str, str] | None = None) -> int:
     printable = " ".join(argv)
     print(f"$ {printable}", flush=True)
     try:
-        completed = subprocess.run(
+        completed = subprocess.run(  # nosec B603 — список аргументов из реестра команд, shell=False
             list(argv), cwd=ROOT, env={**os.environ, **(env or {})}, check=False
         )
     except FileNotFoundError:
@@ -135,6 +135,10 @@ def cmd_deploy_check(_args: Sequence[str]) -> int:
     return run([sys.executable, str(ROOT / "scripts" / "deploy_check.py")])
 
 
+def cmd_suppressions(_args: Sequence[str]) -> int:
+    return run([sys.executable, str(ROOT / "scripts" / "count_suppressions.py"), "--list"])
+
+
 def cmd_deploy(_args: Sequence[str]) -> int:
     print(
         "Боевой деплой выполняется вручную по docs/runbook/deploy.md (TZ §12.7): образы только "
@@ -204,6 +208,7 @@ COMMANDS: dict[str, tuple[Handler, str]] = {
     "history-load": (_gated("history-load"), "загрузчик истории с бюджетом"),
     "backtest": (_gated("backtest"), "прогон бэктеста по конфигу"),
     "deploy-check": (cmd_deploy_check, "проверка площадки перед боевым контуром"),
+    "suppressions": (cmd_suppressions, "посчитать подавления проверок (noqa/nosec/pragma)"),
     "backup": (_gated("backup"), "pg_dump + чек-сумма"),
     "restore-verify": (_gated("restore-verify"), "восстановление дампа и сверка"),
     "deploy": (cmd_deploy, "ручной боевой деплой (не автоматизируется здесь)"),

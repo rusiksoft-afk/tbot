@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 import yaml
 
-from tests.paths import COMPOSE_BASE, COMPOSE_OVERRIDE
+from tests.paths import COMPOSE_BASE, COMPOSE_OVERRIDE, DOCKERFILE
 
 LONG_RUNNING = ("web", "engine", "tgbot", "jobs")
 
@@ -96,6 +96,40 @@ def test_секрет_попадает_только_тому_процессу_к
     for service, names in expected.items():
         mounted = set(services[service].get("secrets", []))
         assert mounted == names, f"{service}: ожидались секреты {names}, получено {mounted}"
+
+
+def test_контекст_сборки_и_dockerfile_существуют() -> None:
+    """Контекст в compose разрешается относительно каталога compose-файла, а не репозитория.
+
+    Ошибка вида `context: .` внутри deploy/compose.yaml даёт `deploy/deploy/Dockerfile` и
+    падает на сборке в CI; здесь это проверяется без Docker — по факту существования путей.
+    """
+    services = _base()["services"]
+    project_dir = COMPOSE_BASE.parent
+    built = [
+        name for name, spec in services.items() if isinstance(spec, dict) and spec.get("build")
+    ]
+    assert built, "в compose не осталось ни одной сборки — стенд нечем поднять"
+    for name in built:
+        build = services[name]["build"]
+        context = (project_dir / str(build["context"])).resolve()
+        dockerfile = context / str(build["dockerfile"])
+        assert context.is_dir(), f"{name}: контекст не существует: {context}"
+        assert dockerfile.is_file(), f"{name}: dockerfile не найден: {dockerfile}"
+        assert build["context"] == "..", (
+            f"{name}: контекст обязан быть `..` (корень репозитория), иначе докерфайл ищется "
+            "внутри deploy/"
+        )
+
+
+def test_докерфайл_объявляет_синтаксис_buildkit_корректно() -> None:
+    """Директива `# syntax=` обязана быть первой строкой и в форме образа, а не контекста.
+
+    Форма `docker/dockerfile=1.7` парсится как имя контекста и даёт
+    `invalid reference format` — сборка падает до первого шага.
+    """
+    first_line = DOCKERFILE.read_text(encoding="utf-8").splitlines()[0]
+    assert first_line.startswith("# syntax=docker/dockerfile:"), f"первая строка: {first_line!r}"
 
 
 def test__logs_ограничены_по_объёму() -> None:

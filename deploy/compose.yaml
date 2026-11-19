@@ -67,7 +67,7 @@ services:
 
   web:
     build:
-      context: .
+      context: ..
       dockerfile: deploy/Dockerfile
       args:
         APP: web
@@ -100,7 +100,7 @@ services:
 
   engine:
     build:
-      context: .
+      context: ..
       dockerfile: deploy/Dockerfile
       args:
         APP: engine
@@ -131,7 +131,7 @@ services:
 
   tgbot:
     build:
-      context: .
+      context: ..
       dockerfile: deploy/Dockerfile
       args:
         APP: tgbot
@@ -165,7 +165,7 @@ services:
 
   jobs:
     build:
-      context: .
+      context: ..
       dockerfile: deploy/Dockerfile
       args:
         APP: jobs
@@ -195,7 +195,7 @@ services:
 
   migrate:
     build:
-      context: .
+      context: ..
       dockerfile: deploy/Dockerfile
       args:
         APP: web

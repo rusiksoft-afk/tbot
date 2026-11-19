@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile=1.7
+# syntax=docker/dockerfile:1.7
 #
 # Единый многоступенчатый образ для всех четырёх процессов: какой процесс запускать, задаётся
 # build-аргументом APP (web | engine | tgbot | jobs). Так зависимости считаются один раз, а
