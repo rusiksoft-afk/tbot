@@ -44,6 +44,17 @@
     При написании найдена реальная ошибка: сервисам не были выданы секреты (`/run/secrets`
     пуст), из-за чего `/readyz` web не проходил проверку базы; исправлено точечной выдачей
     секретов по процессам (контрактный тест это теперь фиксирует).
+  - Статус 2026-11-20: в `compose-smoke` разобрано пять причин (все — только с реальным Docker,
+    локально их было не увидеть): capability базы против entrypoint/gosu, каталог unix-сокета на
+    read-only rootFS, `listen_addresses = 'localhost'` (база не слушала сеть контейнера),
+    healthcheck `jobs` на `/readyz` (готовность на M0 честно отвечает «исполнителей ещё нет»,
+    поэтому `up --wait` не стал бы зелёным никогда) и `python3` внутри контейнера базы, где Python
+    вообще не установлен. Исправлено: якорь `x-db-runtime` (ровно `CHOWN/FOWNER/SETGID/SETUID`
+    только у базы, всё остальное hardening сохранено), tmpfs на `/var/run/postgresql`,
+    `listen_addresses = '*'`, healthcheck `jobs` на `/healthz --liveness`, проба egress на `bash`.
+    Каждое закрыто контрактным тестом (`tests/integration/test_compose_contract.py`,
+    `tests/contract/test_ci_workflows.py`). Приёмка всё ещё не закрыта: Docker на dev-машине нет,
+    нужен первый зелёный прогон job'а `compose-smoke` в CI.
 - [ ] **T-006** Сертификат НУЦ Минцифры в образе + `SSL_TBANK_VERIFY` + коннект-тест контуров
   - Приёмка: `REQ-broker-gateway-02`, `AC-broker-gateway-02`
   - Проверка: `make deploy-check` (TLS-часть), тест с mock
@@ -62,7 +73,13 @@
   - Статус 2026-11-19: workflow'ы написаны (quality + `suppress-growth`, tests + coverage 80%,
     миграции up/down/up, gitleaks, bandit, pip-audit, compose-smoke, deploy-check, build/push
     по digest). Приёмка — по первому фактическому прогону на зелёном коммите; локально
-    183 теста и 94.95% покрытия (инвентаризация подавлений: `docs/acceptance/m0-quality.md`).
+    210 тестов и 95.07% покрытия (инвентаризация подавлений: `docs/acceptance/m0-quality.md`).
+  - Статус 2026-11-20: шаг `pip-audit` починен поднятием пинов (`fastapi>=0.165,<0.166` →
+    starlette 1.10.0, `cryptography>=50.0,<51.0`): нижняя граница взята из версии, в которой
+    закрыт самый старший из известных advisory, понижать порог и исключать advisory не пришлось.
+    Локально шаг воспроизведён без CI (venv только с продакшн-зависимостями + `pip-audit --strict`
+    по `pip freeze --exclude-editable`) — «No known vulnerabilities found». Задача остаётся
+    открытой, пока весь workflow не станет зелёным.
 - [ ] **T-009** `storage`: Alembic + первые миграции (users, sessions, invitations, totp, backup_codes, audit_log с append-only правами)
   - Приёмка: `REQ-identity-04`, `REQ-storage-01/02`; `upgrade head` → `downgrade base` → `upgrade head`
   - Проверка: `make migrate`, `test_audit_append_only_role`

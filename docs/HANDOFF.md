@@ -1,4 +1,4 @@
-# HANDOFF — текущее состояние (обновлено 2026-11-20 04:00, UTC+5)
+# HANDOFF — текущее состояние (обновлено 2026-11-20 04:45, UTC+5)
 
 Точка входа для новой сессии. Порядок чтения: этот файл → `tasks/todo.md` → нужный раздел `docs/tz/*`.
 `docs/TZ.md` и `docs/tz/*` — контракт с заказчиком, не переписывать без запроса. Файл рабочий,
@@ -6,57 +6,72 @@
 
 ## 1. Где мы
 
-- **git**: репозиторий `github.com/rusiksoft-afk/tbot` **создан**, `main` запушена и синхронна с `origin`; HEAD — по `git log --oneline -1`
-  (цепочка: `d59922a` спецификация/ТЗ/план → `9f55120` каркас процессов → `b1e1df5` протокол приёмки качества →
-  `9a1b5ce` починка парсинга workflow → `8de3d1a` четыре причины падения CI → `3e7281c` handoff + AGENTS.md).
-- **Локальные гейты зелёные** (подробности и инвентаризация подавлений — `docs/acceptance/m0-quality.md` §1–§2):
-  `ruff format --check` / `ruff check` чисто, `mypy --strict` — 44 файла без замечаний,
-  `pytest -m "not live_api and not e2e"` — 183 passed, покрытие **94.95%** при пороге 80%, базовый уровень подавлений **14**.
-- **CI на HEAD падает.** Актуальное состояние перечитывать перед началом: `gh run list --repo rusiksoft-afk/tbot --limit 5`
-  (CI запускается на каждый push). В run `44581310609` (push `8de3d1a`): workflow **CI = failure**, workflow
-  **Image = success** (1m50s). Зелёные job'ы CI: `миграции (upgrade → downgrade → upgrade)`,
-  `проверка площадки (ожидания CI-раннера)`, `поиск секретов (gitleaks)`, `lint + typecheck + guardrails`,
-  `тесты и покрытие`. Падают два:
+- **git**: `github.com/rusiksoft-afk/tbot`, `main` синхронна с `origin`; HEAD — `git log --oneline -1`.
+- **Локальные гейты зелёные**: `ruff format --check`/`ruff check` чисто, `mypy --strict` — 48 файлов,
+  `pytest -m "not live_api and not e2e"` — **210 passed**, покрытие **95.07%** при пороге 80%,
+  подавлений **14** (инвентаризация — `docs/acceptance/m0-quality.md §2`; расхождение числа в
+  workflow и в дереве ловит `test_базовый_уровень_подавлений_совпадает_с_фактом`).
+- **Job `audit` воспроизводится локально**, без Docker: venv только с продакшн-зависимостями →
+  `pip freeze --exclude-editable` → `pip-audit --strict -r <файл>` (ровно тот же шаг, что в CI).
+  Venv держать **вне** дерева репозитория: каталог вида `.venv-audit/` внутри дерева попадает в
+  обход `scripts/count_suppressions.py` и в `ruff`/`mypy`-обходы. Проверено на
+  `%LOCALAPPDATA%/Temp/tbot-audit-venv`.
 
-### 1.1 `зависимости (pip-audit) и статический аудит` → шаг `pip-audit`
+### 1.1 Зависимости (job `audit`) — исправлено в `pyproject.toml`
 
-Найден уязвимые пакеты (полный список — `gh run view 44581310609 --repo rusiksoft-afk/tbot --log-failed`):
-
-| пакет | версия в CI | какие advisory | какие версии закрывают |
+| пакет | было | стало | почему так |
 |---|---|---|---|
-| `cryptography` | 43.0.3 | PYSEC-2026-1284, -2141, -35, -3553, -3554, GHSA-537c-gmf6-5ccf | 44.0.1, 46.0.5, 46.0.6, 48.0.1, **49.0.0** |
-| `starlette` | 0.46.2 | PYSEC-2026-1941, -1942, -161, -2280, -2281, -248, -249 | 0.47.2, 0.49.1, 1.0.1, 1.1.0, 1.3.0, **1.3.1** |
+| `fastapi` | `>=0.115,<0.116` (тянул starlette 0.46.2) | `>=0.165,<0.166` (starlette 1.10.0) | advisory по starlette закрываются только версией **1.3.1**, а fastapi 0.115–0.116 ограничивают starlette сверху 0.46, 0.120 — 0.48, 0.130 — 0.99: в этих ветках исправленную версию resolver поставить не может. Только ветки ≥0.164 требуют starlette ≥1.6 |
+| `cryptography` | `>=43.0,<44.0` (прямая зависимость, не транзитивная) | `>=50.0,<51.0` | самый «старший» fix — **50.0.0** (PYSEC-2026-3552); 49.0.0 закрывала лишь -3553/-3554, и это поймал именно локальный прогон аудита, а не CI |
 
-Причина известна: `pyproject.toml:19` — `cryptography>=43.0,<44.0`, то есть это **прямая зависимость с пином,
-запрещающим исправленные версии** (вопрос «откуда берётся cryptography» из прошлой сессии закрыт — он не транзитивный).
-`starlette` 0.46.2 приходит через `fastapi>=0.115,<0.116` (`pyproject.toml:8`).
+После бампа локально: 210 тестов, mypy без замечаний, `pip-audit --strict` по 41 продакшн-пакету —
+«No known vulnerabilities found». Конфликта с `pydantic 2.9` / `pydantic-settings 2.6` /
+`httpx 0.27` нет: fastapi требует `pydantic>=2.9`, starlette — `anyio<5,>=4`. Быстрый возврат к
+падению возможен, если advisory-базу обновят снова: тогда нижняя граница сдвигается тем же приёмом
+(сначала локальный `pip-audit`, потом CI).
 
-Что делать: поднять пины так, чтобы закрылись старшие advisory (`cryptography` → ветка ≥49.0.0;
-`starlette` → либо разрешить `fastapi`, который тянет starlette ≥1.3.1, либо зафиксировать starlette явно),
-после чего прогнать `mypy --strict`, весь `pytest`, `ruff`, и убедиться, что `pydantic 2.9` / `fastapi`
-не конфликтуют. Понижать порог аудита, исключать advisory или подавать аудит — нельзя (см. стоп-лист в `AGENTS.md`).
+### 1.2 dev-стенд (job `compose-smoke`) — починено, первого зелёного прогона в CI ещё не было
 
-### 1.2 `dev-стенд: сборка, готовность, изоляция базы` → шаг `поднять стенд`
+Предыдущий прогон job'а падал на `up --wait`: `tbot-postgres-1 is unhealthy`
+(`chmod: … Operation not permitted`, `chmod: /var/run/postgresql: Read-only file system`,
+`error: failed switching to "postgres": operation not permitted`). Разбор дал **пять** независимых
+причин, все закрыты; проверка — только в CI (Docker на dev-машине нет).
 
-`docker compose up --wait`: `dependency failed to start: container tbot-postgres-1 is unhealthy`. Журнал контейнера:
+1. **Capability у базы.** Entrypoint официального образа `postgres:16.4` под root делает
+   `chmod` каталога данных и каталога unix-сокета (нужны `FOWNER`), `chown` этих каталогов
+   (`CHOWN`) и `exec gosu postgres …`, где gosu вызывает setgroups/setgid/setuid (`SETGID`,
+   `SETUID`). Без них контейнер умирал ровно с тем сообщением из лога. Решение — якорь
+   `x-db-runtime`: те же `cap_drop: ALL`, `no-new-privileges:true`, `read_only: true`, `pids_limit`,
+   что и у всех, плюс ровно четыре `cap_add` только у `postgres`. `gosu` — не setuid-бинарник,
+   поэтому `no-new-privileges` не мешает; сервер `postgres` после переключения пользователя
+   работает вообще без capability. Исключение закреплено тестом
+   `test_база_получает_только_те_capability_которые_нужны_entrypoint` (набор == {CHOWN, FOWNER,
+   SETGID, SETUID}) и `test_прикладные_процессы_не_получают_capability`.
+2. **Каталог unix-сокета.** На read-only rootFS postgres не может создать сокет в
+   `/var/run/postgresql` → добавлен `tmpfs` (`/var/run/postgresql:size=16m,mode=1777`). Вариант
+   «перенести сокет в /tmp» не годился: временный сервер, который entrypoint поднимает во время
+   `initdb` (`pg_ctl -o "-c listen_addresses=''"`), использует каталог сокета по умолчанию.
+   Короткая форма tmpfs с опциями корректна: `docker/compose` режет строку по первому `:`
+   (`strings.Cut`) и отдаёт опции движку; дефолт Docker для tmpfs — `mode=1777`.
+3. **`listen_addresses = 'localhost'`** в `deploy/postgres/tbot.conf` — это только loopback самого
+   контейнера: web/engine/jobs получили бы `connection refused`, а наружу это выглядело бы как
+   «unhealthy web». Теперь `'*'` (наружу порт не смотрит: база только в `internal`-сети,
+   публикация портов — лишь в dev-дополнении и только на 127.0.0.1). Держится тестом
+   `test_база_слушает_не_только_loopback_внутри_контейнера`.
+4. **healthcheck `jobs`** был на `/readyz`, а готовность `jobs` на M0 честно отвечает «исполнителей
+   задач ещё нет» (это охрана от вранья в `/readyz`, см.
+   `test_исполнители_задач_появятся_не_раньше_своей_логики`) → контейнер никогда не стал бы
+   healthy. Healthcheck переведён на `/healthz` + `--liveness`; приёмка T-005 требует `/readyz` 200
+   только у web и engine. Тест: `test_процесс_jobs_проверяется_liveness_а_не_readiness`.
+5. **Шаг CI «у контейнера базы нет исходящего трафика» запускал `python3` внутри контейнера базы**,
+   а в образе `postgres` (debian-slim без recommends) Python нет вовсе — приёмка egress падала бы
+   на «executable file not found». Проба переписана на `bash` + `/dev/tcp` + `timeout`
+   (то же в `deploy/README.md`), страховка от повторения —
+   `tests/contract/test_ci_workflows.py::test_пробы_внутри_контейнера_базы_не_требуют_инструментов_которых_в_нём_нет`.
 
-```
-postgres-1 | chmod: changing permissions of '/var/lib/postgresql/data': Operation not permitted
-postgres-1 | chmod: changing permissions of '/var/run/postgresql': Read-only file system
-postgres-1 | error: failed switching to "postgres": operation not permitted
-```
-
-Корень подтверждён логом: сервис `postgres` в `deploy/compose.yaml` наследует якорь `*default-runtime`
-(`read_only: true`, `cap_drop: ALL`, `no-new-privileges`), а entrypoint официального образа `postgres:16.4`
-обязан сделать `chmod` каталога данных, `mkdir /var/run/postgresql` и смену пользователя через `gosu`.
-
-Что делать (не откатывая hardening прикладных сервисов): дать БД отдельный runtime-профиль —
-`read_only: true` сохранить, добавить `tmpfs` для `/var/run/postgresql` и `/tmp`, том `pgdata` оставить,
-а права решить либо явным `user:` + предварительной инициализацией тома, либо точечным возвратом
-`cap_add: [CHOWN, FOWNER]` только для БД с комментарием-обоснованием. Закрепить контрактным тестом в
-`tests/integration/test_compose_contract.py` (сейчас он проверяет только существование build-контекста и
-форму `# syntax=`) + не забыть `deploy/compose.override.yaml`. Реального прогона на dev-машине нет: Docker отсутствует,
-проверка только в CI.
+Остаточный риск: ни одна из правок 1–5 не проверена реальным `docker compose up` — только
+статическими контрактами и чтением entrypoint/Dockerfile образа. Следующий прогон CI может
+показать ещё одну причину (шаг `журнал контейнеров при неудаче` в job `compose-smoke` её и печатает).
 
 ### 1.3 Отдельная ловушка: тексты тоже проверяются контрактом
 
@@ -68,8 +83,9 @@ postgres-1 | error: failed switching to "postgres": operation not permitted
 
 ## 2. Следующие шаги (по порядку)
 
-1. Починить `pip-audit` (п. 1.1) и `compose-smoke` (п. 1.2), закоммитить, дождаться зелёного CI
-   (`gh run list --repo rusiksoft-afk/tbot --limit 5`).
+1. Дождаться CI на push'ах с фиксами п. 1.1 и п. 1.2 (`gh run list --repo rusiksoft-afk/tbot --limit 5`).
+   Если `compose-smoke` снова упадёт — причину искать в шаге `журнал контейнеров при неудаче`
+   (он печатает `logs --tail=200`), а не в тексте ошибки `up --wait`.
 2. `T-005` (Docker/Compose dev) — закрыть приёмку после зелёного `compose-smoke`: `/readyz` 200 у web и engine,
    у контейнера БД нет исходящего трафика; результат — строка статуса в `tasks/todo.md` + протокол в `docs/acceptance/`.
 3. `T-006` сертификат НУЦ Минцифры в образе + `SSL_TBANK_VERIFY` + коннект-тест контуров.
