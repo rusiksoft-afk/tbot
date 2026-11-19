@@ -6,13 +6,14 @@
 
 ## 1. Где мы
 
-- **git**: `main` = `8de3d1a`, репозиторий `github.com/rusiksoft-afk/tbot` **создан**, `main` запушен и синхронен
-  с `origin` (5 коммитов: `d59922a` спецификация/ТЗ/план → `9f55120` каркас процессов → `b1e1df5` протокол приёмки
-  качества → `9a1b5ce` починка парсинга workflow → `8de3d1a` четыре причины падения CI).
+- **git**: репозиторий `github.com/rusiksoft-afk/tbot` **создан**, `main` запушена и синхронна с `origin`; HEAD — по `git log --oneline -1`
+  (цепочка: `d59922a` спецификация/ТЗ/план → `9f55120` каркас процессов → `b1e1df5` протокол приёмки качества →
+  `9a1b5ce` починка парсинга workflow → `8de3d1a` четыре причины падения CI → `3e7281c` handoff + AGENTS.md).
 - **Локальные гейты зелёные** (подробности и инвентаризация подавлений — `docs/acceptance/m0-quality.md` §1–§2):
   `ruff format --check` / `ruff check` чисто, `mypy --strict` — 44 файла без замечаний,
   `pytest -m "not live_api and not e2e"` — 183 passed, покрытие **94.95%** при пороге 80%, базовый уровень подавлений **14**.
-- **CI на HEAD падает.** Run `44581310609` (push `main`, 2026-11-19 22:49): workflow **CI = failure**, workflow
+- **CI на HEAD падает.** Актуальное состояние перечитывать перед началом: `gh run list --repo rusiksoft-afk/tbot --limit 5`
+  (CI запускается на каждый push). В run `44581310609` (push `8de3d1a`): workflow **CI = failure**, workflow
   **Image = success** (1m50s). Зелёные job'ы CI: `миграции (upgrade → downgrade → upgrade)`,
   `проверка площадки (ожидания CI-раннера)`, `поиск секретов (gitleaks)`, `lint + typecheck + guardrails`,
   `тесты и покрытие`. Падают два:
@@ -56,6 +57,14 @@ postgres-1 | error: failed switching to "postgres": operation not permitted
 `tests/integration/test_compose_contract.py` (сейчас он проверяет только существование build-контекста и
 форму `# syntax=`) + не забыть `deploy/compose.override.yaml`. Реального прогона на dev-машине нет: Docker отсутствует,
 проверка только в CI.
+
+### 1.3 Отдельная ловушка: тексты тоже проверяются контрактом
+
+`tests/contract/test_no_forbidden_references.py` обходит все `.md` (и `.py`, `.yaml`, `.toml`, …) и находит запрещённое
+имя стороннего сервиса-аналога в любой строке — включая формулировки самого запрета. На `3e7281c` из-за одной такой
+строки в `AGENTS.md` впервые упал job `тесты и покрытие` (2 failed / 199 passed); формулировка заменена описательную.
+Тест намеренно собирает запрещённые подстроки из частей, поэтому в документах её не цитируют. Термины вида `noqa`,
+`nosec`, `cap_drop` в `.md` безопасны: `scripts/count_suppressions.py` (базовый уровень 14) считает их в исходниках, а не в документации.
 
 ## 2. Следующие шаги (по порядку)
 
