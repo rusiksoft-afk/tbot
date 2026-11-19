@@ -1,0 +1,106 @@
+"""Контрактный тест на файлы CI: их сначала читает GitHub, а не человек.
+
+Ошибка в YAML workflow'ах не видна ни `ruff`, ни `mypy`, ни локальными тестами — она
+проявляется только в момент запуска, когда коммит уже в `main`. Поэтому структура и ключевые
+константы проверяются здесь: парсинг YAML, обязательные job'ы, и главное — базовый уровень
+подавлений проверок должен совпадать с фактическим числом в дереве (в CI за этим следит шаг
+`suppress-growth`; здесь мы ловим расхождение до коммита).
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+from typing import Any
+
+import pytest
+import yaml
+
+ROOT = Path(__file__).resolve().parents[2]
+CI_FILE = ROOT / ".github" / "workflows" / "ci.yml"
+IMAGE_FILE = ROOT / ".github" / "workflows" / "image.yml"
+
+# Те же признаки подавления, что ищит шаг `suppress-growth` в CI.
+SUPPRESSION_RE = re.compile(r"#\s*(noqa|type:\s*ignore|pragma:\s*no cover)")
+EXCLUDED_DIR_PARTS: frozenset[str] = frozenset({".git", ".venv", "__pycache__", ".mypy_cache"})
+
+REQUIRED_JOBS: tuple[str, ...] = (
+    "quality",
+    "tests",
+    "migrations",
+    "secret-scan",
+    "audit",
+    "compose-smoke",
+    "deploy-check",
+)
+
+
+def _load(path: Path) -> dict[str, Any]:
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(payload, dict), f"{path.name}: ожидаем отображение верхнего уровня"
+    return payload
+
+
+def _count_suppressions() -> int:
+    total = 0
+    for path in ROOT.rglob("*.py"):
+        if EXCLUDED_DIR_PARTS & set(path.parts):
+            continue
+        total += len(SUPPRESSION_RE.findall(path.read_text(encoding="utf-8")))
+    return total
+
+
+@pytest.mark.parametrize("path", [CI_FILE, IMAGE_FILE], ids=["ci.yml", "image.yml"])
+def test_workflow_разбирается_как_yaml(path: Path) -> None:
+    # Именно эта проверка поймала первую версию ci.yml: unquoted `name:` со двоеточием внутри
+    # делала workflow непарсируемым, и падение было видно только в GitHub.
+    payload = _load(path)
+    assert "jobs" in payload, f"{path.name}: нет секции jobs"
+
+
+def test_обязательные_job_ы_присутствуют_и_описаны() -> None:
+    jobs = _load(CI_FILE)["jobs"]
+    missing = [name for name in REQUIRED_JOBS if name not in jobs]
+    assert not missing, f"в CI нет job'ов: {missing}"
+    for name, spec in jobs.items():
+        assert "runs-on" in spec, f"job {name}: нет runs-on"
+        steps = spec.get("steps")
+        assert isinstance(steps, list), f"job {name}: шаги должны быть списком"
+        assert steps, f"job {name}: нет шагов"
+
+
+def test_базовый_уровень_подавлений_совпадает_с_фактом() -> None:
+    """Число в workflow и число в дереве не имеют права разъезжаться.
+
+    Рост без объяснения запрещён (см. `docs/acceptance/m0-quality.md §2`), но и занижать
+    базовый уровень молча нельзя: тогда шаг `suppress-growth` перестанет что-то охранять.
+    """
+    env = _load(CI_FILE).get("env", {})
+    declared = int(str(env["SUPPRESSION_BASELINE"]))
+    actual = _count_suppressions()
+    assert declared == actual, (
+        f"SUPPRESSION_BASELINE={declared}, а в дереве {actual} — обнови значение вместе "
+        "с объяснением в описании PR и в инвентаризации подавлений"
+    )
+
+
+def test_стенд_в_ci_использует_каталог_секретов_compose() -> None:
+    """Compose разрешает `./secrets/...` относительно deploy/compose.yaml.
+
+    Если CI положит секреты в корень репозитория, стенд стартует с пустым `/run/secrets`, и
+    `web` не пройдёт `/readyz` — то есть job будет падать по причине, не связанной с кодом.
+    """
+    jobs = _load(CI_FILE)["jobs"]
+    steps = jobs["compose-smoke"]["steps"]
+    script = "\n".join(str(step.get("run", "")) for step in steps)
+    assert "mkdir -p deploy/secrets" in script
+    for name in ("db_password", "db_url", "tg_bot_token", "tg_socks_password"):
+        assert f"deploy/secrets/{name}" in script, f"секрет {name} не создаётся в нужном каталоге"
+
+
+def test_порог_покрытия_в_конфиге_не_ниже_обещанного() -> None:
+    """Порог покрытия задаётся один раз (pyproject), и он не должен «тихо» падать."""
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r"fail_under\s*=\s*([0-9.]+)", pyproject)
+    assert match, "в pyproject.toml нет fail_under для coverage"
+    assert float(match.group(1)) >= 80.0, "порог покрытия ниже обещанного в TZ §4"

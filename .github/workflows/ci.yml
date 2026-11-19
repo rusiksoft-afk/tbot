@@ -152,7 +152,7 @@ jobs:
         run: .venv-audit/bin/pip-audit --strict --local
 
   compose-smoke:
-    name: dev-стенд: сборка, готовность, изоляция базы
+    name: 'dev-стенд: сборка, готовность, изоляция базы'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
