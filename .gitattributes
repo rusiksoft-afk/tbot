@@ -1,0 +1,31 @@
+# Нормализация переводов строк: в репозитории хранится LF, рабочих копий на Windows это не
+# ломает, но скрипты, попадающие в Linux-контейнеры, всегда получают LF.
+* text=auto
+
+*.md text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+*.cfg text eol=lf
+*.json text eol=lf
+*.sql text eol=lf
+*.j2 text eol=lf
+*.html text eol=lf
+*.css text eol=lf
+*.js text eol=lf
+*.po text eol=lf
+*.pot text eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
+*.woff2 binary
+*.zip binary
+*.dat binary
+
+# Защита от случайного коммита ключей и секретов (двойная страховка к .gitignore).
+*.pem binary
+*.key binary

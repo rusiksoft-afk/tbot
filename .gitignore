@@ -1,0 +1,61 @@
+# Секреты и ключи — никогда не коммитить (TZ §15.4, TZ §8.4)
+ssh-key/
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+.known_hosts
+known_hosts
+*.kdbx
+
+# Ключ шифрования токенов (KEK) — только на хосте, права 0400
+keys/
+*.kek
+kek*.json
+
+# Окружение и локальные конфиги с токенами
+.env
+.env.*
+!.env.example
+configs/local.yaml
+configs/*.local.yaml
+configs/secrets/
+
+# Данные и артефакты
+backups/
+data/
+parquet/
+*.dump
+*.pgdata/
+.history/
+.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+coverage.xml
+htmlcov/
+*.log
+
+# Инструменты и IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# Локальные выгрузки исследований (документация брокера целиком — не в git)
+docs/research/raw/
+docs/acceptance/_private/
+
+# Разрешаем примеры
+!configs/tbot.example.yaml
+!configs/commissions.example.yaml
+!.env.example
