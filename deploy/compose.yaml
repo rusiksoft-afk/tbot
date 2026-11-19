@@ -32,6 +32,39 @@ x-runtime: &default-runtime
     - /tmp:size=64m,mode=1777
   logging: *default-logging
 
+x-db-runtime: &db-runtime
+  restart: unless-stopped
+  init: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  # Единственное точечное исключение в стенде — и только для базы.
+  # Entrypoint официального образа postgres (см. /usr/local/bin/docker-entrypoint.sh):
+  #   * CHOWN, FOWNER — меняет владельца каталога данных и каталога unix-сокета
+  #     (`chown … '{}' +`, `chmod 03775 /var/run/postgresql`);
+  #   * SETGID, SETUID — `gosu postgres` делает setgroups/setgid/setuid и только после этого
+  #     exec'ит сервер; без них контейнер падает на `failed switching to "postgres"`.
+  # Границы исключения: `no-new-privileges` сохранён (gosu — не setuid-бинарник, привилегии
+  # он получает системными вызовами, а `postgres` после переключения пользователя работает
+  # вообще без capability); исходящего трафика у базы по-прежнему нет (сеть `internal`,
+  # порты наружу не публикуются), поэтому SETUID/SETGID не добавляют ни сетевой доступ,
+  # ни доступа к хосту. Держимся минимального набора — он закреплен контрактом
+  # `test_база_получает_только_те_capability_которые_нужны_entrypoint`.
+  cap_add:
+    - CHOWN
+    - FOWNER
+    - SETGID
+    - SETUID
+  pids_limit: 256
+  read_only: true
+  tmpfs:
+    - /tmp:size=64m,mode=1777
+    # Каталог unix-сокета: на read-only корневой ФС postgres не может ни создать этот
+    # каталог, ни записать в него файл сокета — поэтому он вынесен на отдельный tmpfs.
+    - /var/run/postgresql:size=16m,mode=1777
+  logging: *default-logging
+
 x-app-env: &app-env
   TBOT_SECRETS_DIR: /run/secrets
   TBOT_LOG_JSON: "true"
@@ -63,7 +96,7 @@ services:
       start_period: 20s
     networks:
       - tbot-backend
-    <<: *default-runtime
+    <<: *db-runtime
 
   web:
     build:
@@ -180,13 +213,18 @@ services:
     networks:
       - tbot-backend
     healthcheck:
+      # Liveness, а не readiness: на M0 у `jobs` нет ни одного исполнителя задач, и `executors_check`
+      # честно отвечает «не готово» (это охрана от того, чтобы `/readyz` врал о готовности).
+      # Готовность задач проверяется отдельно — шагами CI и `/readyz` после появления исполнителей
+      # (M2 и далее, см. docs/tz/12 §12.3).
       test:
         - CMD
         - python
         - -m
         - packages.common.health_probe
+        - --liveness
         - --url
-        - http://127.0.0.1:9103/readyz
+        - http://127.0.0.1:9103/healthz
       interval: 20s
       timeout: 5s
       retries: 5

@@ -102,3 +102,22 @@ def test_порог_покрытия_в_конфиге_не_ниже_обеща�
     match = re.search(r"fail_under\s*=\s*([0-9.]+)", pyproject)
     assert match, "в pyproject.toml нет fail_under для coverage"
     assert float(match.group(1)) >= 80.0, "порог покрытия ниже обещанного в TZ §4"
+
+
+def test_пробы_внутри_контейнера_базы_не_требуют_инструментов_которых_в_нём_нет() -> None:
+    """В образе postgres нет python3 — debian-slim без recommends, пакетов Python там нет.
+
+    Шаг «у контейнера базы нет исходящего трафика» запускает пробу внутри контейнера базы;
+    с `python3` он падал бы на `executable file not found`, то есть приёмка egress вообще
+    не выполнялась бы. Разрешены только bash (он есть в образе — entrypoint написан на bash)
+    и coreutils.
+    """
+    steps = _load(CI_FILE)["jobs"]["compose-smoke"]["steps"]
+    probes = [
+        str(step.get("run", "")) for step in steps if "exec -T postgres" in str(step.get("run", ""))
+    ]
+    assert probes, "проверка egress контейнера базы пропала из job `compose-smoke`"
+    for script in probes:
+        assert "postgres bash" in script, "проба внутри базы должна запускать bash"
+        for missing in ("python3", "curl", "wget", "nc "):
+            assert missing not in script, f"в образе postgres нет {missing.strip()}"

@@ -193,18 +193,18 @@ jobs:
           docker compose -f deploy/compose.yaml -f deploy/compose.override.yaml \
             exec -T jobs python -m packages.common.health_probe --liveness --url http://127.0.0.1:9103/healthz
       - name: у контейнера базы нет исходящего трафика
+        # В образе postgres нет python3 (debian-slim + postgresql без recommends), поэтому
+        # проба — на bash: /dev/tcp — встроенная возможность bash, а `timeout` — coreutils.
         run: |
-          docker compose -f deploy/compose.yaml -f deploy/compose.override.yaml exec -T postgres python3 - <<'PY'
-          import socket
-          import sys
-          try:
-              socket.create_connection(("8.8.8.8", 443), timeout=5)
-          except OSError:
-              print("OK: исходящий трафик базы заблокирован (внутренняя сеть)")
-              sys.exit(0)
-          print("FAIL: у базы появилось исходящее соединение")
-          sys.exit(1)
-          PY
+          docker compose -f deploy/compose.yaml -f deploy/compose.override.yaml \
+            exec -T postgres bash -s <<'SH'
+          set -u
+          if timeout 6 bash -c 'exec 3<>/dev/tcp/8.8.8.8/443' 2>/dev/null; then
+            echo "FAIL: у базы появилось исходящее соединение" >&2
+            exit 1
+          fi
+          echo "OK: исходящий трафик базы заблокирован (внутренняя сеть)"
+          SH
       - name: журнал контейнеров при неудаче
         if: failure()
         run: docker compose -f deploy/compose.yaml -f deploy/compose.override.yaml logs --tail=200

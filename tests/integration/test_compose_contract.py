@@ -15,6 +15,20 @@ from tests.paths import COMPOSE_BASE, COMPOSE_OVERRIDE, DOCKERFILE
 
 LONG_RUNNING = ("web", "engine", "tgbot", "jobs")
 
+# Минимальный набор capability, который нужен entrypoint официального образа postgres:
+# chown/chmod каталога данных и каталога unix-сокета (CHOWN, FOWNER) и переключение на
+# пользователя postgres через gosu — setgroups/setgid/setuid (SETGID, SETUID).
+DB_CAPS_ALLOWED: frozenset[str] = frozenset({"CHOWN", "FOWNER", "SETGID", "SETUID"})
+
+
+def _postgres_conf_values() -> dict[str, str]:
+    conf = (COMPOSE_BASE.parent / "postgres" / "tbot.conf").read_text(encoding="utf-8")
+    return {
+        line.split("=")[0].strip(): line.split("=", 1)[1].strip().strip("'\"")
+        for line in conf.splitlines()
+        if "=" in line and not line.strip().startswith("#")
+    }
+
 
 def _base() -> dict[str, Any]:
     data = yaml.safe_load(COMPOSE_BASE.read_text(encoding="utf-8"))
@@ -149,17 +163,71 @@ def test_дополнение_dev_публикует_порты_только_н�
 
 def test_параметры_базы_под_ограничения_площадки() -> None:
     """OQ-11: shared_buffers ≤512MB и max_connections ≤60 для 2 vCPU / 3.8 GiB."""
-    conf = (COMPOSE_BASE.parent / "postgres" / "tbot.conf").read_text(encoding="utf-8")
-    values = {
-        line.split("=")[0].strip(): line.split("=", 1)[1].strip().strip("'\"")
-        for line in conf.splitlines()
-        if "=" in line and not line.strip().startswith("#")
-    }
+    values = _postgres_conf_values()
     assert values["max_connections"] == "60"
     shared_buffers = values["shared_buffers"]
     assert shared_buffers.endswith("MB")
     assert int(shared_buffers[:-2]) <= 512, "для OQ-11 shared_buffers не выше 512MB"
     assert values["timezone"] == "UTC"
+
+
+def test_база_слушает_не_только_loopback_внутри_контейнера() -> None:
+    """Приложение ходит в базу по TCP через сеть `tbot-backend`.
+
+    `listen_addresses = 'localhost'` — это только loopback самого контейнера, и тогда
+    web/engine/jobs получают «connection refused», а job `compose-smoke` падает на
+    неготовом `/readyz` — по причине, которую по журналу базы не найти.
+    """
+    assert _postgres_conf_values()["listen_addresses"] == "*", (
+        "внутри контейнера база обязана слушать все интерфейсы: наружу её порт не смотрит, "
+        "потому что база подключена только к internal-сети, а публикация портов есть "
+        "только в dev-дополнении и только на 127.0.0.1"
+    )
+
+
+def test_база_получает_только_те_capability_которые_нужны_entrypoint() -> None:
+    """Исключение из `cap_drop: ALL` разрешено только базе и только в этом наборе.
+
+    Без CHOWN/FOWNER entrypoint не может подготовить каталоги, а без SETGID/SETUID он
+    падает на `failed switching to \"postgres\"` (gosu делает setgroups/setgid/setuid).
+    Всё остальное обязано оставаться сброшенным; `no-new-privileges` и read-only rootfs
+    сохраняются и у базы — исключение не должно превратиться в «обычный» контейнер.
+    """
+    postgres = _base()["services"]["postgres"]
+    assert postgres.get("cap_drop") == ["ALL"], "у базы список capability сбрасывается целиком"
+    granted = set(postgres.get("cap_add", []))
+    assert (
+        granted == DB_CAPS_ALLOWED
+    ), f"у базы capability {sorted(granted)}, а обосновано только {sorted(DB_CAPS_ALLOWED)}"
+    assert "no-new-privileges:true" in postgres.get("security_opt", [])
+    assert postgres.get("read_only") is True, "read-only rootfs у базы сохраняется"
+    tmpfs_paths = [str(item).split(":", 1)[0] for item in postgres.get("tmpfs", [])]
+    assert "/var/run/postgresql" in tmpfs_paths, (
+        "каталог unix-сокета базы обязан быть на записи: на read-only rootfs postgres не "
+        "может создать в нём сокет"
+    )
+
+
+@pytest.mark.parametrize("service", [*LONG_RUNNING, "migrate"])
+def test_прикладные_процессы_не_получают_capability(service: str) -> None:
+    """Точечное исключение — только у postgres; прикладные процессы запускаются под uid 10001."""
+    spec = _base()["services"][service]
+    assert spec.get("cap_drop") == ["ALL"]
+    assert "cap_add" not in spec, f"{service}: возвращать capability прикладному процессу нельзя"
+
+
+def test_процесс_jobs_проверяется_liveness_а_не_readiness() -> None:
+    """На M0 у `jobs` нет ни одного исполнителя задач, и `/readyz` честно отвечает 503.
+
+    Если оставить healthcheck на `/readyz`, `up --wait` никогда не станет зелёным, а
+    приёмка T-005 («/readyz» 200 у web и engine) этого и не требует. Проверка готовности
+    задач вернётся вместе с исполнителями (M2, docs/tz/12 §12.3) — см.
+    `tests/unit/test_jobs_registry.py::test_исполнители_задач_появятся_не_раньше_своей_логики`.
+    """
+    test_command = _base()["services"]["jobs"]["healthcheck"]["test"]
+    joined = " ".join(str(item) for item in test_command)
+    assert "--liveness" in joined, "healthcheck jobs обязан использовать флаг --liveness"
+    assert "/healthz" in joined, "healthcheck jobs обязан опрашивать /healthz (liveness)"
 
 
 def test_образ_запускается_от_ne_root() -> None:
