@@ -95,7 +95,7 @@
 | Тесты | pytest, pytest-asyncio, hypothesis, Playwright (e2e), gRPC mock-сервер | `docs/tz/13` |
 | Линт/типы | ruff (format+lint), mypy --strict, bandit, pip-audit, gitleaks | CI обязателен |
 | Контейнеры | Docker (multi-stage), docker compose v2; образ на `python:3.12-slim` + корневой сертификат НУЦ Минцифры | TLS брокера |
-| Reverse proxy | Caddy (авто-сертификаты LE) или nginx | TLS 1.2/1.3, HSTS, rate limit, IP-allowlist |
+| Reverse proxy | Caddy (авто-сертификаты LE) или nginx | TLS 1.2/1.3, HSTS, пределы запроса; rate limit — прикладной счётчик (Caddy без плагинов), IP-allowlist |
 | CI/CD | GitHub Actions (приватный репозиторий) + GHCR для образов | build/test/scan; деплой — ручной запуск |
 
 Версии зависимостей пинятся (`uv.lock` или `requirements-*.txt` с хешами). Любое обновление

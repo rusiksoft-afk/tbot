@@ -290,6 +290,41 @@ jobs:
             sudo chmod 600 "/etc/tbot/secrets/$name"
           done
           sudo ls -l /etc/tbot/secrets
+
+      - name: 'скрипт ввода секретов прогоняется на фиктивных значениях'
+        # Значения фиктивные, и это не подделка приёмки: проверяется механизм — режим 600,
+        # владелец root, побайтовая длина (лишний перевод строки ломает DSN и токен), порядок
+        # «значение → свой файл» и то, что `--check` замечает испорченный режим. Настоящие
+        # значения в логах и в чате запрещены (стоп-лист `AGENTS.md`), поэтому класс ошибок
+        # ловится здесь.
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp -d)
+          # длины фиктивных значений — 2, 4, 6, 8 байт: длина файла доказывает, что перевод
+          # строки не дописан (`printf '%s'`), а порядок ответов — что имя не перепутано.
+          printf 'aa\nbbbb\ncccccc\ndddddddd\n' \
+            | sudo env TBOT_SECRETS_SETUP_DIR="$tmp" bash deploy/vps/secrets-setup.sh
+          sudo env TBOT_SECRETS_SETUP_DIR="$tmp" bash deploy/vps/secrets-setup.sh --check
+          for pair in db_password:2 db_url:4 ghcr_token:6 telegram_token:8; do
+            name=${pair%%:*}
+            want=${pair##*:}
+            got=$(sudo stat -c '%s' "$tmp/$name")
+            if [ "$got" != "$want" ]; then
+              echo "FAIL: $name: $got байт, ожидалось $want — дописан перевод строки?" >&2
+              exit 1
+            fi
+          done
+          # значение обязано попасть в свой файл, а не в следующий по порядку
+          printf 'aa' | sudo cmp - "$tmp/db_password"
+          printf 'cccccc' | sudo cmp - "$tmp/ghcr_token"
+          # негативная проба: `--check` обязан падать на испорченном режиме, иначе проверка прав
+          # — украшение
+          sudo chmod 644 "$tmp/db_url"
+          if sudo env TBOT_SECRETS_SETUP_DIR="$tmp" bash deploy/vps/secrets-setup.sh --check; then
+            echo "FAIL: --check пропустил режим 644" >&2
+            exit 1
+          fi
+          sudo rm -rf "$tmp"
       - name: 'docker compose config: боевой overlay'
         run: |
           # Версия печатается намеренно: раннер даёт свой compose (на 2026-11-20 — v5.1.3),

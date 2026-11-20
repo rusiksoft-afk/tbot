@@ -29,6 +29,13 @@ chmod 600 deploy/secrets/*
 боевого бота в этот каталог не кладутся: они существуют только на площадке
 (`/etc/tbot/secrets`, права `600`).
 
+На площадке имена другие — их задаёт `deploy/compose.prod.yaml` в секции `secrets:`:
+`db_password`, `db_url`, `telegram_token`, `telegram_socks_pass` (плюс хостовый `ghcr_token`,
+который в контейнеры не монтируется). Значения кладёт только заказчик — скриптом
+`vps/secrets-setup.sh`, а готовность проверяется без содержимого: `sudo bash
+vps/secrets-setup.sh --check` (`docs/runbook/secrets-on-host.md`). Путать два набора имён
+нельзя: в `/etc/tbot/secrets` файлы с именами `tg_bot_token`/`tg_socks_password` создавать не нужно.
+
 Запуск dev-стенда
 
 ```bash
@@ -102,9 +109,11 @@ docker compose -f compose.yaml -f compose.prod.yaml --env-file tbot.prod.env up 
   `tgbot` и `jobs` ключа `ports` в бою нет (лишняя публикация появилась бы именно при слиянии —
   compose объединяет `ports` и `networks` по имени сервиса);
 - секреты только файлами из `/etc/tbot/secrets`: `db_password` (база), `db_url` (`migrate`, `web`,
-  `engine`, `jobs`), `tg_bot_token` и `tg_socks_password` (`tgbot`); у `caddy` секретов нет, а
-  переменные окружения `POSTGRES_PASSWORD` и `TBOT_DB_URL` пробрасываются из env и должны
-  совпасть с файлами (`scripts/check_db_url.py`);
+  `engine`, `jobs`), `tg_bot_token` и `tg_socks_password` (`tgbot`); у `caddy` секретов нет.
+  `postgres` читает пароль из `POSTGRES_PASSWORD_FILE` (`/run/secrets/db_password`) — пароля в
+  `environment` нет ни в базе, ни в overlay. Пароль внутри `db_url` обязан совпадать с файлом
+  `db_password`: статически это не проверяется, расхождение видно только по первому коннекту
+  (`password authentication failed`);
 - `caddy` монит в `:ro` файлы `./caddy/Caddyfile` и `./caddy/templates`, поэтому при смене конфига
   достаточно `docker compose ... restart caddy` (или `caddy reload`); том `caddy_data` обязан
   переживать `up -d` — в нём сертификат Let's Encrypt (лимит 50 выпусков на домен в неделю);
@@ -115,6 +124,12 @@ docker compose -f compose.yaml -f compose.prod.yaml --env-file tbot.prod.env up 
 
 Журнал доступа Caddy фильтруется (`format filter`): query-параметры `token`, `key`, `sig`,
 заголовок `X-Api-Key` и заголовки учётных данных пишутся как `REDACTED` — иначе одноразовая ссылка
-на отчёт попадает в файл на диске (TZ §8.4). HTTP/3 выключён (`protocols h1 h2`), потому что
-UDP/443 не открыт: иначе браузер первым идёт по QUIC и ловит тайм-аут. Разбор и пробы —
-`docs/acceptance/tls-edge.md`.
+на отчёт попадает в файл на диске (TZ §8.4). HTTP/3 включён (`protocols h1 h2 h3`): `443/udp`
+открыт решением заказчика (`docs/adr/ADR-003`), правило `allow 443/udp` лежит в
+`vps/ufw.rules`, а проход UDP/443 через облачную группу безопасности подтверждён счётчиком правила
+`ufw` (20 датаграмм снаружи → 20 пакетов / 900 байт). Эти две правки связаны контрактом
+`test_HTTP_3_объявлен_только_вместе_с_открытым_UDP_443`: снять udp-правило можно только вместе с
+`h3`. Разбор и пробы — `docs/acceptance/tls-edge.md`.
+
+Боевой запуск на площадке, порядок шагов и приёмка периметра — `docs/runbook/stand-deploy.md`
+(команды только через `sudo docker`, `ADR-003 §3`).

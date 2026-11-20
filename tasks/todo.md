@@ -475,11 +475,12 @@
     (json-file 50 МБ × 10), smoke-подтверждения hardening на площадке (read-only, `NoNewPrivs: 1`,
     `CapEff: 0`, `--network none` → только `lo`, egress контейнера → `ghcr.io/v2/` 401) —
     `docs/acceptance/prod-firewall.md §5`.
-  - Что блокирует остаток: **read-only токен GHCR не размещён** (`/etc/tbot/secrets/ghcr_token`,
-    процедура — `docs/runbook/ghcr-pull.md §3`; дайджесты текущего релиза выписаны там же),
-    нет секретов приложения (`/etc/tbot/secrets/db_password`, `db_url`) и нет разрешения заказчика
-    на деплой состава на живую ВМ (стоп-лист в `AGENTS.md` всё ещё запрещает Docker/80/443/Caddy,
-    а `docs/adr/ADR-001` их разрешает — см. `docs/acceptance/tls-edge.md §7`).
+  - Что блокирует остаток (обновлено 2026-11-20 вечером): **блокировок нет** — шесть ответов
+    заказчика получены и закреплены в `docs/adr/ADR-003-prod-deploy-edge-decisions.md`
+    (деплой разрешён, доступ через `sudo`, секреты кладёт заказчик). Нужны действия владельца
+    площадки: выпустить и завести `ghcr_token` и секреты приложения скриптом
+    `deploy/vps/secrets-setup.sh`; добавить публичную часть deploy-ключа ВМ в репозиторий
+    (read-only); сообщить логин — владельца токена; согласовать `systemctl restart docker` и ребут.
     Проверка pull по digest для публичного образа
     выполнена: `postgres:16.4` = `sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412`.
   - Что сделано дополнительно 2026-11-20: `deploy/compose.prod.yaml` написан (единственные
@@ -495,6 +496,16 @@
     `docker compose config` + `scripts/prod_compose_check.py` + `caddy validate` внутри образа с
     закреплённым digest) и статически (`test_compose_prod_contract`, `test_prod_compose_check`).
     Остаток задачи — реальный `pull → migrate → restart` и учебный откат на площадке.
+  - Добавлено 2026-11-20 (вечер): порядок деплоя описан в `docs/runbook/stand-deploy.md`
+    (клон по read-only deploy-ключу, `config` на ВМ, `pull` по digest, `migrate`, первый срез
+    `postgres + web + caddy`); ввод секретов — новый артефакт `deploy/vps/secrets-setup.sh` и
+    `docs/runbook/secrets-on-host.md`; `AGENTS.md` приведён к `ADR-001`; дайджесты в
+    `deploy/tbot.prod.env` пересняты с commit `21579ba` (run `Image` 44708907667).
+  - Новая подзадача остатка: `scripts/deploy_check.py` ищет в каталоге секретов имена
+    *конфигурации* (`tg_bot_token`, `tg_socks_password`), а на площадке файлы названы по TZ §14.3
+    (`telegram_token`, `telegram_socks_pass`) → `secret_files` краснеет на готовой площадке.
+    Чинить по замеру на хосте, файлы с именами конфигурации создавать нельзя (имена задаёт
+    `deploy/compose.prod.yaml`) — `docs/runbook/stand-deploy.md §8`.
 - [ ] **T-713** Caddy + сертификат Let's Encrypt на `tbot.rusiksoft.ru`, редирект HTTP→HTTPS, HSTS, базовые заголовки CSP/CSRF-защита уровня прокси
   - Приёмка: TZ §8.3, §14.9; в браузере — валидный сертификат, HSTS, редирект
   - Проверка: `curl -I https://tbot.rusiksoft.ru/healthz`, тест на отсутствие смешанного содержимого и внешних CDN
@@ -513,13 +524,23 @@
     опция `log_credentials`; (2) Caddy сам навешивал `Alt-Svc: h3`, а UDP/443 не открыт →
     `protocols h1 h2`; (3) фактический порог `max_header_size 16KB` измерен: 431 начинается с
     ≈21 КиБ, а не ровно с 16 КиБ.
+  - Изменения после ответов заказчика (тот же день, вечер): `443/udp` открыт (правило в
+    `deploy/vps/ufw.rules` + применено на площадке), **HTTP/3 включён** — Caddyfile переведён на
+    `protocols h1 h2 h3`. Проход udp доказан счётчиком правила: 20 датаграмм снаружи →
+    `20 900 ACCEPT udp dpt:443` в `ufw-user-input` (`docs/acceptance/tls-edge.md §2.1`); локально
+    переснято: `adapt` даёт `protocols ["h1","h2","h3"]`, в ответе появился `Alt-Svc: h3`,
+    udp-сокет поднят. Связка «udp-правило ↔ h3» держится тестом
+    `test_HTTP_3_объявлен_только_вместе_с_открытым_UDP_443`.
   - Что осталось (требует деплоя): выпуск сертификата ACME, `curl -I https://…/healthz`,
     редирект :80→:443 живым трафиком, заголовки против живого `web`, `openssl s_client -tls1_1`
-    (отказ), ротация логов `json-file` в контейнере, поведение после рестарта docker и ребута.
-  - Что блокирует деплой: разрешение заказчика (стоп-лист `AGENTS.md` против `ADR-001`),
-    секреты `db_password`/`db_url` (и `telegram_token` для `tgbot`), решение по ограничителю
-    запросов (TZ §8.3 ждёт `limit_req`, у Caddy без плагинов его нет) и по UDP/443 —
-    `docs/acceptance/tls-edge.md §7`.
+    (отказ), `curl --http3` (на dev-машине curl 8.22.0 без nghttp3 — проверять на площадке или
+    счётчиком udp), ротация логов `json-file` в контейнере, поведение после рестарта docker и ребута.
+  - Блокировки сняты 2026-11-20 (вечер): деплой разрешён и описан в
+    `docs/runbook/stand-deploy.md`, доступ к Docker — через `sudo`, ограничитель запросов
+    перенесён в приложение (TZ §8.3 поправлен с разрешения заказчика, `ADR-003 §4`), `443/udp`
+    открыт, `80/tcp` остаётся, секреты кладёт заказчик скриптом `deploy/vps/secrets-setup.sh`.
+    Ждут только действия владельца площадки (секреты, deploy-ключ, логин владельца `ghcr_token`,
+    согласие на рестарт docker и ребут) — `docs/acceptance/tls-edge.md §7`.
 
 ## Позже (вне M0–M7, зафиксировано объёмом ТЗ)
 
