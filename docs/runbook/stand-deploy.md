@@ -32,7 +32,12 @@ sudo ssh-keygen -t ed25519 -f /root/.ssh/tbot_deploy_key -N '' -C 'deploy-key/tb
 sudo cat /root/.ssh/tbot_deploy_key.pub          # публичная часть — не секрет
 # владелец репозитория добавляет её: Settings → Deploy keys → Add (не ставить write access)
 sudo sh -c 'ssh-keyscan -t ed25519 github.com >> /root/.ssh/known_hosts'
-sudo git clone git@github.com:rusiksoft-afk/tbot.git /opt/tbot
+# Ключ назван НЕ id_ed25519 — ssh сам его не предложит (он перебирает только id_*), поэтому
+# путь обязан быть указан явно и для проверки, и для клона:
+KEYOPTS="-o IdentitiesOnly=yes -o BatchMode=yes -i /root/.ssh/tbot_deploy_key"
+sudo ssh $KEYOPTS -T git@github.com        # ожидание: Hi rusiksoft-afk/tbot! …
+sudo GIT_SSH_COMMAND="ssh $KEYOPTS -o StrictHostKeyChecking=accept-new" \
+  git clone git@github.com:rusiksoft-afk/tbot.git /opt/tbot
 cd /opt/tbot && git log --oneline -1
 ```
 
@@ -51,8 +56,10 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINLDO6mbx5f5R1gtTC3wqbVygUWDXHuUpMnRbKGe7MpX
 отказывается. Если ключ хоста в известном каталоге появится другим (смена балансировщика GitHub),
 клон упадёт с `HOST KEY CHANGE` — править запись надо вручную, а не «принимать снова вслепую».
 
-**Статус клона на 2026-11-20 13:45:** ключ в GitHub ещё **не добавлен** — проверка с ВМ отвечает
-`git@github.com: Permission denied (publickey)`. Порядок на этом этапе: заказчик добавляет
+**Замер 2026-11-20 14:05:** deploy key добавлен заказчиком и **работает** — но только при явном
+`-i /root/.ssh/tbot_deploy_key -o IdentitiesOnly=yes`: без них ssh предлагает только
+`/root/.ssh/id_*` (их нет) и отвечает `Permission denied (publickey)`. Первая проба без
+ключей дала ложный вывод «ключ не добавлен» — это ловушка, а не состояние площадки. Порядок на этом этапе: заказчик добавляет
 публичную часть как read-only deploy key → агент делает `sudo git clone` и дальше идёт по
 ранбуку. Секретов на площадке тоже ещё нет (`--check` красный по четырём файлам), но скрипт
 ввода уже лежит на ВМ как `/tmp/secrets-setup.sh` с совпадающей контрольной суммой
