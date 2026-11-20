@@ -100,7 +100,12 @@ trap 'if [[ "$HISTORY_ENABLED" == "1" ]]; then set -o history; fi' EXIT
 umask 077
 install -d -m 700 -o root -g root "$SECRETS_DIR"
 
-name val written=0
+# Ловушка bash, на который этот цикл уже спотыкался: `name val written=0` — это не объявление
+# трёх переменных, а запуск команды `name` с аргументами (`command not found` при первом же
+# прогоне). Объявление переменной без значения в bash пишется отдельно или через `declare`.
+# Поймал не человек, а поведенческий прогон скрипта в job `prod-config` (прогон 44716225556):
+# на dev-машине цикл не исполняется, потому что скрипт требует root.
+written=0
 for name in "${SECRET_NAMES[@]}"; do
   if [[ -e "$SECRETS_DIR/$name" ]]; then
     existing_mode=$(stat -c '%a' "$SECRETS_DIR/$name")
