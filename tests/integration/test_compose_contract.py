@@ -11,7 +11,7 @@ from typing import Any
 import pytest
 import yaml
 
-from tests.paths import COMPOSE_BASE, COMPOSE_OVERRIDE, DOCKERFILE
+from tests.paths import COMPOSE_BASE, COMPOSE_OVERRIDE, DOCKERFILE, ROOT, load_script
 
 LONG_RUNNING = ("web", "engine", "tgbot", "jobs")
 
@@ -258,3 +258,42 @@ def test_образ_запускается_от_ne_root() -> None:
     dockerfile = (COMPOSE_BASE.parent / "Dockerfile").read_text(encoding="utf-8")
     assert "useradd --uid 10001" in dockerfile
     assert "USER 10001:10001" in dockerfile
+
+
+def test_образ_кладёт_корень_нц_до_пересборки_связки_доверия() -> None:
+    """Порядок шагов в Dockerfile — единственное, что гарантирует доверие к брокеру в образе.
+
+    `update-ca-certificates` пересобирает `/etc/ssl/certs/ca-certificates.crt` из того, что уже
+    лежит в `/usr/local/share/ca-certificates`. Если копирование корня идёт после этого шага,
+    сборка выглядит успешной, а доверия в образе нет: приложение спотыкается уже в бою, где
+    сеть к брокеру есть, а корня нет. Поведенчески это проверяет шаг compose-smoke «корень НУЦ
+    установлен в системный набор доверия образа», а порядок закрепляется здесь.
+    """
+    ca_policy = load_script("ca_policy")
+    dockerfile = DOCKERFILE.read_text(encoding="utf-8")
+    copy_marker = f"COPY deploy/ca/ {ca_policy.CA_IMAGE_DIR}/"
+    assert copy_marker in dockerfile, (
+        f"в Dockerfile нет копирования корня в {ca_policy.CA_IMAGE_DIR} — каталог якорей "
+        "разошёлся с scripts/ca_policy.py"
+    )
+    copy_at = dockerfile.index(copy_marker)
+    update_at = dockerfile.index("update-ca-certificates")
+    assert copy_at < update_at, (
+        "`update-ca-certificates` исполняется раньше, чем скопирован корень: связка доверия "
+        "образа останется без него"
+    )
+
+
+def test_публичный_корень_нц_не_прячется_в_gitignore() -> None:
+    """`*.pem` в `.gitignore` защищает от приватных ключей, но публичный корень — артефакт сборки.
+
+    Если `deploy/ca/ru-trusted-root-ca.pem` не попадает в коммит, в свежем чекауте в образ
+    копируется только README: сборка и `up --wait` остаются зелёными, а доверия к брокеру в
+    образе нет — приложение спотыкается уже в бою. Поэтому для этого каталога нужна явная
+    отмена игнорирования, и она здесь закреплена.
+    """
+    ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
+    assert "!deploy/ca/*.pem" in ignore, (
+        "в .gitignore нет `!deploy/ca/*.pem`: публичный корень НУЦ не попадёт в коммит, "
+        "и в образе не будет доверия к брокеру"
+    )

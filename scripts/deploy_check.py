@@ -21,10 +21,15 @@ import socket
 import ssl
 import subprocess  # nosec B404 — ниже только вызовы с фиксированным списком аргументов
 import sys
+from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
+import ca_policy
 from _bootstrap import ensure_repo_root_on_path
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
 
 from packages.common.config import ConfigError, Contour, Settings, load_settings
 
@@ -42,9 +47,13 @@ BROKER_TLS_TARGETS: tuple[tuple[str, int], ...] = (
     ("sandbox-invest-public-api.tbank.ru", 443),
 )
 
-# Отпечаток корневого сертификата НУЦ. Заполняется вместе с T-709: до заполнения проверка
-# выполняется «как есть» и обязана честно сообщать, что корень не подтверждён.
-EXPECTED_CA_FINGERPRINT: str | None = None
+# Корень НУЦ («Российский доверенный корневой»): артефакт, отпечаток и границы срока закреплены
+# в scripts/ca_policy.py — одном месте для `deploy-check`, приёмочной пробы и CI. Здесь они
+# берутся оттуда же: вывод проверки площадки и вывод CI не имеют права разойтись.
+CA_FILE = ca_policy.CA_FILE
+EXPECTED_CA_FINGERPRINT = ca_policy.EXPECTED_CA_FINGERPRINT
+MIN_ROOT_DAYS_LEFT = ca_policy.MIN_ROOT_DAYS_LEFT
+MIN_LEAF_DAYS_LEFT = ca_policy.MIN_LEAF_DAYS_LEFT
 
 FATAL = "fatal"
 WARN = "warn"
@@ -174,8 +183,23 @@ def check_resources() -> CheckResult:
     return CheckResult("resources", True, detail)
 
 
-def _verify_chain(host: str, port: int) -> tuple[bool, str]:
-    """TLS-соединение со стандартным набором доверия: без `-k`, без отключения проверок."""
+def cert_not_after(certificate: Mapping[str, object]) -> datetime | None:
+    """Срок действия сертификата из `getpeercert()` (формат SSL — «Aug 24 11:38:26 2027 GMT»)."""
+    raw = str(certificate.get("notAfter") or "")
+    if not raw:
+        return None
+    try:
+        return datetime.fromtimestamp(ssl.cert_time_to_seconds(raw), UTC)
+    except ValueError:
+        return None
+
+
+def _verify_chain(host: str, port: int) -> tuple[bool, str, datetime | None]:
+    """TLS-соединение со стандартным набором доверия: без `-k`, без отключения проверок.
+
+    Третье значение — срок действия сертификата: «цепочка доверена, но сертификат почти истёк»
+    готовностью не считается, поэтому дата нужна вызывающему коду, а не только для текста.
+    """
     context = ssl.create_default_context()
     try:
         with (
@@ -184,33 +208,125 @@ def _verify_chain(host: str, port: int) -> tuple[bool, str]:
         ):
             certificate = tls.getpeercert()
     except ssl.SSLCertVerificationError as exc:
-        return False, f"цепочка не доверена ({exc.verify_code}): {exc.verify_message}"
+        return False, f"цепочка не доверена ({exc.verify_code}): {exc.verify_message}", None
     except (ssl.SSLError, OSError) as exc:
-        return False, f"соединение не установлено: {type(exc).__name__}: {exc}"
+        return False, f"соединение не установлено: {type(exc).__name__}: {exc}", None
     if not certificate:
-        return False, "сертификат не получен"
-    return True, "цепочка доверена"
+        return False, "сертификат не получен", None
+    return True, "цепочка доверена", cert_not_after(certificate)
 
 
-def check_broker_tls() -> CheckResult:
+def check_ca_bundle() -> CheckResult:
+    """REQ-broker-gateway-02: в репозитории лежит нужный корень НУЦ, а не похожий на него.
+
+    Проверка локальная и сетью не пользуется: она отвечает за то, что в образ
+    (`deploy/Dockerfile` копирует `deploy/ca/` в `/usr/local/share/ca-certificates/tbot/`) и на
+    хост попадает ровно тот корень, чей отпечаток закреплён выше. Сравнение с закреплённым
+    значением обязательное: подмена корня — признак перехвата или смены удостоверяющего
+    центра, и то и другое требует остановки контура (docs/runbook/nucc-ca.md §5).
+    """
+    if not CA_FILE.is_file():
+        return CheckResult(
+            "ca_bundle",
+            False,
+            f"{CA_FILE} отсутствует — порядок получения корня: docs/runbook/nucc-ca.md",
+        )
+    try:
+        certificate = x509.load_pem_x509_certificate(CA_FILE.read_bytes())
+    except ValueError as exc:
+        return CheckResult(
+            "ca_bundle", False, f"{CA_FILE} не разбирается как PEM-сертификат: {exc}"
+        )
+    fingerprint = certificate.fingerprint(hashes.SHA256()).hex()
+    if fingerprint != EXPECTED_CA_FINGERPRINT:
+        return CheckResult(
+            "ca_bundle",
+            False,
+            f"отпечаток {CA_FILE} = {fingerprint}, закреплён {EXPECTED_CA_FINGERPRINT} —"
+            " возможная подмена корня или устаревший файл, запуск блокируется",
+        )
+    if certificate.subject != certificate.issuer:
+        return CheckResult(
+            "ca_bundle",
+            False,
+            f"{CA_FILE} не самоподписан (issuer ≠ subject) — это не корневой сертификат",
+        )
+    now = datetime.now(UTC)
+    days_left = (certificate.not_valid_after_utc - now).days
+    subject = certificate.subject.rfc4514_string()
+    detail = (
+        f"{subject}: срок {certificate.not_valid_before_utc:%Y-%m-%d}…"
+        f"{certificate.not_valid_after_utc:%Y-%m-%d} (осталось {days_left} дн.),"
+        f" отпечаток совпадает с закреплённым"
+    )
+    if certificate.not_valid_after_utc <= now:
+        return CheckResult("ca_bundle", False, f"срок действия корня истёк: {detail}")
+    if days_left < MIN_ROOT_DAYS_LEFT:
+        return CheckResult(
+            "ca_bundle",
+            False,
+            f"до конца срока корня {days_left} дн. (нужно ≥{MIN_ROOT_DAYS_LEFT}) — замена заранее, "
+            "см. docs/runbook/nucc-ca.md §5: " + detail,
+        )
+    return CheckResult("ca_bundle", True, detail)
+
+
+def broker_endpoints(settings: Settings | None) -> tuple[tuple[str, int, bool], ...]:
+    """Адреса брокера в порядке значимости: первичный — тот, что соответствует контуру.
+
+    Отказ по первичному адресу блокирует запуск, по вторичному — только замечание: вторичным
+    оказывается `sandbox_host` при боевом контуре и `production_host` при песочце. Без
+    конфигурации (например, на CI-раннере) равнозначно первичными считаются оба адреса из
+    `BROKER_TLS_TARGETS`, но уровень всё равно не блокирующий — на раннере нет контура.
+    """
+    if settings is None:
+        return tuple((host, port, True) for host, port in BROKER_TLS_TARGETS)
+    production = settings.contour is Contour.PRODUCTION
+    primary = settings.broker.production_host if production else settings.broker.sandbox_host
+    secondary = settings.broker.sandbox_host if production else settings.broker.production_host
+    return ((primary, 443, True), (secondary, 443, False))
+
+
+def check_broker_tls(settings: Settings | None = None) -> CheckResult:
     """REQ-broker-gateway-02: TLS брокера обязан проходить со стандартным набором доверия.
 
     Промежуточный сертификат выдаёт НУЦ, корень которого отсутствует в Ubuntu по умолчанию
-    (замер — `docs/research/03 §3.3`). Пока корень не установлен, проверка обязана быть
-    красной: отключать проверку нельзя.
+    (замер — `docs/research/03 §3.3`). Пока корень не установлен в хосте или образе, проверка
+    обязана быть красной: отключать проверку нельзя.
+
+    Срок действия сертификата брокера контролируется здесь же: «доверено, но истечёт через
+    три дня» — не готовность (TZ §3.1 требует проверки даты в `make deploy-check`).
     """
-    results: list[str] = []
-    verified = 0
-    for host, port in BROKER_TLS_TARGETS:
-        ok, detail = _verify_chain(host, port)
-        results.append(f"{host}: {detail}")
-        verified += 1 if ok else 0
-    if verified == len(BROKER_TLS_TARGETS):
-        return CheckResult("broker_tls", True, "; ".join(results))
-    hint = "установите корень НУЦ (deploy/ca/README.md, задача T-709)"
-    if EXPECTED_CA_FINGERPRINT is None:
-        hint += "; отпечаток корня ещё не зафиксирован в deploy_check.py"
-    return CheckResult("broker_tls", False, "; ".join(results) + ". " + hint)
+    details: list[str] = []
+    primary_failed = False
+    secondary_failed = False
+    expiring: list[str] = []
+    for host, port, primary in broker_endpoints(settings):
+        ok, detail, not_after = _verify_chain(host, port)
+        if not_after is not None:
+            days_left = (not_after - datetime.now(UTC)).days
+            detail += f", сертификат до {not_after:%Y-%m-%d} (осталось {days_left} дн.)"
+            if days_left < MIN_LEAF_DAYS_LEFT:
+                expiring.append(f"{host}: до {not_after:%Y-%m-%d} осталось {days_left} дн.")
+                ok = False
+        details.append(f"{host}: {detail}")
+        if ok:
+            continue
+        if primary:
+            primary_failed = True
+        else:
+            secondary_failed = True
+    if not primary_failed and not secondary_failed:
+        return CheckResult("broker_tls", True, "; ".join(details))
+    if expiring:
+        hint = (
+            f"сертификат брокера почти истёк ({'; '.join(expiring)}) — нужна его перевыдача; "
+            "проверку не отключаем"
+        )
+    else:
+        hint = "установите корень НУЦ (docs/runbook/nucc-ca.md, задачи T-006 и T-709)"
+    severity = _severity(settings) if primary_failed else WARN
+    return CheckResult("broker_tls", False, "; ".join(details) + ". " + hint, severity)
 
 
 def check_telegram_path(settings: Settings | None) -> CheckResult:
@@ -312,6 +428,7 @@ def main(argv: list[str] | None = None) -> int:
         check_python(),
         config_result,
         check_contour(settings),
+        check_ca_bundle(),
         check_time_sync(),
         check_resources(),
         check_secret_files(settings),
@@ -319,7 +436,7 @@ def main(argv: list[str] | None = None) -> int:
         check_telegram_path(settings),
     ]
     if not arguments.skip_broker_tls:
-        results.append(check_broker_tls())
+        results.append(check_broker_tls(settings))
 
     blocking = [item for item in results if not item.ok and item.severity == FATAL]
 
