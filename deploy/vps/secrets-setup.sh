@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # Ввод секретов рабочего контура на ВМ 153.51.172.30.
 #
-# Кто запускает: только заказчик (или тот, кому заказчик передал значения), из интерактивного
-# SSH-сеанса. Агент значения не вводит и не видит
-# (docs/adr/ADR-003-prod-deploy-edge-decisions.md §6).
+# Кто запускает: заказчик (значения внешних систем — `telegram_token`, `ghcr_token`, `tinkoff_*` —
+# вводит только он) или агент: для машиногенерируемых значений (`db_password`, `db_url`,
+# `telegram_socks_pass`) с пустым вводом — значение генерирует скрипт; уже существующее у оператора
+# значение проливается в stdin этого же запуска, не печатаясь.
+# Содержимое ни в одном режиме не уходит в stdout, argv, чат или историю
+# (docs/adr/ADR-003-prod-deploy-edge-decisions.md §6 + docs/adr/ADR-004-secret-value-placement.md).
 #
 #   sudo bash deploy/vps/secrets-setup.sh                 # ввод
 #   sudo bash deploy/vps/secrets-setup.sh --check         # только диагностика

@@ -73,7 +73,9 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINLDO6mbx5f5R1gtTC3wqbVygUWDXHuUpMnRbKGe7MpX
 не-root-сессии: `sudo git -C /opt/tbot …` и абсолютные пути ко всем файлам (`sudo bash
 /opt/tbot/deploy/vps/secrets-setup.sh`, `sudo python3 /opt/tbot/scripts/…`).
 `sha256sum` скрипта ввода на ВМ — `b8266865bcb5f0672224c8a4589af114f767cfa1b6afcd9b95457bed52f9191f`,
-совпадает с репозиторной версией.
+совпадает с репозиторной версией. После правки заголовка скрипта по ADR-004 (2026-11-20, только
+комментарии) репозиторная версия — `5499b18679ea466aab06f23322beb17bb30dff8cff44dfcfa57adb04f7fe7f35`:
+перед сверкой нужен `sudo git -C /opt/tbot pull --ff-only`.
 
 Проверка, что клон соответствует ожидаемому commit: хеш из `git log --oneline -1` обязан совпадать
 с commit, из которого собраны digest'ы в `deploy/tbot.prod.env` (иначе на площадку поедет чужой
