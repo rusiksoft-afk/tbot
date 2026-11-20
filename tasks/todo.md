@@ -477,13 +477,44 @@
     `docs/acceptance/prod-firewall.md §5`.
   - Что блокирует остаток: **read-only токен GHCR не размещён** (`/etc/tbot/secrets/ghcr_token`,
     процедура — `docs/runbook/ghcr-pull.md §3`; дайджесты текущего релиза выписаны там же),
-    нет секретов приложения и нет `compose.prod.yaml` (он пишется вместе с Caddy: единственный
-    публикуемый наружу порт — 80/443 Caddy). Проверка pull по digest для публичного образа
+    нет секретов приложения (`/etc/tbot/secrets/db_password`, `db_url`) и нет разрешения заказчика
+    на деплой состава на живую ВМ (стоп-лист в `AGENTS.md` всё ещё запрещает Docker/80/443/Caddy,
+    а `docs/adr/ADR-001` их разрешает — см. `docs/acceptance/tls-edge.md §7`).
+    Проверка pull по digest для публичного образа
     выполнена: `postgres:16.4` = `sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412`.
+  - Что сделано дополнительно 2026-11-20: `deploy/compose.prod.yaml` написан (единственные
+    публикуемые наружу порты — 80/443 Caddy, секреты файлами из `/etc/tbot/secrets`, лимиты под
+    3.8 ГиБ, все образы по digest, `build: !reset null`);
+    compose 2.40.3 на площадке понимает теги `!reset`/`!override` — проверено на самой машине
+    (`docker compose version`); состав разбирается и проверяется в CI (job `prod-config`:
+    `docker compose config` + `scripts/prod_compose_check.py` + `caddy validate` внутри образа с
+    закреплённым digest) и статически (`test_compose_prod_contract`, `test_prod_compose_check`).
+    Остаток задачи — реальный `pull → migrate → restart` и учебный откат на площадке.
 - [ ] **T-713** Caddy + сертификат Let's Encrypt на `tbot.rusiksoft.ru`, редирект HTTP→HTTPS, HSTS, базовые заголовки CSP/CSRF-защита уровня прокси
   - Приёмка: TZ §8.3, §14.9; в браузере — валидный сертификат, HSTS, редирект
   - Проверка: `curl -I https://tbot.rusiksoft.ru/healthz`, тест на отсутствие смешанного содержимого и внешних CDN
-  - Файлы: `deploy/caddy/Caddyfile`, `deploy/vps/caddy-bootstrap.yaml`
+  - Файлы: `deploy/caddy/Caddyfile`, `deploy/compose.prod.yaml`, `deploy/tbot.prod.env`,
+    `scripts/prod_compose_check.py`, `docs/acceptance/tls-edge.md`
+  - Статус 2026-11-20: **в процессе, не принята**. Проверено без запуска контура:
+    Caddyfile валиден и отформатирован `caddy` v2.11.9 (та же версия, что у закреплённого digest),
+    21 поведенческая проба на копии Caddyfile (`tls internal`, upstream-заглушка) — заголовки
+    TZ §8.3, `-Server` снимает и чужой `Server`, TRACE→405, `/metrics`→404, тело 11 МиБ→413 без
+    доступа к приложению, заголовки 100 КиБ→431, TLS 1.2/1.3 работают, `X-Forwarded-*`/
+    `X-Real-IP` доходят до upstream, журнал — JSON. Снаружи: DNS → `153.51.172.30`, 80/443
+    отвечают `Connection refused` (SG и ufw пропускают, слушателя нет) —
+    `docs/acceptance/tls-edge.md §2`.
+  - Находки пробы, уже внесённые в артефакты: (1) журнал прокси писал `?token=…` и `X-Api-Key`
+    открытым текстом → добавлен `format filter` (query `token|key|sig`, `X-Api-Key`) и запрещена
+    опция `log_credentials`; (2) Caddy сам навешивал `Alt-Svc: h3`, а UDP/443 не открыт →
+    `protocols h1 h2`; (3) фактический порог `max_header_size 16KB` измерен: 431 начинается с
+    ≈21 КиБ, а не ровно с 16 КиБ.
+  - Что осталось (требует деплоя): выпуск сертификата ACME, `curl -I https://…/healthz`,
+    редирект :80→:443 живым трафиком, заголовки против живого `web`, `openssl s_client -tls1_1`
+    (отказ), ротация логов `json-file` в контейнере, поведение после рестарта docker и ребута.
+  - Что блокирует деплой: разрешение заказчика (стоп-лист `AGENTS.md` против `ADR-001`),
+    секреты `db_password`/`db_url` (и `telegram_token` для `tgbot`), решение по ограничителю
+    запросов (TZ §8.3 ждёт `limit_req`, у Caddy без плагинов его нет) и по UDP/443 —
+    `docs/acceptance/tls-edge.md §7`.
 
 ## Позже (вне M0–M7, зафиксировано объёмом ТЗ)
 
