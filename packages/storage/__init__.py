@@ -8,6 +8,6 @@ Capability Map (контракт `tests/contract/test_repo_layout.py`).
 
 from __future__ import annotations
 
-from packages.storage.base import NAMING_CONVENTION, Base
+from packages.storage.base import APPEND_ONLY_TABLES, NAMING_CONVENTION, Base
 
-__all__ = ("NAMING_CONVENTION", "Base")
+__all__ = ("APPEND_ONLY_TABLES", "NAMING_CONVENTION", "Base")

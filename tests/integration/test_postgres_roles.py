@@ -1,0 +1,326 @@
+"""Права роли приложения на живой PostgreSQL (T-009, `AC-identity-04`).
+
+Здесь проверяется то, что нельзя проверить офлайн: сервер действительно отказывает роли
+приложения в правке журнала (`REQ-identity-04`) и при этом обычный DML остаётся доступен —
+иначе «append-only» означал бы «приложению вообще не выдали прав».
+
+Порядок такой же, как на площадке: база развёрнута до `upgrade head`, затем применяется
+`deploy/postgres/roles.sql`. В CI роль приложения существует только для этой проверки, поэтому её
+создаёт сам тест (файл прав идемпотентен).
+
+Что закреплено:
+
+* `INSERT` в `audit_log` ролью приложения проходит, `UPDATE`/`DELETE`/`TRUNCATE` — отказ `42501`;
+* счётчик `audit_log.id` выдаётся базой без прав на последовательность: у identity-колонки
+  PostgreSQL проверяет право `INSERT` на таблицу (у `serial` пришлось бы выдавать
+  `USAGE ON SEQUENCE` — различие закреплено поведенчески, потому что прав на последовательности
+  файлом прав не выдаётся);
+* отзыв точечный: на `users` роль приложения по-прежнему делает `INSERT`/`UPDATE`/`DELETE`;
+* у роли приложения нет прав уровня кластера, и она не создаёт объектов схемы (DDL — у владельца);
+* таблицы будущих ревизий получают DML автоматически (`ALTER DEFAULT PRIVILEGES`), иначе следующая
+  миграция «забудет» выдать права, и приложение упадёт на площадке;
+* файл прав можно запускать повторно.
+
+Запуск: та же `TBOT_DB_URL`, что у `test_identity_schema_db.py`. Без переменной группа пропускается
+(на dev-машине PostgreSQL нет), в CI job `migrations` — исполняется.
+"""
+
+from __future__ import annotations
+
+import os
+import uuid
+from collections.abc import Iterator
+from pathlib import Path
+from typing import Any, Final
+
+import psycopg
+import pytest
+
+from packages.common.db import psycopg_dsn
+
+_DB_URL = os.environ.get("TBOT_DB_URL", "")
+_ROLES_SQL: Final = (
+    Path(__file__).resolve().parents[2] / "deploy" / "postgres" / "roles.sql"
+).read_text(encoding="utf-8")
+_APP_ROLE: Final = "tbot_app"
+_INSUFFICIENT_PRIVILEGE: Final = "42501"
+_HASH: Final = "c" * 64
+_ARGON2ID: Final = (
+    "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHRzb29sZA"
+    "$0k3Z0m1aK1P0d1kQ2w3e4r5t6y7u8i9o0p1q2r3s4t5u"
+)
+
+pytestmark = pytest.mark.skipif(
+    not _DB_URL,
+    reason="нет TBOT_DB_URL: нужны живой PostgreSQL (группа исполняется в CI job `migrations`)",
+)
+
+
+@pytest.fixture(scope="module")
+def admin_connection() -> Iterator[psycopg.Connection[tuple[Any, ...]]]:
+    """Соединение владельца схемы: применяет права и читает каталог.
+
+    `autocommit=True` обязателен: у файла прав собственные `BEGIN`/`COMMIT`. Без autocommit
+    psycopg открыл бы свой транзакт, вложенный `BEGIN` дал бы только предупреждение, и выданные
+    права могли бы не дожить до следующей сессии — тест остался бы зелёным в одном соединении и
+    красным на площадке.
+    """
+    connection = psycopg.connect(psycopg_dsn(_DB_URL), autocommit=True, connect_timeout=10)
+    try:
+        yield connection
+    finally:
+        connection.close()
+
+
+@pytest.fixture(scope="module", autouse=True)
+def app_role(admin_connection: psycopg.Connection[tuple[Any, ...]]) -> str:
+    """Роль приложения создана и получила права — так же, как это делает runbook на площадке."""
+    admin_connection.execute(_ROLES_SQL)
+    return _APP_ROLE
+
+
+@pytest.fixture
+def app_session(
+    app_role: str,
+) -> Iterator[psycopg.Connection[tuple[Any, ...]]]:
+    """Сессия, в которой текущая роль — приложение: `SET ROLE`, а не вход с паролем.
+
+    Отдельный вход не используется намеренно: пароля у роли приложения в тестовой базе нет
+    (значения — секреты, ADR-004), а `SET ROLE` проверяет ровно те же объектные права.
+    Членство «владелец → приложение» выдаёт сам `roles.sql`.
+    """
+    connection = psycopg.connect(psycopg_dsn(_DB_URL), connect_timeout=10)
+    try:
+        connection.execute(f'SET ROLE "{app_role}"')
+        yield connection
+    finally:
+        connection.rollback()
+        connection.close()
+
+
+def _denied(
+    connection: psycopg.Connection[tuple[Any, ...]],
+    sql: str,
+    what: str,
+    params: tuple[object, ...] = (),
+) -> None:
+    """Ожидаем отказ ровно по правам (`42501`), а не по синтаксису или по данным.
+
+    Код ошибки принципиален: при пустом или кривом файле прав запрос мог бы упасть по другой
+    причине, и проверка осталась бы зелёной, не проверяя ничего.
+
+    Попытка оборачивается в `SAVEPOINT`, а не в откат транзакта: откат транзакта в PostgreSQL
+    отменяет и `SET ROLE` (выполненный в этом транзакте), и вторая попытка ушла бы уже под
+    ролью владельца — отказ перестал бы проверяться.
+    """
+    connection.execute("SAVEPOINT denied_probe")
+    captured: psycopg.Error | None = None
+    try:
+        connection.execute(sql, params)
+    except psycopg.Error as error:
+        captured = error
+    finally:
+        connection.execute("ROLLBACK TO SAVEPOINT denied_probe")
+        connection.execute("RELEASE SAVEPOINT denied_probe")
+
+    assert captured is not None, f"{what}: право не отозвано — запрос выполнился без ошибки"
+    sqlstate = getattr(captured, "sqlstate", None)
+    assert sqlstate == _INSUFFICIENT_PRIVILEGE, (
+        f"{what}: ожидался отказ по правам ({_INSUFFICIENT_PRIVILEGE}), получено "
+        f"{type(captured).__name__} sqlstate={sqlstate}: {captured}"
+    )
+
+
+def _audit_row_id(connection: psycopg.Connection[tuple[Any, ...]]) -> int:
+    """Одна строка журнала, вставленная текущей ролью: возвращает выданный базой id."""
+    row = connection.execute(
+        "INSERT INTO audit_log (at, action, entity, entity_id, details, ip, request_id, "
+        "hash_prev, hash) VALUES (now(), %s, %s, %s, %s::jsonb, %s::inet, %s, NULL, %s) "
+        "RETURNING id",
+        (
+            "session.login",
+            "session",
+            str(uuid.uuid4()),
+            '{"reason": "append-only"}',
+            "10.0.0.1",
+            uuid.uuid4(),
+            _HASH,
+        ),
+    ).fetchone()
+    assert row is not None, "вставка в audit_log не вернула строку"
+    record_id = row[0]
+    assert isinstance(record_id, int), f"audit_log.id имеет неожиданный тип {type(row[0])}"
+    return record_id
+
+
+def test_audit_append_only_role(app_session: psycopg.Connection[tuple[Any, ...]]) -> None:
+    """Проверка из задачи T-009: журнал дописывается, но не правится ролью приложения."""
+    record_id = _audit_row_id(app_session)
+    assert record_id > 0, "audit_log.id обязан выдаваться базой"
+
+    _denied(
+        app_session,
+        "UPDATE audit_log SET action = 'poddelka' WHERE id = %s",
+        "UPDATE audit_log ролью приложения",
+        (record_id,),
+    )
+    _denied(
+        app_session,
+        "DELETE FROM audit_log WHERE id = %s",
+        "DELETE FROM audit_log ролью приложения",
+        (record_id,),
+    )
+    _denied(app_session, "TRUNCATE audit_log", "TRUNCATE audit_log ролью приложения")
+
+    # Отказ не должен «съедать» и чтение: журнал остаётся видимым для приложения.
+    readable = app_session.execute("SELECT count(*) FROM audit_log").fetchone()
+    assert readable is not None, "счётчик журнала не вернул строку"
+    assert isinstance(readable[0], int), "count(*) имеет неожиданный тип"
+    assert readable[0] >= 1, "приложение обязано читать журнал после отказов на правку"
+
+
+def test_счётчик_журнала_выдаёт_база_без_прав_на_последовательность(
+    app_session: psycopg.Connection[tuple[Any, ...]],
+) -> None:
+    """Права на последовательности приложению не выданы — и всё же строки получают id по порядку.
+
+    Это не косметика: если бы `audit_log.id` был `serial` (default `nextval()`), вставка под
+    ролью приложения упала бы с `42501` на последовательности, и файл прав пришлось бы
+    дополнять `USAGE ON SEQUENCE` — то есть приложению стало бы доступно движение счётчика.
+    """
+    denied = app_session.execute(
+        "SELECT has_sequence_privilege(%s, 'audit_log_id_seq'::regclass, 'USAGE')",
+        (_APP_ROLE,),
+    ).fetchone()
+    assert denied is not None, "has_sequence_privilege не вернул строку"
+    assert not denied[0], (
+        "роли приложения выдано право на последовательность журнала: файл прав "
+        "deploy/postgres/roles.sql не должен его выдавать"
+    )
+    first, second = _audit_row_id(app_session), _audit_row_id(app_session)
+    assert second > first, f"identity журнала не растёт: {first} → {second}"
+
+
+def test_обычные_таблицы_доступны_роли_приложения_на_полный_dml(
+    app_session: psycopg.Connection[tuple[Any, ...]],
+) -> None:
+    """Отзыв точечный: на `users` разрешены и вставка, и правка, и удаление.
+
+    Без этой проверки «append-only» мог бы означать, что приложению просто ничего не выдали.
+    """
+    user_id = uuid.uuid4()
+    login = f"roles-{user_id.hex[:12]}@example.test"
+    inserted = app_session.execute(
+        "INSERT INTO users (id, login, role, state, password_hash) "
+        "VALUES (%s, %s, 'operator', 'active', %s) RETURNING id",
+        (user_id, login, _ARGON2ID),
+    ).fetchone()
+    assert inserted is not None, "приложение не может создать учётку"
+    assert inserted[0] == user_id, "учётка создалась под другим идентификатором"
+    app_session.execute("UPDATE users SET display_name = 'roles' WHERE id = %s", (user_id,))
+    app_session.execute("DELETE FROM users WHERE id = %s", (user_id,))
+
+
+def test_роль_приложения_без_привилегий_кластера(
+    admin_connection: psycopg.Connection[tuple[Any, ...]],
+) -> None:
+    """Ни суперпользователя, ни создания баз и ролей, ни обхода RLS, ни репликации."""
+    row = admin_connection.execute(
+        "SELECT rolcanlogin, rolsuper, rolcreatedb, rolcreaterole, rolbypassrls, rolreplication "
+        "FROM pg_roles WHERE rolname = %s",
+        (_APP_ROLE,),
+    ).fetchone()
+    assert row is not None, f"роль {_APP_ROLE} не создана — файл прав не применён"
+    can_login, superuser, createdb, createrole, bypassrls, replication = row
+    assert not can_login, (
+        "у роли приложения нет пароля, значит и права входа быть не должно: "
+        "LOGIN включается только шагом переключения на площадке (runbook §переключение)"
+    )
+    granted = [
+        name
+        for name, flag in zip(
+            ("rolsuper", "rolcreatedb", "rolcreaterole", "rolbypassrls", "rolreplication"),
+            (superuser, createdb, createrole, bypassrls, replication),
+            strict=True,
+        )
+        if flag
+    ]
+    assert not granted, f"у роли приложения появились права кластера: {granted}"
+
+
+def test_приложение_не_создаёт_объектов_схемы(
+    app_session: psycopg.Connection[tuple[Any, ...]],
+) -> None:
+    """DDL остаётся у владельца: иначе ревизия Alembic прямо из приложения стала бы нормой."""
+    _denied(app_session, "CREATE TABLE roles_probe_ddl (id integer)", "CREATE TABLE")
+    _denied(app_session, "ALTER TABLE audit_log ADD COLUMN probe text", "ALTER TABLE audit_log")
+    _denied(app_session, "CREATE INDEX ix_audit_log_probe ON audit_log (action)", "CREATE INDEX")
+
+
+def test_таблицы_будущих_ревизий_получают_права_автоматически(
+    admin_connection: psycopg.Connection[tuple[Any, ...]],
+) -> None:
+    """Работает ли `ALTER DEFAULT PRIVILEGES`: новая таблица видима приложению сразу.
+
+    Таблица создаётся и удаляется здесь же. Смысл проверки в том, что следующая ревизия не
+    оставит новую таблицу без прав: на площадке это выглядело бы как `42501` в момент первого
+    запроса приложения к новой таблице.
+    """
+    admin_connection.execute("CREATE TABLE roles_probe_future (id integer)")
+    try:
+        missing = [
+            privilege
+            for privilege in ("select", "insert", "update", "delete")
+            if not _has_table_privilege(admin_connection, "roles_probe_future", privilege)
+        ]
+        assert not missing, (
+            f"новая таблица не получила прав {missing}: ALTER DEFAULT PRIVILEGES в "
+            "deploy/postgres/roles.sql не применяется к таблицам текущего владельца"
+        )
+    finally:
+        admin_connection.execute("DROP TABLE roles_probe_future")
+
+
+def test_права_переустанавливаются_повторно(
+    admin_connection: psycopg.Connection[tuple[Any, ...]],
+) -> None:
+    """Файл прав идемпотентен: runbook допускает повторный запуск после каждой ревизии."""
+    admin_connection.execute(_ROLES_SQL)
+    still_open = any(
+        _has_table_privilege(admin_connection, "audit_log", privilege)
+        for privilege in ("update", "delete", "truncate")
+    )
+    assert (
+        not still_open
+    ), "после повторного применения прав приложению снова доступны правка или очистка журнала"
+
+
+def test_владелец_журнала_не_роль_приложения(
+    admin_connection: psycopg.Connection[tuple[Any, ...]],
+) -> None:
+    """Смысл отзыва прав в том, что приложение — не владелец таблицы.
+
+    У владельца `REVOKE` не отнимает неявные права, поэтому проверка «владелец сильнее» — это
+    честность самой модели прав: если таблицы когда-нибудь перейдут роли приложения,
+    `test_audit_append_only_role` надо будет не чинить, а менять модель.
+    """
+    owner = admin_connection.execute(
+        "SELECT tableowner FROM pg_tables WHERE tablename = 'audit_log'"
+    ).fetchone()
+    assert owner is not None, "в базе нет таблицы audit_log"
+    assert owner[0] != _APP_ROLE, (
+        f"журнал принадлежит роли {owner[0]}: приложение стало владельцем таблицы, "
+        "и append-only перестал быть правом базы"
+    )
+
+
+def _has_table_privilege(
+    connection: psycopg.Connection[tuple[Any, ...]], table: str, privilege: str
+) -> bool:
+    row = connection.execute(
+        "SELECT has_table_privilege(%s, %s::regclass, %s)", (_APP_ROLE, table, privilege)
+    ).fetchone()
+    assert row is not None, f"has_table_privilege по таблице {table} не вернул строку"
+    value = row[0]
+    assert isinstance(value, bool), f"ожидался логический результат, получено {type(value)}"
+    return value

@@ -107,7 +107,9 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
       - run: python -m pip install --upgrade pip
-      - run: pip install -e .
+      # `[dev]`, а не голое `-e .`: в этом job'е после цикла миграций исполняются тесты поведения
+      # схемы и прав (pytest их не тянет как рантайм-зависимость).
+      - run: pip install -e ".[dev]"
       - run: mkdir -p /tmp/tbot-secrets
       - name: upgrade head
         run: alembic upgrade head
@@ -127,6 +129,10 @@ jobs:
       # инструмент `make revision` он остался, как приёмка схемы — нет.
       - name: поведение схемы на живой базе (TZ §4.1, §8.1–8.3)
         run: python -m pytest tests/integration/test_identity_schema_db.py -q -rs
+      # Права роли приложения поверх развёрнутой схемы: `deploy/postgres/roles.sql` применяется
+      # прямо в тесте, потому что в CI роль приложения создаётся только для проверки.
+      - name: append-only права роли приложения (AC-identity-04)
+        run: python -m pytest tests/integration/test_postgres_roles.py -q -rs
 
   secret-scan:
     name: поиск секретов (gitleaks)

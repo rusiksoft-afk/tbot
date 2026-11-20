@@ -6,7 +6,7 @@
 
 * обратная миграция обязана найти ограничение по предсказуемому имени (`drop_constraint`),
   иначе `downgrade base` падает на первой же ревизии;
-* `alembic check` (CI job `migrations`) сравнивает схему базы с моделями: расхождение в имени
+* `alembic revision --autogenerate` сравнивает схему базы с моделями: расхождение в имени
   выглядит как «удалить одно ограничение, создать другое»;
 * проверка прав и инспекция схемы на площадке (`psql \\d+`) читаются по смыслу, а не по хэшу.
 
@@ -15,6 +15,8 @@
 """
 
 from __future__ import annotations
+
+from typing import Final
 
 from sqlalchemy import MetaData
 from sqlalchemy.orm import DeclarativeBase
@@ -37,3 +39,10 @@ class Base(DeclarativeBase):
     """
 
     metadata = MetaData(naming_convention=NAMING_CONVENTION)
+
+
+# Таблицы, которым запрещены правки и удаление строк (TZ §4.1, `REQ-identity-04`). Единственный
+# источник списка: `deploy/postgres/roles.sql` обязан отозвать `UPDATE`/`DELETE`/`TRUNCATE` на
+# каждой из них, а `tests/contract/test_db_roles.py` сверяет список с SQL-файлом — иначе новая
+# таблица журнала окажется защищённой только в комментариях.
+APPEND_ONLY_TABLES: Final[frozenset[str]] = frozenset({"audit_log"})
