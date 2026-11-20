@@ -4,9 +4,10 @@
 в `secrets_dir`. Без явно указанной базы миграции отказываются выполняться — «угадать» адрес
 нельзя, потому что одна и та же команда запускается и на dev-машине, и на площадке.
 
-`target_metadata` сейчас пустой: ORM-модели слоя хранения подключаются в задаче T-009. Пока их
-нет, автосгенерированная ревизия намеренно запрещена — иначе она предложила бы удалить всё, чего
-«не видно» в метаданных.
+`target_metadata` — метаданные слоя `storage` (ORM-отображения таблиц, `packages/storage`).
+С ними `make revision` autogenerate видит существующую схему, а CI-шаг `alembic check` ловит
+ситуацию, когда ревизию забыли (модель описывает таблицу, которой в базе нет) или наоборот.
+Имена ограничений задаёт конвенция из `packages/storage/base.py` — одна для моделей и ревизий.
 """
 
 from __future__ import annotations
@@ -14,28 +15,19 @@ from __future__ import annotations
 from logging.config import fileConfig
 
 from alembic import context
-from sqlalchemy import MetaData, engine_from_config, pool
+from sqlalchemy import engine_from_config, pool
 from sqlalchemy.engine import Connection
 
 from packages.common.config import ConfigError, load_settings
 from packages.common.db import sqlalchemy_url
+from packages.storage.base import Base
 
 config = context.config
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
-# Каталог колонок и индексов, общий для всех миграций: имена ограничений задаются по шаблону,
-# чтобы их можно было предсказуемо находить и удалять в обратных миграциях.
-NAMING_CONVENTION: dict[str, str] = {
-    "ix": "ix_%(column_0_label)s",
-    "uq": "uq_%(table_name)s_%(column_0_name)s",
-    "ck": "ck_%(table_name)s_%(constraint_name)s",
-    "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
-    "pk": "pk_%(table_name)s",
-}
-
-target_metadata = MetaData(naming_convention=NAMING_CONVENTION)
+target_metadata = Base.metadata
 
 
 def _database_url() -> str:

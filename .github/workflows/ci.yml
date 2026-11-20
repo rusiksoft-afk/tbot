@@ -119,6 +119,14 @@ jobs:
         run: |
           psql "postgresql://tbot:ci-only-password@localhost:5432/tbot" -Atc \
             "select value from app_meta where key='schema_baseline'" | grep -qx 0001
+      # Поведение и точное соответствие схемы на живой базе: колонки/типы/имена ограничений из
+      # каталога, citext, CHECK-ограничения, частичный уникальный индекс, ON DELETE RESTRICT
+      # (TZ §4.1, §8.1–8.3). Оффлайн-половинка — `tests/contract/test_identity_schema.py`.
+      # `alembic check` здесь не используется: сравнение `server_default` у Alembic на PostgreSQL
+      # эвристическое и даёт фантомные различия на приводимых типах (`'invited'::text`); как
+      # инструмент `make revision` он остался, как приёмка схемы — нет.
+      - name: поведение схемы на живой базе (TZ §4.1, §8.1–8.3)
+        run: python -m pytest tests/integration/test_identity_schema_db.py -q -rs
 
   secret-scan:
     name: поиск секретов (gitleaks)
