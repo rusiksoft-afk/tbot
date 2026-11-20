@@ -16,6 +16,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import socket
 import ssl
@@ -360,31 +361,156 @@ def check_telegram_path(settings: Settings | None) -> CheckResult:
     )
 
 
+# Имена файлов секретов различаются в двух местах, и путать их — значит получить красный
+# `secret_files` на полностью готовой площадке (замер 2026-11-20, `stand-deploy §8`): внутри
+# контейнера приложение читает имена **конфигурации** (`/run/secrets/{db_url,tg_bot_token,
+# tg_socks_password}`, `packages.common.config.SECRET_FIELDS`), а на хосте площадки файлы названы
+# по `deploy/compose.prod.yaml` — `db_url`, `db_password`, `telegram_token`,
+# `telegram_socks_pass` и `ghcr_token` (последний нужен хосту для `docker login ghcr.io` и в
+# контейнеры не монтируется). Ниже — слоты: логический секрет, его возможные имена (в порядке
+# предпочтения) и обязан ли он существовать.
+@dataclass(frozen=True)
+class _SecretSlot:
+    key: str
+    names: tuple[str, ...]
+    required_everywhere: bool
+    required_in_production_only: bool = False
+
+
+SECRET_SLOTS: tuple[_SecretSlot, ...] = (
+    _SecretSlot("db_password", ("db_password",), True),
+    _SecretSlot("db_url", ("db_url",), True),
+    _SecretSlot("telegram_token", ("telegram_token", "tg_bot_token"), False, True),
+    _SecretSlot("telegram_socks_pass", ("telegram_socks_pass", "tg_socks_password"), True),
+    _SecretSlot("ghcr_token", ("ghcr_token",), False, True),
+)
+
+# Форма значений (контракт и признаки подмены — docs/runbook/secrets-on-host.md §4.1). Схема DSN
+# допускает и `postgresql://`, и `postgresql+psycopg://`: нормализация диалекта — забота
+# packages/common/db.py, а жёсткость здесь давала бы ложные отказы dev-стенда.
+_SECRET_SHAPES: dict[str, re.Pattern[str]] = {
+    "db_url": re.compile(
+        r"postgres(ql|ql\+psycopg)://[A-Za-z][A-Za-z0-9_]*:[^@\s]+@[A-Za-z0-9._-]+:[0-9]{2,5}"
+        r"/[A-Za-z][A-Za-z0-9_]*"
+    ),
+    "ghcr_token": re.compile(
+        r"github_pat_[A-Za-z0-9_]{22,}|gh[pousr]_[A-Za-z0-9]{36,}|[0-9a-f]{40}"
+    ),
+    "telegram_token": re.compile(r"[0-9]{6,12}:[A-Za-z0-9_-]{35}"),
+    "db_password": re.compile(r"[A-Za-z0-9._~-]{16,64}"),
+    "telegram_socks_pass": re.compile(r"[^\s]{8,128}"),
+}
+
+_SECRET_SHAPE_HINTS: dict[str, str] = {
+    "db_url": "postgresql+psycopg://<user>:<пароль>@<хост>:<порт>/<база>",
+    "ghcr_token": "personal access token GitHub (github_pat_…, gh…_… или классический hex-40)",
+    "telegram_token": "<id бота>:<35 символов из @BotFather>",
+    "db_password": "16–64 символа без пробелов и спецсимволов (URL-безопасно: он же внутри db_url)",
+    "telegram_socks_pass": "8–128 символов без пробелов (пароль SOCKS-входа туннеля)",
+}
+
+
+def secret_ownership_ok(stat_result: os.stat_result) -> bool:
+    """Файл секрета должен принадлежать root:root (TZ §8.3); вызывается только для боевого контура."""
+    return stat_result.st_uid == 0 and stat_result.st_gid == 0
+
+
+def slot_required(slot: _SecretSlot, settings: Settings) -> bool:
+    if slot.required_everywhere:
+        return True
+    return slot.required_in_production_only and settings.contour is Contour.PRODUCTION
+
+
 def check_secret_files(settings: Settings | None) -> CheckResult:
-    """Права на файлы секретов: содержимое не читается и не выводится (REQ-sec-04)."""
+    """Наличие, права и владелец файлов секретов; содержимое не выводится (REQ-sec-04)."""
     if settings is None:
         return CheckResult("secret_files", False, "конфигурация не загружена")
     if os.name != "posix":
         return CheckResult("secret_files", True, "проверка прав доступна только на POSIX", WARN)
-    expected = (
-        "db_url",
-        "tg_bot_token",
-        "tg_socks_password",
-    )
     problems: list[str] = []
     present: list[str] = []
-    for name in expected:
-        path = settings.secrets_dir / name
-        if not path.is_file():
-            problems.append(f"{name}: файла нет")
-            continue
-        mode = path.stat().st_mode & 0o777
-        if mode & 0o077:
-            problems.append(f"{name}: права {oct(mode)}, нужно 600")
-        present.append(name)
+    for slot in SECRET_SLOTS:
+        found = False
+        for name in slot.names:
+            path = settings.secrets_dir / name
+            try:
+                stat = path.stat()
+            except FileNotFoundError:
+                continue
+            except PermissionError:
+                problems.append(f"{name}: нет доступа к файлу (нужен root)")
+                found = True
+                break
+            found = True
+            if stat.st_mode & 0o170000 == 0o040000:
+                problems.append(f"{name}: каталог вместо файла")
+                break
+            if stat.st_size == 0:
+                problems.append(f"{name}: пустой файл")
+                break
+            mode = stat.st_mode & 0o777
+            if mode & 0o077:
+                problems.append(f"{name}: права {oct(mode)}, нужно 600")
+            if settings.contour is Contour.PRODUCTION and not secret_ownership_ok(stat):
+                problems.append(f"{name}: владелец {stat.st_uid}:{stat.st_gid}, нужен root:root")
+            present.append(f"{name} ({stat.st_size} байт)")
+            break
+        if not found and slot_required(slot, settings):
+            problems.append(f"{slot.key}: файла нет (допустимые имена: {', '.join(slot.names)})")
     if problems:
         return CheckResult("secret_files", False, "; ".join(problems), _severity(settings))
-    return CheckResult("secret_files", True, "права 600 у файлов: " + ", ".join(present))
+    return CheckResult(
+        "secret_files", True, "права 600 и root:root у файлов: " + ", ".join(present)
+    )
+
+
+def check_secret_shapes(settings: Settings | None) -> CheckResult:
+    """Форма значений секретов — отдельно от наличия, прав и владельца.
+
+    Presence-проверка этого не ловит: замер 2026-11-20 на площадке дал зелёный `--check` по
+    режимам при значениях не по назначению (`db_url` из 11 цифр без схемы, токен не-PAT из 11
+    символов, пароль с пробелами). Проверка читает файл, но в вывод кладёт только имя, длину и
+    подсказку формата: значение не печатается ни целиком, ни по частям (разбор полей значения =
+    утечка в журнал сессии).
+    """
+    if settings is None:
+        return CheckResult("secret_shapes", False, "конфигурация не загружена")
+    if settings.contour is Contour.SANDBOX:
+        # В песочце значения фиктивные (`deploy/README.md §2`: `dev-not-a-real-token`), и форма
+        # здесь не показательна. Для торгового и боевого контуров значения настоящие, и именно
+        # там не-форма означает «деплой встанет на месте» — см. замер 2026-11-20.
+        return CheckResult(
+            "secret_shapes",
+            True,
+            "форма значений проверяется в торговом и боевом контурах (песочца — фиктивные)",
+            WARN,
+        )
+    problems: list[str] = []
+    ok_items: list[str] = []
+    for slot in SECRET_SLOTS:
+        shape = _SECRET_SHAPES.get(slot.key)
+        if shape is None:
+            continue
+        for name in slot.names:
+            path = settings.secrets_dir / name
+            try:
+                raw = path.read_bytes()
+            except (FileNotFoundError, PermissionError):
+                continue
+            text = raw.decode("utf-8", "replace").strip()
+            if shape.fullmatch(text):
+                ok_items.append(f"{name} ({len(raw)} байт)")
+            else:
+                problems.append(
+                    f"{name}: значение не по форме ({len(raw)} байт) — ожидалось: "
+                    f"{_SECRET_SHAPE_HINTS[slot.key]}"
+                )
+            break
+    if problems:
+        return CheckResult("secret_shapes", False, "; ".join(problems), _severity(settings))
+    return CheckResult(
+        "secret_shapes", True, "форма значений соответствует: " + ", ".join(ok_items)
+    )
 
 
 def check_db(settings: Settings | None) -> CheckResult:
@@ -432,6 +558,7 @@ def main(argv: list[str] | None = None) -> int:
         check_time_sync(),
         check_resources(),
         check_secret_files(settings),
+        check_secret_shapes(settings),
         check_db(settings),
         check_telegram_path(settings),
     ]

@@ -563,6 +563,9 @@
     `config --quiet` exit 0 и `prod_compose_check.py` 13/13 OK; `postgres` и `caddy` по
     закреплённым digest на хосте. Блокировка одна: четыре файла секретов не заведены
     (`--check` красный), значит `docker login`/`pull` образов приложения недоступен.
+    Файлы секретов заведены, но значения не по назначению (`db_url` = 11 цифр, `ghcr_token`
+    не PAT → `401` в ghcr.io/token, `db_password` 154 байта с пробелами, `telegram_token`
+    нет) — контракт формата и признаки: `docs/runbook/secrets-on-host.md §4.1`.
 
 ## Позже (вне M0–M7, зафиксировано объёмом ТЗ)
 

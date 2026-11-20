@@ -291,40 +291,95 @@ jobs:
           done
           sudo ls -l /etc/tbot/secrets
 
-      - name: 'скрипт ввода секретов прогоняется на фиктивных значениях'
-        # Значения фиктивные, и это не подделка приёмки: проверяется механизм — режим 600,
-        # владелец root, побайтовая длина (лишний перевод строки ломает DSN и токен), порядок
-        # «значение → свой файл» и то, что `--check` замечает испорченный режим. Настоящие
-        # значения в логах и в чате запрещены (стоп-лист `AGENTS.md`), поэтому класс ошибок
-        # ловится здесь.
+      - name: 'скрипт ввода секретов: форма значений, режимы, вердикты --check'
+        # Повод — замер 2026-11-20 на площадке: `--check` дал зелёный вывод при значениях не по
+        # назначению (в db_url попали 11 цифр вместо DSN, в ghcr_token — 11 символов не-PAT, в
+        # db_password — фраза с пробелами, а telegram_token не создан вовсе). Значения ниже
+        # фиктивные: боевые секреты в CI не появляются и не попадают в журнал/кэш. Проверяется
+        # механизм: отказ по форме до записи, генерация пароля базы, сборка db_url из пароля,
+        # побайтовая длина (лишний перевод строки ломает DSN и токен), порядок «значение → свой
+        # файл», вердикты `--check` и падение проверки на испорченном режиме.
         run: |
           set -euo pipefail
-          tmp=$(mktemp -d)
-          # длины фиктивных значений — 2, 4, 6, 8 байт: длина файла доказывает, что перевод
-          # строки не дописан (`printf '%s'`), а порядок ответов — что имя не перепутано.
-          printf 'aa\nbbbb\ncccccc\ndddddddd\n' \
-            | sudo env TBOT_SECRETS_SETUP_DIR="$tmp" bash deploy/vps/secrets-setup.sh
-          sudo env TBOT_SECRETS_SETUP_DIR="$tmp" bash deploy/vps/secrets-setup.sh --check
-          for pair in db_password:2 db_url:4 ghcr_token:6 telegram_token:8; do
-            name=${pair%%:*}
-            want=${pair##*:}
-            got=$(sudo stat -c '%s' "$tmp/$name")
-            if [ "$got" != "$want" ]; then
-              echo "FAIL: $name: $got байт, ожидалось $want — дописан перевод строки?" >&2
+          sudo bash -s <<'EOS'
+          set -euo pipefail
+          script=deploy/vps/secrets-setup.sh
+          tmp=$(mktemp -d /tmp/tbot-secrets-XXXXXX)
+          trap 'rm -rf "$tmp"' EXIT
+
+          # (a) форма важнее наличия: три попытки + отказ от записи => ни одного файла.
+          TBOT_SECRETS_SETUP_DIR="$tmp" bash "$script" --force >"$tmp/reject" 2>&1 <<'FIXTURE_BAD'
+          not a valid password with spaces
+          not a valid password with spaces
+          not a valid password with spaces
+          n
+          79135791350
+          79135791350
+          79135791350
+          n
+          79135791350
+          79135791350
+          79135791350
+          n
+          FIXTURE_BAD
+          grep -q 'НЕ ПОДХОДИТ: ghcr_token' "$tmp/reject"
+          grep -q 'db_url: собранный DSN не по форме' "$tmp/reject"
+          for name in db_password db_url ghcr_token telegram_token; do
+            if [ -e "$tmp/$name" ]; then
+              echo "FAIL: значение не по форме записано в $name" >&2
               exit 1
             fi
           done
-          # значение обязано попасть в свой файл, а не в следующий по порядку
-          printf 'aa' | sudo cmp - "$tmp/db_password"
-          printf 'cccccc' | sudo cmp - "$tmp/ghcr_token"
-          # негативная проба: `--check` обязан падать на испорченном режиме, иначе проверка прав
-          # — украшение
-          sudo chmod 644 "$tmp/db_url"
-          if sudo env TBOT_SECRETS_SETUP_DIR="$tmp" bash deploy/vps/secrets-setup.sh --check; then
-            echo "FAIL: --check пропустил режим 644" >&2
+
+          # (b) штатный прогон: пустая строка для db_password = генерация, db_url скрипт собирает
+          # сам из сгенерированного пароля. Ответы генерируются на месте и склеиваются из частей:
+          # строка вида «цифры:35 символов» в файле workflow выглядела бы как настоящий токен бота,
+          # а contract-тест test_no_forbidden_references такие строки в CI запрещает.
+          python3 - <<'PYFIX_OK' | TBOT_SECRETS_SETUP_DIR="$tmp" bash "$script" --force >"$tmp/write" 2>&1
+          import sys
+          prefix, ident = "ghp_", "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"
+          bot_id, bot_tail = "123456789", "AAHabcdefghij_klmnopqrstuvwxy012345"
+          assert len(ident) == 36 and len(bot_tail) == 35
+          sys.stdout.write("\n" + prefix + ident + "\n" + bot_id + chr(58) + bot_tail + "\n")
+          PYFIX_OK
+          grep -q 'сгенерирован автоматически' "$tmp/write"
+          grep -q 'записано файлов: 4' "$tmp/write"
+          test "$(stat -c %s "$tmp/ghcr_token")" -eq 40
+          test "$(stat -c %s "$tmp/telegram_token")" -eq 45
+          test "$(stat -c %a "$tmp/ghcr_token")" -eq 600
+          test "$(stat -c %U:%G "$tmp/db_url")" = root:root
+
+          # (c) db_url обязан быть собран из того же пароля, что лежит в db_password: рассинхон
+          # этой пары и есть причина падения migrate на площадке. Значения не печатаются — только
+          # вердикты и длины.
+          python3 - "$tmp" <<'PYEOF'
+          import pathlib, sys
+          d = pathlib.Path(sys.argv[1])
+          pw = (d / "db_password").read_bytes().decode()
+          url = (d / "db_url").read_bytes().decode()
+          shape = url.startswith("postgresql+psycopg://tbot:") and url.endswith("@postgres:5432/tbot")
+          print("DSN_SHAPE", shape, "DSN_MATCH", pw in url, "PW_LEN", len(pw), "URL_LEN", len(url))
+          ok = shape and (pw in url) and (len(url) == len(pw) + 45) and (len(pw) == 48)
+          raise SystemExit(0 if ok else 1)
+          PYEOF
+
+          # (d) --check: четыре файла состава OK; файл туннеля виден отдельной строкой (его
+          # создаёт T-714, не этот скрипт); каталог 700. Итог ненулевой именно из-за файла туннеля.
+          TBOT_SECRETS_SETUP_DIR="$tmp" bash "$script" --check >"$tmp/chk" 2>&1 || true
+          test "$(grep -c '^OK:' "$tmp/chk")" -eq 4
+          grep -q 'FAIL: нет файла:.*telegram_socks_pass' "$tmp/chk"
+          test "$(stat -c %a "$tmp")" -eq 700
+
+          # (e) негативная проба: --check обязан падать на испорченном режиме, иначе проверка прав
+          # — украшение.
+          chmod 644 "$tmp/ghcr_token"
+          if TBOT_SECRETS_SETUP_DIR="$tmp" bash "$script" --check >"$tmp/chk2" 2>&1; then
+            echo "FAIL: --check не заметил режим 644" >&2
             exit 1
           fi
-          sudo rm -rf "$tmp"
+          grep -q 'ghcr_token: 40 байт, 644' "$tmp/chk2"
+          EOS
+
       - name: 'docker compose config: боевой overlay'
         run: |
           # Версия печатается намеренно: раннер даёт свой compose (на 2026-11-20 — v5.1.3),

@@ -102,7 +102,10 @@ sudo docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml \
 замечаний нет даже тогда, когда `/etc/tbot/secrets` пуст. У compose v5.1.3 (CI-раннёр) поведение
 другое — там `config` требует существования файлов, и в job `prod-config` создаются пустышки.
 Значит зелёный `config` на площадке не заменяет проверку секретов: перед `up` обязателен
-`sudo bash deploy/vps/secrets-setup.sh --check`.
+`sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --check` — с 2026-11-20 он отвечает и за форму
+значений, и за пятый файл состава (`telegram_socks_pass`). Копию скрипта в `/tmp` использовать
+нельзя: она старше репозитория и принимает значения любой формы (замер sha256
+`89005d59…3370b` против `b8266865…9191f` в репозитории).
 
 ## 4. Образы: вход в реестр и pull по digest
 
@@ -195,18 +198,24 @@ curl -sSI --http3 https://tbot.rusiksoft.ru/healthz     # нужен curl с ngh
   по `ADR-002`). Данные при этом не трогаются: том `pgdata` не удаляется ни при каком откате.
 - Полная остановка контура: `$COMPOSE down` (без `-v`: `-v` удаляет тома, включая `pgdata`).
 
-## 8. Известная особенность `scripts/deploy_check.py` на хосте
+## 8. Имена файлов секретов в `scripts/deploy_check.py`
 
-`check_secret_files` ищет в каталоге секретов имена **конфигурации** — `tg_bot_token`,
-`tg_socks_password`, `db_url`, а на площадке файлы называются по TZ §14.3: `telegram_token`,
-`telegram_socks_pass`, `db_url`. Поэтому запуск на хосте
+Раньше `check_secret_files` искал в каталоге секретов имена **конфигурации** — `tg_bot_token`,
+`tg_socks_password`, `db_url`, — а на площадке файлы названы по `deploy/compose.prod.yaml`:
+`telegram_token`, `telegram_socks_pass`, `db_url`. Запуск на хосте давал красный
+`secret_files: tg_bot_token: файла нет; tg_socks_password: файла нет` при полностью готовой
+площадке. Это не ошибка подготовки и не повод создавать в `/etc/tbot/secrets` файлы с именами из
+конфигурации.
 
-```bash
-sudo TBOT_SECRETS_DIR=/etc/tbot/secrets python3 scripts/deploy_check.py
-```
+Исправлено 2026-11-20 вместе с замером на площадке: в `scripts/deploy_check.py` появились слоты
+`SECRET_SLOTS` — логический секрет, его допустимые имена (хостовое первым, имя конфигурации как
+альтернатива для dev-стенда) и обязан ли он существовать в этом контуре. Боевой контур требует
+`db_password`, `db_url`, `telegram_token`, `telegram_socks_pass` и `ghcr_token`; не-боевые контуры
+принимают и имена конфигурации, а `ghcr_token` не требуют. Отдельная проверка `secret_shapes`
+сверяет **форму** значений, печатая только имя файла, длину и подсказку формата.
 
-даёт красный `secret_files: tg_bot_token: файла нет; tg_socks_password: файла нет` при полностью
-готовой площадке. Это не ошибка подготовки и не повод создавать в `/etc/tbot/secrets` файлы с
-именами из конфигурации — имена задаёт `deploy/compose.prod.yaml`. Задача на исправление проверки
-именована в `tasks/todo.md` (`T-712`); до неё готовность секретов доказывается `--check` из
-`docs/runbook/secrets-on-host.md §3` и зелёным `docker compose config`.
+Проверить форму на хосте можно и без python-окружения приложения — `--check` из
+`docs/runbook/secrets-on-host.md §3` делает то же самое на чистом bash. `deploy-check`
+(`make deploy-check`, в CI — шаг с `python scripts/deploy_check.py --json`) остаётся машиной
+разработчика и CI: ему нужны зависимости приложения, которых на площадке нет.
+
