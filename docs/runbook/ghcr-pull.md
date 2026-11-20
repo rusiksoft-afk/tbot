@@ -26,18 +26,22 @@ gh run view <run-id> --repo rusiksoft-afk/tbot --log 2>/dev/null \
   | sed -E 's/pushing manifest for //' | sort -u
 ```
 
-Состояние на 2026-11-20 13:12 MSK (commit `b235d29` — мерж PR #2, run `44716926556`):
+Состояние на 2026-11-20 13:46 MSK (последний зелёный `Image` перед деплоем — commit
+`1ce4be6`, run `44721673799`):
 
 | Образ | Тег | Digest |
 | --- | --- | --- |
-| `ghcr.io/rusiksoft-afk/tbot-web` | `main`, `sha-b235d29` | `sha256:0f48265114538fbc60aa407cefb9b183f6fa29aa868d2d7590c54eaaea5f970d` |
-| `ghcr.io/rusiksoft-afk/tbot-tgbot` | `main`, `sha-b235d29` | `sha256:873152b3a9178290736f0676ed253817b52702c1db60bd1f788ac4ac6db2e37e` |
-| `ghcr.io/rusiksoft-afk/tbot-engine` | `main`, `sha-b235d29` | `sha256:c5c1af5e451db1ddf4b7e1d7efed8accf6fac23fb4e7bed564de069670006e03` |
-| `ghcr.io/rusiksoft-afk/tbot-jobs` | `main`, `sha-b235d29` | `sha256:04070e40b269dce3ed264b131d98cedac5d1c0fca2f1e0cc868f75f3c702753f` |
+| `ghcr.io/rusiksoft-afk/tbot-web` | `main`, `sha-1ce4be6` | `sha256:4aa09b13224e4f82031281ef4db460e66c428b9c566128d19004111f5cfae7e6` |
+| `ghcr.io/rusiksoft-afk/tbot-tgbot` | `main`, `sha-1ce4be6` | `sha256:e9993ac68693c9e2afe6f3dc85d2f5ab8119352ad53365d6bcacca90b5a635f1` |
+| `ghcr.io/rusiksoft-afk/tbot-engine` | `main`, `sha-1ce4be6` | `sha256:422818369c3f96731aa1c5b7054d5b94a65ef4b3032ed976de0fb12dae2f93fa` |
+| `ghcr.io/rusiksoft-afk/tbot-jobs` | `main`, `sha-1ce4be6` | `sha256:14b72e92a9fe5e89b5a7e2ca17fe5f24015427502cda5927a427e69c04865157` |
 | `postgres` (публичный, Docker Hub) | `16.4` | `sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412` |
 | `caddy` (публичный, Docker Hub) | `2` (v2.11.9) | `sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b` |
 
-Предыдущие наборы — точки отката по TZ §12.7. Commit `21579ba`, run `44708907667`: web
+Предыдущие наборы — точки отката по TZ §12.7. Commit `b235d29`, run `44716926556`: web
+`sha256:0f482651…970d`, tgbot `sha256:873152b3…637e`, engine
+`sha256:c5c1af5e…6e03`, jobs `sha256:04070e40…753f`. Commit `21579ba`,
+run `44708907667`: web
 `sha256:c33283cf…970d`, tgbot `sha256:413b1df8…637e`, engine `sha256:ae6faf72…3914`, jobs
 `sha256:a8800433…753f`. Commit `4fa1b51`, run `44689994900`: web `sha256:5705a7ba…5fdc`,
 tgbot `sha256:5d009e00…1a19`, engine `sha256:b0740c89…6b21`, jobs `sha256:9adee970…32a3`.
