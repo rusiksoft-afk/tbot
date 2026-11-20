@@ -30,6 +30,7 @@ REQUIRED_JOBS: tuple[str, ...] = (
     "audit",
     "compose-smoke",
     "deploy-check",
+    "broker-tls",
 )
 
 
@@ -139,3 +140,65 @@ def test_приёмка_стенда_требует_readyz_у_web_и_engine() ->
         ), f"в compose-smoke нет строгой readiness-пробы {svc}:{port}/readyz"
     for port in (9101, 9103):
         assert f"{probe} --liveness --url http://127.0.0.1:{port}/healthz" in joined, port
+
+
+def _runs(job: str) -> str:
+    """Все shell-скрипты job'а одним текстом: так удобно искать признаки приёмочной проверки."""
+    steps = _load(CI_FILE)["jobs"][job]["steps"]
+    return "\n".join(str(step.get("run", "")) for step in steps if step.get("run"))
+
+
+def test_приёмка_доверия_к_брокеру_покрывает_обе_половины_условия() -> None:
+    """AC-broker-gateway-02 (T-006): «без корня — падает, с корнем — работает».
+
+    Отдельного шага «корень установлен» в CI нет, поэтому обе половины закрепляются текстом
+    job'ов: отрицательная — пробой без якоря и ассертом в job `deploy-check`, положительная —
+    пробой с закреплённым корнём и проверкой системного набора доверия в образе.
+    """
+    broker_tls = _runs("broker-tls")
+    for marker in (
+        "--expect unverified",
+        "--expect verified",
+        "--extra-ca deploy/ca/ru-trusted-root-ca.pem",
+        "python scripts/ca_policy.py",
+    ):
+        assert marker in broker_tls, f"в job `broker-tls` пропало {marker!r}"
+
+    platform_run = _runs("deploy-check")
+    assert "не имеет права быть зелёной" in platform_run, (
+        "в job `deploy-check` пропал ассерт «без корня НУЦ broker_tls обязан падать» — "
+        "именно он не даёт тихо отключить проверку сертификата"
+    )
+
+    stand = _runs("compose-smoke")
+    assert "ca-certificates.crt" in stand, "проверка системного набора доверия образа пропала из CI"
+    assert "ca_policy.py --print-fingerprint" in stand, "отпечаток в compose-smoke должен быть один"
+
+
+def test_отпечаток_корня_не_дублируется_вне_политики() -> None:
+    """Закреплённый якорь живёт в `scripts/ca_policy.py` ровно один раз.
+
+    Копия отпечатка в workflow или Dockerfile — это будущая тихая рассинхронизация: CI начнёт
+    проверять старый корень, а приложение ходить по новому, и зелённый прогон будет врать.
+    В документации отпечаток разрешён: это инструкция для человека, который ставит корень руками.
+    """
+    policy = (ROOT / "scripts" / "ca_policy.py").read_text(encoding="utf-8")
+    pinned = re.findall(r"\b[0-9a-f]{64}\b", policy)
+    assert (
+        len(pinned) == 1
+    ), f"в ca_policy.py ожидался один закреплённый отпечаток, найдено {pinned}"
+
+    checked: list[Path] = [
+        CI_FILE,
+        IMAGE_FILE,
+        ROOT / "deploy" / "Dockerfile",
+        ROOT / "deploy" / "compose.yaml",
+        ROOT / "deploy" / "compose.override.yaml",
+        ROOT / "scripts" / "deploy_check.py",
+        ROOT / "scripts" / "tls_trust_probe.py",
+    ]
+    for path in checked:
+        assert not re.search(r"\b[0-9a-f]{64}\b", path.read_text(encoding="utf-8")), (
+            f"{path.relative_to(ROOT)}: отпечаток корня закреплён ещё и здесь — должен быть один "
+            "источник (scripts/ca_policy.py)"
+        )
