@@ -74,3 +74,47 @@ Runtime-профиль базы
 лежат в `/etc/tbot`, TLS наружу terminates Caddy, перед переключением обязательна проверка
 `make deploy-check`, точка отката фиксируется до миграций (TZ §12.7). Порядок шагов —
 `docs/runbook/deploy.md`; подготовка самой ВМ — `docs/research/03 §3.10`.
+
+Боевой состав (`compose.yaml` + `compose.prod.yaml`)
+
+Прод-файл — дополнение, а не самостоятельная конфигурация: он переопределяет образы на digest из
+`tbot.prod.env`, а локальной сборки в этой паре файлов нет вовсе (`build` объявлен только в
+`compose.override.yaml`): иначе `up -d` на площадке собрал бы образ из контекста вместо pull по
+digest. Поэтому оба файла перечисляются явно, вместе с env-файлом дайджестов:
+
+```bash
+cd deploy
+docker compose -f compose.yaml -f compose.prod.yaml --env-file tbot.prod.env config --quiet
+docker compose -f compose.yaml -f compose.prod.yaml --env-file tbot.prod.env config --format json \
+  | python3 ../scripts/prod_compose_check.py
+docker compose -f compose.yaml -f compose.prod.yaml --env-file tbot.prod.env run --rm migrate
+docker compose -f compose.yaml -f compose.prod.yaml --env-file tbot.prod.env up -d
+```
+
+(команды выполняются внутри каталога `deploy/`; из корня репозитория все три пути
+пишутся с префиксом `deploy/`). Проверка состава в CI — job `prod-config`:
+`scripts/prod_compose_check.py` по разобранному составу + `caddy validate` внутри образа с
+закреплённым digest.
+
+Что закреплено за этим составом (и почему это проверяется после слияния, а не по одному YAML):
+
+- наружу публикуются только `80:80` и `443:443`, и только у `caddy`: у `postgres`, `web`, `engine`,
+  `tgbot` и `jobs` ключа `ports` в бою нет (лишняя публикация появилась бы именно при слиянии —
+  compose объединяет `ports` и `networks` по имени сервиса);
+- секреты только файлами из `/etc/tbot/secrets`: `db_password` (база), `db_url` (`migrate`, `web`,
+  `engine`, `jobs`), `tg_bot_token` и `tg_socks_password` (`tgbot`); у `caddy` секретов нет, а
+  переменные окружения `POSTGRES_PASSWORD` и `TBOT_DB_URL` пробрасываются из env и должны
+  совпасть с файлами (`scripts/check_db_url.py`);
+- `caddy` монит в `:ro` файлы `./caddy/Caddyfile` и `./caddy/templates`, поэтому при смене конфига
+  достаточно `docker compose ... restart caddy` (или `caddy reload`); том `caddy_data` обязан
+  переживать `up -d` — в нём сертификат Let's Encrypt (лимит 50 выпусков на домен в неделю);
+- наружу ходят только `caddy` (ACME) и `tgbot` (Bot API через SOCKS5 туннеля T-714): у `postgres`,
+  `migrate` и `jobs` в прод-дополнении только `internal`-сети;
+- память всех контейнеров по ТЗ §14.6 и не более 3 ГиБ суммарно при 3.8 ГиБ хоста (OQ-11), у
+  `engine` — `stop_grace_period: 60s` (graceful shutdown обязателен для записи состояния).
+
+Журнал доступа Caddy фильтруется (`format filter`): query-параметры `token`, `key`, `sig`,
+заголовок `X-Api-Key` и заголовки учётных данных пишутся как `REDACTED` — иначе одноразовая ссылка
+на отчёт попадает в файл на диске (TZ §8.4). HTTP/3 выключён (`protocols h1 h2`), потому что
+UDP/443 не открыт: иначе браузер первым идёт по QUIC и ловит тайм-аут. Разбор и пробы —
+`docs/acceptance/tls-edge.md`.

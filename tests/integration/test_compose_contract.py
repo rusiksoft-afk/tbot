@@ -11,7 +11,14 @@ from typing import Any
 import pytest
 import yaml
 
-from tests.paths import COMPOSE_BASE, COMPOSE_OVERRIDE, DOCKERFILE, ROOT, load_script
+from tests.paths import (
+    COMPOSE_BASE,
+    COMPOSE_OVERRIDE,
+    COMPOSE_PROD,
+    DOCKERFILE,
+    ROOT,
+    load_script,
+)
 
 LONG_RUNNING = ("web", "engine", "tgbot", "jobs")
 
@@ -118,13 +125,14 @@ def test_контекст_сборки_и_dockerfile_существуют() -> N
 
     Ошибка вида `context: .` внутри deploy/compose.yaml даёт `deploy/deploy/Dockerfile` и
     падает на сборке в CI; здесь это проверяется без Docker — по факту существования путей.
-    """
-    services = _base()["services"]
-    project_dir = COMPOSE_BASE.parent
+    Сборки объявлены в `compose.override.yaml` (см.
+    `test_локальная_сборка_объявлена_только_в_dev_дополнении`)."""
+    services = _override()["services"]
+    project_dir = COMPOSE_OVERRIDE.parent
     built = [
         name for name, spec in services.items() if isinstance(spec, dict) and spec.get("build")
     ]
-    assert built, "в compose не осталось ни одной сборки — стенд нечем поднять"
+    assert built, "в dev-дополнении не осталось ни одной сборки — стенд нечем поднять"
     for name in built:
         build = services[name]["build"]
         context = (project_dir / str(build["context"])).resolve()
@@ -135,6 +143,25 @@ def test_контекст_сборки_и_dockerfile_существуют() -> N
             f"{name}: контекст обязан быть `..` (корень репозитория), иначе докерфайл ищется "
             "внутри deploy/"
         )
+
+
+def test_локальная_сборка_объявлена_только_в_dev_дополнении() -> None:
+    """Боевая пара файлов не должна давати compose права что-либо собирать.
+
+    Первый прогон job'а `prod-config` (2026-11-20) показал, что `build: !reset null` в overlay
+    НЕ убирает сборку из разобранной модели: в `config --format json` остаются `context` и
+    `dockerfile` из базового файла. А пока `build` в модели есть, `up -d` с отсутствующим
+    локально образом соберёт его на площадке — «pull по digest» превратится в «собрали на
+    коленке», и compose не сочтёт это ошибкой. Поэтому `build` живёт только в dev-дополнении,
+    а боевой дополнительно проверяется по разобранной модели (`no_local_build` в
+    `scripts/prod_compose_check.py`).
+    """
+    for path in (COMPOSE_BASE, COMPOSE_PROD):
+        services = yaml.safe_load(path.read_text(encoding="utf-8"))["services"]
+        built = [
+            name for name, spec in services.items() if isinstance(spec, dict) and "build" in spec
+        ]
+        assert not built, f"{path.name}: локальная сборка объявлена здесь: {built}"
 
 
 def test_хостовые_пут_и_монтирований_существуют() -> None:

@@ -18,9 +18,12 @@ from typing import Any
 import pytest
 import yaml
 
+from tests.paths import COMPOSE_PROD, load_compose_yaml
+
 ROOT = Path(__file__).resolve().parents[2]
 CI_FILE = ROOT / ".github" / "workflows" / "ci.yml"
 IMAGE_FILE = ROOT / ".github" / "workflows" / "image.yml"
+PROD_ENV_FILE = ROOT / "deploy" / "tbot.prod.env"
 
 REQUIRED_JOBS: tuple[str, ...] = (
     "quality",
@@ -29,6 +32,7 @@ REQUIRED_JOBS: tuple[str, ...] = (
     "secret-scan",
     "audit",
     "compose-smoke",
+    "prod-config",
     "deploy-check",
     "broker-tls",
 )
@@ -202,3 +206,96 @@ def test_отпечаток_корня_не_дублируется_вне_пол
             f"{path.relative_to(ROOT)}: отпечаток корня закреплён ещё и здесь — должен быть один "
             "источник (scripts/ca_policy.py)"
         )
+
+
+def _scripts_of(job: str) -> str:
+    """Скрипты всех шагов job'а одним текстом — так удобнее искать договорённости шагов."""
+    steps = _load(CI_FILE)["jobs"][job]["steps"]
+    return "\n".join(str(step.get("run", "")) for step in steps)
+
+
+def test_боевой_состав_разбирается_в_ci_а_не_только_руками() -> None:
+    """`compose-smoke` поднимает dev-стенд; боевой overlay не исполняется нигде, кроме CI.
+
+    Без шага разбора расхождение в `deploy/compose.prod.yaml` (первая же ошибка — разрыв
+    слияния overlay: лишняя публикация порта или сеть с egress у базы) обнаружилось бы только на
+    площадке, то есть в момент деплоя.
+    """
+    script = _scripts_of("prod-config")
+    assert (
+        "deploy/compose.yaml" in script
+    ), "job `prod-config` обязан разбирать состав базовым файлом, как это делает площадка"
+    assert (
+        "deploy/compose.prod.yaml" in script
+    ), "job `prod-config` обязан разбирать состав боевым overlay, как это делает площадка"
+    assert "--env-file deploy/tbot.prod.env" in script, (
+        "digest берутся из deploy/tbot.prod.env: без `--env-file` compose подставил бы пустые "
+        "значения и проверял не тот состав, что пойдёт на площадку"
+    )
+    assert "config" in script
+
+
+def test_проверки_разобранного_состава_живут_в_скрипте_а_не_в_workflow() -> None:
+    """Логика проверок обязана быть покрываемой офлайн-тестами.
+
+    Вставка `python <<PY …` прямо в workflow не видит ни `mypy`, ни `pytest`, ни покрытие: такой
+    шаг постепенно «зарастает» утверждениями, которые никто не исполнял. Поэтому шаг CI только
+    вызывает `scripts/prod_compose_check.py`, а его поведение закреплено в
+    `tests/unit/test_prod_compose_check.py`.
+    """
+    script = _scripts_of("prod-config")
+    assert (
+        "python3 scripts/prod_compose_check.py" in script
+    ), "job `prod-config` обязан проверять разбор через скрипт из репозитория"
+    assert (
+        "<<'PY'" not in script
+    ), "проверки разобранного состава переехали обратно в workflow: их нечем покрыть тестами"
+
+
+def test_разбор_боевого_состава_не_требует_боевых_секретов() -> None:
+    """Job не имеет права обращаться к repository secrets: пустышки создаёт сам шаг.
+
+    `compose config` требует, чтобы файлы секретов существовали. Если вместо подставных файлов
+    шагу выдать настоящие секреты площадки, они попадут в логи и в кэш раннёра — то есть job
+    станет источником компрометации (TZ §8.4).
+    """
+    script = _scripts_of("prod-config")
+    assert (
+        "secrets." not in script
+    ), "job `prod-config` обратился к секретам репозитория — состав обязан разбираться на пустышках"
+    ожидаемые = {
+        str(spec["file"])
+        for spec in load_compose_yaml(COMPOSE_PROD)["secrets"].values()
+        if isinstance(spec, dict) and spec.get("file")
+    }
+    assert ожидаемые, "в deploy/compose.prod.yaml не осталось файловых секретов"
+    for путь in ожидаемые:
+        assert путь in script or путь.removeprefix("/etc/tbot/secrets/") in script, (
+            f"секрет {путь} не создаётся в job `prod-config` — `compose config` упадёт на "
+            "отсутствующем файле, а не на ошибке в составе"
+        )
+
+
+def test_caddyfile_валидируется_образом_из_env_файла_и_без_доступа_в_сеть() -> None:
+    """Тот же бинарник и тот же путь, что на площадке, — и никаких обращений наружу.
+
+    Digest вычитывается из `deploy/tbot.prod.env`, а не переписывается в workflow: копия
+    указателя в двух местах обязательно разъедется, и CI начнёт валидировать не тот образ,
+    который запускается (тот же смысл у проверки отпечатка корня). `--network none` держит
+    шаг подальше от ACME: валидация конфигурации не должна выпускать сертификат.
+    """
+    script = _scripts_of("prod-config")
+    assert (
+        '--entrypoint caddy "caddy@$caddy_digest"' in script
+    ), "валидировать обязан тот же образ с закреплённым digest, который запускается на площадке"
+    assert (
+        "^CADDY_DIGEST=" in script
+    ), "digest образа Caddy обязан приходить из deploy/tbot.prod.env"
+    assert re.search(r"\b[0-9a-f]{64}\b", script) is None, (
+        "в job `prod-config` появился закреплённый digest прямо в workflow: единственный "
+        "источник указателей — deploy/tbot.prod.env"
+    )
+    assert "--network none" in script
+    assert (
+        "--config /etc/caddy/Caddyfile" in script
+    ), "валидировать надо тот путь, на котором Caddyfile стоит в контейнере площадки"

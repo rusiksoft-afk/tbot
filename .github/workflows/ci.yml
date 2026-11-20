@@ -266,6 +266,67 @@ jobs:
         if: failure()
         run: docker compose -f deploy/compose.yaml -f deploy/compose.override.yaml logs --tail=200
 
+  prod-config:
+    name: 'боевой состав: compose-overlay, digest, Caddyfile'
+    # Боевой состав нигде не поднимается (ни локально, ни в compose-smoke), поэтому хотя бы
+    # разбирается здесь: `docker compose config` знает настоящие правила слияния overlay, а
+    # `caddy validate` внутри образа с закреплённым digest проверяет Caddyfile, не трогая
+    # площадку. Статическая половина контракта — tests/integration/test_compose_prod_contract.py.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 'файлы секретов площадки (пустышки: проверяется путь, а не значение)'
+        # compose при разборе состава требует, чтобы файлы секретов существовали; имена ниже —
+        # те же, что кладёт заказчик (TZ §14.3, docs/runbook/telegram-token.md). Без этого шага
+        # разбор падал бы на отсутствующем файле, а не на ошибке в составе.
+        run: |
+          set -euo pipefail
+          # обход каталога тоже под sudo: 750 root, glob под пользователем runner не раскроется
+          sudo install -d -m 750 /etc/tbot/secrets
+          for name in db_password db_url telegram_token telegram_socks_pass; do
+            printf 'ci-placeholder-not-a-secret' | sudo tee "/etc/tbot/secrets/$name" >/dev/null
+            sudo chmod 600 "/etc/tbot/secrets/$name"
+          done
+          sudo ls -l /etc/tbot/secrets
+      - name: 'docker compose config: боевой overlay'
+        run: |
+          # Версия печатается намеренно: раннер даёт свой compose (на 2026-11-20 — v5.1.3),
+          # а площадка — 2.40.3 из пакета Ubuntu. Разбор поэтому проверяет синтаксис и
+          # правила слияния более новой реализации; расхождение фиксируется в
+          # docs/acceptance/tls-edge.md §5 и снимается только прогоном на самой площадке.
+          docker compose version
+          docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+            --env-file deploy/tbot.prod.env config --quiet
+      - name: 'разобранный состав: порты, digest, сети, лимиты'
+        # Правила слияния overlay знает только compose, поэтому здесь проверяется результат
+        # слияния, а не текст файла. Логика проверок — `scripts/prod_compose_check.py`,
+        # она покрыта офлайн-тестами `tests/unit/test_prod_compose_check.py`.
+        run: |
+          docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+            --env-file deploy/tbot.prod.env config --format json \
+            | python3 scripts/prod_compose_check.py
+      - name: 'Caddyfile валидируется тем же образом, что запустится на площадке'
+        run: |
+          set -euo pipefail
+          caddy_digest=$(grep -m1 '^CADDY_DIGEST=' deploy/tbot.prod.env | cut -d= -f2)
+          if [ -z "$caddy_digest" ]; then
+            echo "в deploy/tbot.prod.env нет CADDY_DIGEST — проверять нечем" >&2
+            exit 1
+          fi
+          # digest читают из файла, а не дублируют в workflow: копия указателя в двух местах
+          # обязательно разъедется, и площадка получит не тот образ, что проверял CI.
+          docker run --rm --network none --cap-drop ALL \
+            -v "$PWD/deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" \
+            --entrypoint caddy "caddy@$caddy_digest" \
+            validate --config /etc/caddy/Caddyfile --adapter caddyfile
+      - name: 'журнал разбора при неудаче'
+        if: failure()
+        run: |
+          docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+            --env-file deploy/tbot.prod.env config || true
+
   deploy-check:
     name: проверка площадки (ожидания CI-раннера)
     runs-on: ubuntu-latest
