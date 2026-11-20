@@ -236,14 +236,23 @@ def check_images(model: dict[str, Any]) -> CheckResult:
 
 
 def check_no_build(model: dict[str, Any]) -> CheckResult:
-    """Локальной сборки в бою нет: `build: !reset null` обязан дожить до разобранного состава."""
-    built = sorted(name for name, spec in _services(model).items() if spec.get("build"))
+    """В разобранном составе не должно быть ни одного `build` — ни в какой форме.
+
+    Первый прогон job'а `prod-config` (2026-11-20) опроверг допущение, что `build: !reset null`
+    в overlay отключает сборку: после слияния compose оставляет `context` (каталог проекта) и
+    `dockerfile` из базового файла. Пока `build` в модели есть, `up -d` с отсутствующим локально
+    образом соберёт его на площадке (compose не считает это ошибкой), и связь «запустили ровно
+    то, что собрали в CI» (TZ §14.6, `docs/runbook/ghcr-pull.md §1`) теряется.
+    Поэтому проверяется именно наличие ключа: `build: null` — тоже сигнал, что кто-то
+    пытается «отключить» сборку вместо того, чтобы убрать её из боевого разбора.
+    """
+    built = sorted(name for name, spec in _services(model).items() if "build" in spec)
     return CheckResult(
         "no_local_build",
         not built,
         f"в разобранном составе осталась сборка: {built}"
         if built
-        else "сборок нет: все образы тянутся из реестра",
+        else "сборок нет ни в одной форме: все образы тянутся из реестра",
     )
 
 

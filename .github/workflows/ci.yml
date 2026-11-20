@@ -276,26 +276,6 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: 'ВРЕМЕННАЯ диагностика: какой тег compose действительно сбрасывает build'
-        # Первый прогон job'а показал: `build: !reset null` в overlay НЕ убирает сборку из
-        # разобранной модели — compose 2.40.3 оставляет context/dockerfile из базового файла.
-        # Шаг перебирает формы тега и печатает, что остаётся в `config --format json`.
-        run: |
-          set +e
-          docker compose version
-          for form in '!reset null' '!override null' '!reset {}' '!override {}' '!reset []' 'null'; do
-            echo 'services:' > /tmp/probe.yaml
-            echo '  web:' >> /tmp/probe.yaml
-            echo "    build: $form" >> /tmp/probe.yaml
-            json=$(docker compose -f deploy/compose.yaml -f /tmp/probe.yaml \n              --env-file deploy/tbot.prod.env config --format json 2>/tmp/probe.err)
-            if [ $? -ne 0 ]; then
-              echo "FORM [$form] -> ОШИБКА compose:"
-              head -3 /tmp/probe.err
-              continue
-            fi
-            echo "FORM [$form] -> $(printf '%s' "$json" | python3 scripts/_probe_build.py)"
-          done
-          true
 
       - name: 'файлы секретов площадки (пустышки: проверяется путь, а не значение)'
         # compose при разборе состава требует, чтобы файлы секретов существовали; имена ниже —
@@ -312,6 +292,11 @@ jobs:
           sudo ls -l /etc/tbot/secrets
       - name: 'docker compose config: боевой overlay'
         run: |
+          # Версия печатается намеренно: раннер даёт свой compose (на 2026-11-20 — v5.1.3),
+          # а площадка — 2.40.3 из пакета Ubuntu. Разбор поэтому проверяет синтаксис и
+          # правила слияния более новой реализации; расхождение фиксируется в
+          # docs/acceptance/tls-edge.md §5 и снимается только прогоном на самой площадке.
+          docker compose version
           docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml \
             --env-file deploy/tbot.prod.env config --quiet
       - name: 'разобранный состав: порты, digest, сети, лимиты'
