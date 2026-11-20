@@ -7,8 +7,9 @@
 ## 1. Где мы
 
 - **git**: `github.com/rusiksoft-afk/tbot`, `main` синхронна с `origin`; HEAD — `git log --oneline -1`.
-- **Локальные гейты зелёные**: `ruff format --check`/`ruff check` чисто, `mypy --strict` — 57 файлов,
-  `pytest -m "not live_api and not e2e"` — **348 passed**, покрытие **95.07%** при пороге 80%,
+- **Локальные гейты зелёные**: `ruff format --check`/`ruff check` чисто, `mypy --strict` — 58 файлов,
+  `pytest -m "not live_api and not e2e"` — **372 passed / 7 skipped** (пропуски — POSIX-ветки,
+  они исполняются в CI), покрытие **95.07%** при пороге 80%,
   подавлений **14** (инвентаризация — `docs/acceptance/m0-quality.md §2`; расхождение числа в
   workflow и в дереве ловит `test_базовый_уровень_подавлений_совпадает_с_фактом`). Новые скрипты
   пишутся **без `subprocess`**, чтобы не плодить `nosec`: приёмка площадки читает `/proc` и `/etc`
@@ -26,6 +27,7 @@
   затем PR #1 → `44707622555` + `Image` `44707622496`, и после слияния в main — `44708167410` +
   `Image` `44708167554` (первый зелёный прогон job'а `prod-config`: 13 проверок разобранного
   состава OK, `caddy validate` внутри образа с digest → «Valid configuration»).
+  После починки красного прогона на `b3b49f1` — `44752449359` + `Image` `44752449201` (§1.12).
   Прогон текущего HEAD смотреть здесь: `gh run list --repo rusiksoft-afk/tbot --limit 4`.
   Приёмка T-005 (стенд) и T-008 (CI) закрыта, протокол — `docs/acceptance/m0-stand.md`
   (там же §10 — как диагностировать падение стенда). Приёмка доверия TLS к брокера (T-006 и
@@ -418,30 +420,97 @@
 Граница не сдвинута: значения по-прежнему не выводятся ни целиком, ни полями; агент видит только
 имя файла, длину и вердикт формы.
 
+### 1.12 Красный CI на `b3b49f1` починен: имя секрета проверяется по контуру (2026-11-20 17:35 MSK)
+
+Пал job `тесты и покрытие` (run `44746558946`, 1 failed / 376 passed / 1 skipped):
+`tests/unit/test_deploy_check_secrets.py::test_боевой_контур_требует_хостовые_имена_а_не_имена_конфигурации`.
+На Windows эта POSIX-ветка пропускается, поэтому дефект дожил только до CI — и там он выглядел
+как «раннер придирается к владельцу файлов».
+
+- Дефект в проверке, а не в тесте. `check_secret_files` перебирал **оба** имени слота, и в боевом
+  контуре его закрывало имя контейнера: лежащий `tg_bot_token` закрывал слот `telegram_token`,
+  `tg_socks_password` — слот `telegram_socks_pass`, и строки «файла нет» в выводе не было вовсе.
+  На Linux-раннёре (uid 1001) первой претензией становился владелец, и проверка переставала
+  говорить про имена вообще. Десятый случай той же болезни, что восемь причин `compose-smoke`:
+  «шаг выполняется, но проверяет не то».
+- Починено в `scripts/deploy_check.py`: `slot_names(slot, settings)` — боевой контур принимает
+  только хостовое имя (`deploy/compose.prod.yaml` монтирует `…/secrets/telegram_token` и
+  `…/telegram_socks_pass`, а `tg_bot_token`/`tg_socks_password` существуют только внутри
+  контейнера — `packages.common.config.SECRET_FIELDS`), вне боя (dev-стенд `deploy/secrets/`)
+  принимаются оба. `slot_foreign_names` выводит лишний файл отдельной строкой («файл с именем
+  контейнера, а не хоста»), а подсказка «файла нет» больше не зовёт создать в `/etc/tbot/secrets`
+  файл, который состав не прочитает. `check_secret_shapes` читает то же имя, что и проверка
+  наличия: иначе значение из чужого файла получало вердикт «форма соблюдается».
+- Чем доказано: выбор имён закреплён в `test_слоты_знают_обе_пары_имён` — он без файловой системы
+  и исполняется тоже на Windows (на POSIX-ветках полагаться нельзя, они пропускаются);
+  `test_лишнее_имя_контейнера_в_бою_называется_лишним_а_не_готовностью` закрепляет сообщения.
+  В тестах про имена владелец замазан `monkeypatch`: иначе претензия к uid раннера закрывает
+  предмет проверки (именно так тест и падал). Мутационная проба: вернуть перебор `slot.names` →
+  падает и POSIX-тест, и логический.
+- Прогон после правки: `44752449359` — все 9 job'ов зелёные, `тесты и покрытие` = **378 passed /
+  1 skipped**, покрытие 95.07%. Локально: ruff чисто, `mypy --strict` — 58 файлов,
+  `pytest` — 372 passed / 7 skipped, подавлений **14** (уровень не вырос, новых подавлений нет).
+- Дайджесты переснимать не нужно — замер, а не допущение: `git diff --name-only 1ce4be6..HEAD`
+  не задевает `apps/`, `packages/`, `deploy/Dockerfile`, `pyproject.toml`, `deploy/compose*.yaml`,
+  `deploy/caddy/Caddyfile`, `deploy/postgres/tbot.conf`, поэтому закреплённый набор `CADDY_DIGEST`
+  /`TBOT_*_DIGEST` собирается из того же кода (разрешённое исключение — `stand-deploy §2`).
+
+### 1.13 Площадка обновлена до `f67ab76`, `--check` стал честным: 4 `FAIL` и 1 `OK`
+
+- Клон `/opt/tbot` подтянут до `f67ab76` (`sudo git -C /opt/tbot pull --ff-only`, deploy-ключ
+  работает). Грабля: под `rusiksoft` нет права входа в каталог (750 `root:root`) — `cd /opt/tbot`
+  даёт `Permission denied`, а следом «not a git repository»; все git-операции с площадки — только
+  `sudo git -C /opt/tbot …` и абсолютные пути к файлам.
+- `sha256sum deploy/vps/secrets-setup.sh` на ВМ = `b8266865bcb5…9191f` — совпал с репозиторной
+  версией, то есть на площадке теперь форма-осведомлённый скрипт, а копия из `/tmp` не нужна.
+- `sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --check` (2026-11-20 17:35 MSK): `FAIL` × 3 по
+  форме (`db_password` 154 байта, `db_url` 11 байт, `ghcr_token` 11 байт) + `FAIL: нет файла:
+  /etc/tbot/secrets/telegram_token`, и `OK: telegram_socks_pass: 24 байта, 600, root:root`;
+  код возврата 1. Мусорные значения из §1.10 больше не выглядят «готовностью» — это и был смысл
+  правки §1.11.
+- Готовность переснята на новом HEAD: `sudo python3 scripts/prod_bootstrap_check.py` — `ГОТОВО`,
+  exit 0, `clock_offset` = 0.000068 с по свежему снимку `chronyc tracking`; `ufw` active
+  (22/80/443 tcp + 443 udp, deny incoming); `config --quiet` exit 0 и `prod_compose_check.py` —
+  13/13 OK на compose **2.40.3**; `df /var/lib/docker` — 64 ГиБ свободных (порог `pull` — 15 ГиБ,
+  ADR-002 требует держать два набора образов). Грабля снимка часов: фиксированное имя
+  `/tmp/chrony-tracking.txt` из прошлого замера `sudo tee` не перезаписал («Permission denied»),
+  и проверка молча читала **старый** снимок — имя файла снимка надо брать уникальным.
+- Порядок «секреты → база» закреплён замером compose: `POSTGRES_PASSWORD_FILE: /run/secrets/db_password`
+  (`deploy/compose.yaml §postgres`) читается только при `initdb`, а пароль роли остаётся в томе
+  `pgdata`. Поднять `postgres` до финального `db_password` = потом получить `migrate` с отказом
+  аутентификации и единственный ремонт — новый том (то есть данные). Поэтому `up -d postgres`
+  не выполняется, пока `--check` красный.
+- Что реально осталось из ранбука: только то, для чего нужны значения — `docker login` + `pull`
+  по digest (нет `ghcr_token`), `migrate`, `up -d postgres web caddy`, пробы 80/443/443udp, ACME,
+  журнал Caddy и устойчивость после рестарта docker/ребута.
+
 ---
 
 ## 2. Следующие шаги (по порядку)
 
 1. `T-713` + остаток `T-712` — **деплой на `153.51.172.30` по `docs/runbook/stand-deploy.md`**
    (протокол приёмки: `docs/acceptance/tls-edge.md`). Со стороны репозитория подготовлено всё:
-   overlay, `Caddyfile` с HTTP/3, скрипт ввода секретов, ADR-003, ранбук, CI-защиты. Деплой
-   упирается в **одно действие заказчика** (§4): один запуск `sudo bash
-   /opt/tbot/deploy/vps/secrets-setup.sh` после `sudo git pull --ff-only` — на ввод остаются два
-   значения (`ghcr_token`, `telegram_token`), пароль базы скрипт генерирует сам, `db_url` собирает
-   из него. Остальное из прежнего списка закрыто: deploy key добавлен и работает, SG сужена,
-   согласия на `systemctl restart docker` и ребут получены. Логин владельца `ghcr_token` не
-   блокирует: вход в GHCR проверяется прямым обменом токена и GET манифеста
-   (`docs/runbook/ghcr-pull.md §3`). Дальше по ранбуку: клон в `/opt/tbot`, сверка хеша commit с
-   дайджестами, `sudo docker compose … config` + `sudo … config --format json | python3
-   scripts/prod_compose_check.py` **на самой ВМ** (compose там 2.40.3), `docker login
-   --password-stdin` + `pull`, `migrate`, `up -d postgres` → healthy → `run --rm migrate` →
-   `up -d web caddy`.
+   overlay, `Caddyfile` с HTTP/3, скрипт ввода секретов, ADR-003, ранбук, CI-защиты; CI зелёный
+   (§1.12). Площадка тоже подготовлена и обновлена до текущего HEAD (§1.13): клон `f67ab76`,
+   `config` + `prod_compose_check` 13/13 на compose 2.40.3, `prod_bootstrap_check` — `ГОТОВО`,
+   `ufw` 22/80/443 tcp + 443 udp, 64 ГиБ свободны.
+   Деплой упирается в **одно действие заказчика** (§4): один запуск `sudo bash
+   /opt/tbot/deploy/vps/secrets-setup.sh` в своей SSH-сессии — клон уже подтянут, скрипт на ВМ
+   формы значений проверяет. На ввод остаются два значения (`ghcr_token`, `telegram_token`),
+   пароль базы скрипт генерирует сам, `db_url` собирает из него; мусорные значения (§1.10) он
+   перезатрёт, потому что они не по форме. Остальное из прежнего списка закрыто: deploy key
+   добавлен и работает, SG сужена, согласия на `systemctl restart docker` и ребут получены.
+   Логин владельца `ghcr_token` не блокирует: вход в GHCR проверяется прямым обменом токена и GET
+   манифеста (`docs/runbook/ghcr-pull.md §3`). Дальше по ранбуку (`stand-deploy §4…§7`):
+   `docker login --password-stdin` + `pull` по digest, `up -d postgres` → healthy →
+   `run --rm migrate` → `up -d web caddy`. Порядок «сначала секрет, потом база» обязателен:
+   пароль роли фиксируется в томе `pgdata` при `initdb` (§1.13).
    Дальше — то, чего без контура не проверить: выпуск сертификата ACME (эмитент Let's Encrypt,
    SAN ровно `tbot.rusiksoft.ru`), `curl -I https://tbot.rusiksoft.ru/healthz` (200), живой
    редирект :80→:443 (`308`), отказ `openssl s_client -tls1_1`, заголовки §4 против живого `web`,
    `docker logs caddy` с `REDACTED`, `json-file 50m x10`, поведение после `systemctl restart docker`
    и после ребута ВМ, `Alt-Svc: h3` + живой QUIC. **Только после этого `T-713` и `T-712`
-   закрываются.**
+   закрываются** — без приёма 80/443 наружу они остаются `[in progress]`.
 2. `T-712` остаток — учебный откат: `pull → migrate → restart` на предыдущий набор digest из
    истории (`docs/runbook/ghcr-pull.md §2`, `ADR-002`). Подзадача «исправить имена в
    `scripts/deploy_check.py`» выполнена 2026-11-20 (см. §1.11 и `stand-deploy §8`).
@@ -492,11 +561,18 @@
   На ВМ:
 
   ```bash
-  cd /opt/tbot && sudo git pull --ff-only
-  sudo sha256sum deploy/vps/secrets-setup.sh   # сверка с репозиторной версией
-  sudo bash deploy/vps/secrets-setup.sh
-  sudo bash deploy/vps/secrets-setup.sh --check
+  # `/opt/tbot` — 750 root:root: под rusiksoft в него нельзя войти (`cd: Permission denied`),
+  # поэтому все команды с абсолютными путями и под sudo:
+  sudo git -C /opt/tbot pull --ff-only                   # уже подтянут до f67ab76 → «Already up to date»
+  sudo sha256sum /opt/tbot/deploy/vps/secrets-setup.sh   # сверка: b8266865bcb5…9191f
+  sudo bash /opt/tbot/deploy/vps/secrets-setup.sh         # два значения с клавиатуры
+  sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --check # ожидание: 5 × OK и код 0
   ```
+
+  Состояние до этого шага (замер 2026-11-20 17:35 MSK, §1.13) — `--check` даёт четыре `FAIL`
+  (три по форме значений + нет `telegram_token`) и один `OK` (`telegram_socks_pass`), код 1:
+  это не сломанная проверка, это ровно те мусорные значения, которые были заведены 12:27–12:29.
+  Новый прогон их перезатрёт.
 
   От заказчика требуется ввести **два** значения: `ghcr_token` (fine-grained PAT: Contents
   Read-only + Packages Read-only на `tbot`) и `telegram_token` (токен из @BotFather). `db_password`
