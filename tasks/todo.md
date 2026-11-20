@@ -478,13 +478,17 @@
   - Что блокирует остаток (обновлено 2026-11-20 вечером): **блокировок нет** — шесть ответов
     заказчика получены и закреплены в `docs/adr/ADR-003-prod-deploy-edge-decisions.md`
     (деплой разрешён, доступ через `sudo`, секреты — режимы записи по `docs/adr/ADR-004`).
-    Из пяти файлов секретов четыре заполнены (замер 14:52 UTC: `db_password` 48 байт и `db_url`
-    93 байта сгенерированы скриптом, `telegram_token` 46 байт, `telegram_socks_pass` 24 байта),
-    `--check` возвращает код 1 только из-за `ghcr_token`. От владельца площадки нужно: выпустить
-    PAT `rusiksoft-afk` с `Packages: Read-only` + `Contents: Read-only` (или классический только
-    `read:packages`), завести его скриптом и назвать логин — владельца токена; локальный `gh`
-    не годится: `read:packages` в scopes нет, анонимный pull отвечает `401`. Также согласовать
-    `systemctl restart docker` и ребут.
+    Из пяти файлов секретов пять заполнены (замер 15:29 UTC: `db_password` 48 байт и `db_url`
+    93 байта сгенерированы скриптом, `telegram_token` 46 байт, `telegram_socks_pass` 24 байта,
+    `ghcr_token` 93 байта — форма PAT), `--check` возвращает пять `OK` и код 0. НО `ghcr_token`
+    выпущен без прав: `packages-list` → `403`, `manifests/main` → `403`, `manifests/<digest>` →
+    `404` (`HANDOFF §1.15`) — `pull` по digest невозможен, `up` не делается. От владельца
+    площадки нужно: в fine-grained токене выставить Repository access → `tbot` и Contents:
+    Read-only + Packages: Read-only, либо выпустить классический PAT только со `read:packages`.
+    Проверка после этого — функциональная проба `docs/runbook/ghcr-pull.md §3`
+    (`packages-list=200`, `manifest(main)=200`), а не только `--check`. Логин владельца токена
+    известен: `rusiksoft-afk` (аккаунт личного типа) — он нужен для `docker login --username`.
+    Также согласовать `systemctl restart docker` и ребут.
     Проверка pull по digest для публичного образа
     выполнена: `postgres:16.4` = `sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412`.
   - Что сделано дополнительно 2026-11-20: `deploy/compose.prod.yaml` написан (единственные

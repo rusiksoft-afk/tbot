@@ -548,6 +548,32 @@
   истории → подлежит ротации в `@BotFather` (`--force --only telegram_token`,
   `docs/runbook/telegram-token.md`). До ротации бот доступен тому, у кого есть копия переписки.
 
+### 1.15 Пятый файл секрета появллся, но токен выпущен без прав: `pull` всё ещё нельзя
+
+- Режим 3 ADR-004 отработал второй раз: PAT сохранён заказчиком файлом `~/.secrets/ghcr_token`
+  (93 байта, без BOM, форма `github_pat_…` проверена локально **до** пересылки — в вывод шли только
+  длина и вердикт формы) и пролит в stdin `secrets-setup.sh --force --only ghcr_token`.
+  Локальная копия удалена (`rm -f`, каталог пуст, других копий в Downloads/Desktop/Documents нет).
+  На ВМ: 93 байта, `600 root:root`, каталог `700 root:root`.
+- `secrets-setup.sh --check` — **пять** `OK`, код 0: формально блокатор по файлам снят.
+- Но функциональная проба (значение читается внутри процесса под `sudo`, в `argv` не попадает)
+  показала, что токен ничего не умеет: `GET /user` → `200`, `login=rusiksoft-afk`,
+  `type=User` (личный аккаунт, не организация); `GET /repos/rusiksoft-afk/tbot/contents/deploy`
+  → `404` (репозиторий вне области видимости токена);
+  `GET /user/packages?package_type=container` → `403` «Resource not accessible by personal access
+  token»; обмен в `ghcr.io/token` по Basic → `200`, но `tags/list` и `manifests/main` → `403`,
+  `manifests/<digest из deploy/tbot.prod.env>` → `404`. Итого: нет ни `Packages`, ни `Contents`.
+- Грабля пробы: обмен GHCR с `Bearer` даёт `401` даже на валидном токене — нужен Basic
+  (`логин:токен`). Из-за этого первая версия пробы выглядела как «токен не принимается».
+- Следствие: `pull` по digest и `up` не делаем; состав и база не поднимаются. Чинится только на
+  стороне заказчика: в существующем fine-grained токене выставить Repository access → `tbot` и
+  Contents: Read-only + Packages: Read-only, либо выпустить классический PAT только со
+  `read:packages` и тем же способом сохранить в `~/.secrets/ghcr_token` (я пролью, не читая).
+- Побочный полезный факт: логин владельца токена — `rusiksoft-afk`, аккаунт личного типа, значит
+  `sudo docker login ghcr.io --username rusiksoft-afk --password-stdin < /etc/tbot/secrets/ghcr_token`.
+- Урок для проверок (записан в `docs/runbook/ghcr-pull.md §3`): зелёный `--check` отвечает за
+  форму файла, но не за права токена; перед `pull` обязательна функциональная проба к реестру.
+
 ---
 
 ## 2. Следующие шаги (по порядку)
@@ -621,32 +647,39 @@
   это отдельное решение (объём, расписание, ключ).
 - ~~Разрешение на исключение из паузы T-011~~ — **получено 2026-11-20**: подготовка, деплой и 80/443 на
   живой ВМ разрешены (`docs/adr/ADR-001`), поэтому `T-714` может доделываться без отдельного разрешения.
-- **Одно значение, без которого деплой (T-712/T-713) не двинется с места: `ghcr_token`.**
-  Остальные четыре файла заполнены (§1.14). На ВМ:
+- **Одно действие, без которого деплой (T-712/T-713) не двинется с места: выдать токену в
+  `ghcr_token` права `Packages: Read-only` и `Contents: Read-only`.** Файл уже лежит, форма
+  правильная, `--check` зелёный — но сам токен пустой по правам (§1.15). Пять файлов заполнены.
+  На GitHub (значение не меняется, менять надо настройки токена): Fine-grained tokens →
+  Repository access → Only select repositories → `rusiksoft-afk/tbot`; Permissions →
+  Contents: Read-only + Packages: Read-only. Если после этого проба всё ещё `403` — выпустить
+  классический PAT только со `read:packages`; его тоже принимает скрипт.
+  На ВМ после этого (или если заводится новый токен):
 
   ```bash
   # `/opt/tbot` — 750 root:root: под rusiksoft в него нельзя войти (`cd: Permission denied`),
   # поэтому все команды с абсолютными путями и под sudo:
-  sudo git -C /opt/tbot pull --ff-only                   # подтянуть версию скрипта с ADR-004
+  sudo git -C /opt/tbot -c core.sshCommand="ssh -o IdentitiesOnly=yes -i /root/.ssh/tbot_deploy_key" pull --ff-only
   sudo sha256sum /opt/tbot/deploy/vps/secrets-setup.sh   # сверка: 5499b18679ea466a…fe7f35
-  sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --only ghcr_token  # одно значение с клавиатуры
+  # только если заведён НОВЫЙ токен (правка прав существующего значения не требует):
+  sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --only ghcr_token   # или ~/.secrets/ghcr_token + пролив агентом
   sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --check # ожидание: 5 × OK и код 0
   ```
 
-  Состояние на 2026-11-20 14:52 UTC (§1.14): `--check` даёт четыре `OK` (`db_password` 48 байт,
-  `db_url` 93 байта, `telegram_token` 46 байт, `telegram_socks_pass` 24 байта, всё `600
-  root:root`) и один `FAIL` — `ghcr_token` (11 байт, значение не по форме «PAT»).
+  Состояние на 2026-11-20 15:29 UTC (§1.15): `--check` даёт пять `OK` и код 0 — все файлы на
+  месте и по форме, но `ghcr_token` (93 байта, `github_pat_…`) выпущен **без прав** Packages и
+  Contents, поэтому `pull` по-прежнему невозможен (пробы: `packages-list` → `403`,
+  `manifests/main` → `403`).
 
-  От заказчика требуется ввести **одно** значение: `ghcr_token` (fine-grained PAT: Contents
-  Read-only + Packages Read-only на `tbot`; или классический PAT только со `read:packages`).
-  Второй способ, не показывающий значение в чате: сохранить PAT файлом на машине оператора
-  (например `~/.secrets/ghcr_token`) и разрешить агенту перлить его в stdin скрипта — режим 3
-  ADR-004; агент не читает файл и не печатает его, временная копия на ВМ не остаётся.
+  Главный проверочный сдвиг: после выдачи прав смотрим **не** `--check` (он уже зелёный и про
+  права ничего не знает), а функциональную пробу из `docs/runbook/ghcr-pull.md §3`: ожидание
+  `packages-list http=200` и `manifest(main) http=200`. Значение в чат по-прежнему не нужно:
+  агент проверяет вердикты (`http=`-коды, логин владельца), а не содержимое. Логин владельца
+  уже известен и сам по себе не секрет: `rusiksoft-afk` — он нужен для
+  `sudo docker login ghcr.io --username rusiksoft-afk --password-stdin < /etc/tbot/secrets/ghcr_token`.
   `db_password` и `db_url` трогать не нужно: пара собрана скриптом из одного значения, поэтому
-  она не может разойтись (именно рассинхон пары и сломал подготовку 2026-11-20). Значения в чат
-  не нужны: агент проверяет только `--check` (имена, длины, режимы, вердикты формы) и
-  `sudo ls -l /etc/tbot/secrets`. Ожидаемый итог — пять строк `OK` и код 0. Копия скрипта в `/tmp`
-  не годится: она старше репозитория и принимает значения любой формы.
+  она не может разойтись (именно рассинхон пары и сломал подготовку 2026-11-20). Копия скрипта
+  в `/tmp` не годится: она старше репозитория и принимает значения любой формы.
 - ~~Read-only deploy key для клона с площадки~~ — **сделано заказчиком 2026-11-20, проверено с
   ВМ 14:05**: `Hi rusiksoft-afk/tbot! You've successfully authenticated`. Грабля, из-за которой
   ключ сначала показался нерабочим: файл назван `tbot_deploy_key`, а ssh без `-i` перебирает только

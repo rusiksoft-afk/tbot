@@ -104,6 +104,67 @@ tgbot `sha256:5d009e00…1a19`, engine `sha256:b0740c89…6b21`, jobs `sha256:9a
    Прежний рецепт с `sudo tee` устарел с 2026-11-20: он пишет любое значение без проверки
    формы — именно так в файл и попали 11 символов не-PAT.
 
+### Зелёный `--check` не означает, что токен рабочий: функциональная проба
+
+Замер 2026-11-20 15:29 UTC: `ghcr_token` размещён (93 байта, `600 root:root`, форма
+`github_pat_…`), `secrets-setup.sh --check` — **пять** `OK` и код 0. При этом тот же файл даёт:
+
+| проба (значение читается внутри процесса на ВМ, в `argv` не попадает) | ответ |
+| --- | --- |
+| `GET https://api.github.com/user` | `200`, `login=rusiksoft-afk`, `type=User` (личный аккаунт, не организация) |
+| `GET /repos/rusiksoft-afk/tbot/contents/deploy` | `404` — репозиторий не в области видимости токена |
+| `GET /user/packages?package_type=container` | `403` «Resource not accessible by personal access token» — право Packages не выдано |
+| `GET ghcr.io/token?service=ghcr.io&scope=repository:rusiksoft-afk/tbot-web:pull` с Basic | `200` (обмен проходит) |
+| `GET ghcr.io/v2/.../tags/list` и `manifests/main` с выданным JWT | `403` |
+| `GET ghcr.io/v2/.../manifests/<digest из deploy/tbot.prod.env>` | `404` |
+
+Вывод: проверка формы в скрипте отвечает только за «файл не мусор». Права токена проверяются
+обращением к реестру, и делать это надо **до** `pull`: иначе `pull` падает на
+`denied`/`unauthorized` уже после того, как скачана половина слоёв. Отдельная грабля: правильная
+форма обмена — Basic (`-u логин:токен`), а не `Bearer`; с `Bearer` GHCR отвечает `401` даже на
+валидном токене (тот же замер: `exchange=401`, при этом `GET /user` тем же токеном — `200`).
+
+Проба, которая ничего не печатает кроме вердиктов (значение читается внутри процесса под `sudo`):
+
+```bash
+ssh -i ~/.ssh/tbot/ssh-key-1795095923419 rusiksoft@153.51.172.30 'sudo python3 -' <<'PROBE'
+import base64, json, urllib.request, urllib.error
+tok = open('/etc/tbot/secrets/ghcr_token', 'rb').read().strip().decode()
+basic = base64.b64encode(('rusiksoft-afk:' + tok).encode()).decode()
+def req(url, headers=None):
+    r = urllib.request.Request(url, headers=headers or {})
+    try:
+        with urllib.request.urlopen(r, timeout=25) as f:
+            return f.status, f.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+    except Exception as e:
+        return 0, str(e).encode()
+gh = {'Authorization': 'Bearer ' + tok, 'Accept': 'application/vnd.github+json'}
+st, body = req('https://api.github.com/user', gh)
+d = json.loads(body or b'{}')
+print('login=%s id=%s type=%s http=%s' % (d.get('login'), d.get('id'), d.get('type'), st))
+st, _ = req('https://api.github.com/user/packages?package_type=container', gh)
+print('packages-list http=%s (нужно 200; 403 = нет права Packages)' % st)
+stx, bx = req('https://ghcr.io/token?service=ghcr.io&scope=repository:rusiksoft-afk/tbot-web:pull',
+              {'Authorization': 'Basic ' + basic})
+jwt = json.loads(bx or b'{}').get('token', '')
+acc = {'Authorization': 'Bearer ' + jwt,
+       'Accept': 'application/vnd.oci.image.index.v1+json,'
+                 'application/vnd.docker.distribution.manifest.list.v2+json,'
+                 'application/vnd.docker.distribution.manifest.v2+json'}
+st, _ = req('https://ghcr.io/v2/rusiksoft-afk/tbot-web/manifests/main', acc)
+print('exchange http=%s jwt_len=%s manifest(main) http=%s' % (stx, len(jwt), st))
+PROBE
+```
+
+Ожидание на рабочей площадке: `packages-list http=200` и `manifest(main) http=200`. Если
+`packages-list` отвечает `403`, а обмен — `200`, у токена нет `Packages: Read-only`: право
+выдаётся в настройках fine-grained токена (Repository access → `tbot`, Permissions →
+Contents: Read-only + Packages: Read-only), либо ставится классический PAT только со
+`read:packages` (скрипт его тоже принимает: `gh[pousr]_[A-Za-z0-9]{36,}`). Значения при этом по
+прежнему вводит заказчик (ADR-004, режим 1 или 3) — проба нужна только для вердикта.
+
 ### Кому принадлежит токен: как узнать логин, не поднимая токен в argv
 
 Логин нужен для `sudo docker login ghcr.io --username <логин> --password-stdin`. Заказчик
