@@ -73,7 +73,12 @@ HOST_CPU_BUDGET = HOST_VCPU * CPU_OVERSUBSCRIPTION
 # от `ufw` (правила уходят в FORWARD/nat, `INPUT` не участвует), поэтому именно список публикаций
 # и описывает периметр — а не файрвол (`docs/acceptance/prod-firewall.md §5`).
 PUBLIC_SERVICE = "caddy"
-ALLOWED_PUBLICATIONS = {"80:80", "443:443"}
+# Публикации вместе с протоколом. `443/udp` — не украшение: Caddyfile объявляет h1/h2/h3 и отдаёт
+# `Alt-Svc: h3=":443"`, файрвол пропускает 443/udp (TZ §8.5, ADR-003), но Docker публикует UDP
+# только отдельной строкой с `/udp`. Замер 2026-11-20 на площадке: при публикациях `80:80` и
+# `443:443` UDP/443 не слушается вообще, то есть периметр обещает транспорт, которого нет
+# (браузер после первого визита уходит в QUIC и получает тайм-аут).
+ALLOWED_PUBLICATIONS = {"80:80/tcp", "443:443/tcp", "443:443/udp"}
 
 # Сервисы, которым путь наружу запрещён архитектурно (TZ §8.5: у БД исходящих нет, секреты
 # наружу не уходят). Caddy и web обязаны egress иметь: прокси выпускает сертификат ACME, а
@@ -157,13 +162,19 @@ def _secret_names(spec: dict[str, Any]) -> set[str]:
 
 
 def _publications(spec: dict[str, Any]) -> set[str]:
-    """Публикации портов вида «хостовый:контейнерный» — строкой или объектом."""
+    """Публикации портов вида «хостовый:контейнерный/протокол» (строка или объект).
+
+    Протокол сохраняется намеренно: `443:443` и `443:443/udp` — это разные слушатели, и
+    свести их к одной строке значит перестать замечать отсутствующий HTTP/3.
+    """
     result: set[str] = set()
     for item in spec.get("ports") or []:
         if isinstance(item, str):
-            result.add(item)
+            pair, _, protocol = item.partition("/")
+            result.add(f"{pair}/{protocol or 'tcp'}")
         elif isinstance(item, dict):
-            result.add(f"{item.get('published')}:{item.get('target')}")
+            protocol = str(item.get("protocol") or "tcp")
+            result.add(f"{item.get('published')}:{item.get('target')}/{protocol}")
     return result
 
 
@@ -193,7 +204,7 @@ def _cpus(value: object) -> float | None:
 
 
 def check_ports(model: dict[str, Any]) -> list[CheckResult]:
-    """Наружу смотрит только прокси, и ровно 80/443 (T-713, TZ §8.3)."""
+    """Наружу смотрит только прокси, и ровно 80/tcp, 443/tcp и 443/udp (T-713, TZ §8.3, §8.5)."""
     services = _services(model)
     actual = _publications(services.get(PUBLIC_SERVICE, {}))
     results = [

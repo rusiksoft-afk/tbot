@@ -34,8 +34,8 @@ def _secret(name: str) -> dict[str, Any]:
     return {"source": name, "target": name, "uid": 0, "gid": 0, "mode": 256}
 
 
-def _port(target: int, published: str) -> dict[str, Any]:
-    return {"mode": "ingress", "target": target, "published": published, "protocol": "tcp"}
+def _port(target: int, published: str, protocol: str = "tcp") -> dict[str, Any]:
+    return {"mode": "ingress", "target": target, "published": published, "protocol": protocol}
 
 
 def _service(
@@ -141,7 +141,7 @@ def _model() -> dict[str, Any]:
                 "caddy",
                 CADDY_DIGEST_IMAGE,
                 {"tbot-public": None},
-                ports=[_port(80, "80"), _port(443, "443")],
+                ports=[_port(80, "80"), _port(443, "443"), _port(443, "443", "udp")],
                 mem=128 * MIB,
                 cpus=0.25,
             ),
@@ -199,6 +199,34 @@ def test_неожиданный_порт_у_прокси_отклоняется(
     модель = _model()
     модель["services"]["caddy"]["ports"] = [_port(80, "80"), _port(443, "443"), _port(8443, "8443")]
     assert not _imap(модель)["ports_proxy_publication"].ok
+
+
+def test_http_3_без_udp_публикации_отклоняется() -> None:
+    """`443:443` без `443:443/udp` — это обещанный и отсутствующий транспорт.
+
+    Замер на площадке 2026-11-20: Caddyfile отдаёт `Alt-Svc: h3=":443"`, `ufw` пропускает
+    443/udp, а публикаций UDP у Docker нет — на UDP/443 приходит ICMP port unreachable. Проверка
+    обязана падать и на отсутствующем udp, и на udp без tcp (это был бы прокси без HTTPS).
+    """
+    модель = _model()
+    модель["services"]["caddy"]["ports"] = [_port(80, "80"), _port(443, "443")]
+    проверка = _imap(модель)["ports_proxy_publication"]
+    assert not проверка.ok, "пропуск udp-публикации при объявленном h3 обязан быть красным"
+    assert "443/udp" in проверка.detail or "443:443/udp" in проверка.detail
+
+    модель = _model()
+    модель["services"]["caddy"]["ports"] = [_port(80, "80"), _port(443, "443", "udp")]
+    assert not _imap(модель)["ports_proxy_publication"].ok, "udp без tcp — это не HTTPS-периметр"
+
+
+def test_протокол_публикации_не_теряется() -> None:
+    """Строковая и объектная формы обязаны различать tcp и udp."""
+    модель = _model()
+    модель["services"]["web"]["ports"] = ["8080:8080", "8080:8080/udp"]
+    проверка = _imap(модель)["ports_only_proxy"]
+    assert not проверка.ok
+    assert "8080:8080/tcp" in проверка.detail
+    assert "8080:8080/udp" in проверка.detail, "строковая форма обязана различать протоколы"
 
 
 def test_образ_без_digest_отклоняется() -> None:
