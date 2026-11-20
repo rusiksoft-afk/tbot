@@ -115,8 +115,9 @@ def _compose_base() -> list[str]:
 def cmd_dev(args: Sequence[str]) -> int:
     if shutil.which("docker") is None:
         print(
-            "docker не найден на этой машине. Проверка compose-стенда выполняется в CI "
-            "(job smoke) или на test-стенде 192.168.1.40 (T-010).",
+            "docker не найден на этой машине. Полный состав стенда поднимается в CI "
+            "(job `dev-стенд: сборка, готовность, изоляция базы`) или на рабочей ВМ "
+            "153.51.172.30 (T-010, docs/adr/ADR-001).",
             file=sys.stderr,
         )
         return 2
