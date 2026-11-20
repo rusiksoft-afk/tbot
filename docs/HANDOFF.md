@@ -205,7 +205,7 @@
   3 ежедневных + 2 еженедельных + 3 pre-deploy, потолок 20 ГиБ). Без WAL-архива RPO ≤15 мин
   (TZ §4.13) не выполняется — это требование к T-702, а не пожелание.
 - **Дайджесты текущего релиза** (для pull по digest, `docs/runbook/ghcr-pull.md §2`): commit
-  `5a670c4` → web `f4e2521d…`, tgbot `a04adfd3…`, engine `a9015b2f…`, jobs `4fcf52bd…`,
+  `4fa1b51` → web `5705a7ba…`, tgbot `5d009e00…`, engine `b0740c89…`, jobs `9adee970…`,
   публичный `postgres:16.4` → `e62fbf9d…`.
 
 ## 2. Следующие шаги (по порядку)

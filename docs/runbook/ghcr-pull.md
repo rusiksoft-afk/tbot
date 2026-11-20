@@ -26,14 +26,14 @@ gh run view <run-id> --repo rusiksoft-afk/tbot --log 2>/dev/null \
   | sed -E 's/pushing manifest for //' | sort -u
 ```
 
-Состояние на 2026-11-20 (commit `5a670c4`, run `44682424201`):
+Состояние на 2026-11-20 11:50 (commit `4fa1b51`, run `44689994900`):
 
 | Образ | Тег | Digest |
 | --- | --- | --- |
-| `ghcr.io/rusiksoft-afk/tbot-web` | `main`, `sha-5a670c4` | `sha256:f4e2521d4deb156ad2bd9fa7d0d563f37e83327c2637b292416bb5379e9d1c8c` |
-| `ghcr.io/rusiksoft-afk/tbot-tgbot` | `main`, `sha-5a670c4` | `sha256:a04adfd394eabc27020d1db67ebe15826c7273a388935542867d5bd293923a59` |
-| `ghcr.io/rusiksoft-afk/tbot-engine` | `main`, `sha-5a670c4` | `sha256:a9015b2f5e2e1d69fc709c85b7e0fe13ac461fa766658509515b54829e1579a7` |
-| `ghcr.io/rusiksoft-afk/tbot-jobs` | `main`, `sha-5a670c4` | `sha256:4fcf52bdd67a92b96fdd4d14b7ca91f589ef60b1e3e09c7e289043f79ad3a196` |
+| `ghcr.io/rusiksoft-afk/tbot-web` | `main`, `sha-4fa1b51` | `sha256:5705a7baf471c5f16ae8035774a600f2966e63e410b7ebc3725d19610d5f5fdc` |
+| `ghcr.io/rusiksoft-afk/tbot-tgbot` | `main`, `sha-4fa1b51` | `sha256:5d009e000b0fdc98732c37e969037dd775b99c8ad256e7a2cd7c04193dcc1a19` |
+| `ghcr.io/rusiksoft-afk/tbot-engine` | `main`, `sha-4fa1b51` | `sha256:b0740c89ae501ee4a6ad2940976e8fdad0e40b2214a37fe0361c407f57406b21` |
+| `ghcr.io/rusiksoft-afk/tbot-jobs` | `main`, `sha-4fa1b51` | `sha256:9adee970b314c4aed3b113137d26f9c8280a483b13e9e00cbd964b6770f832a3` |
 | `postgres` (публичный, Docker Hub) | `16.4` | `sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412` |
 
 `postgres` берётся не из GHCR, но тоже пинится по digest: сборка CI и площадка должны получать
@@ -85,13 +85,13 @@ gh run view <run-id> --repo rusiksoft-afk/tbot --log 2>/dev/null \
 ssh -i ~/.ssh/tbot/ssh-key-1795095923419 rusiksoft@153.51.172.30 '
   sudo docker login ghcr.io --username <логин-владельца-токена> \
     --password-stdin < /etc/tbot/secrets/ghcr_token
-  sudo docker pull ghcr.io/rusiksoft-afk/tbot-web@sha256:f4e2521d4deb156ad2bd9fa7d0d563f37e83327c2637b292416bb5379e9d1c8c
-  sudo docker pull ghcr.io/rusiksoft-afk/tbot-engine@sha256:a9015b2f5e2e1d69fc709c85b7e0fe13ac461fa766658509515b54829e1579a7
-  sudo docker pull ghcr.io/rusiksoft-afk/tbot-jobs@sha256:4fcf52bdd67a92b96fdd4d14b7ca91f589ef60b1e3e09c7e289043f79ad3a196
-  sudo docker pull ghcr.io/rusiksoft-afk/tbot-tgbot@sha256:a04adfd394eabc27020d1db67ebe15826c7273a388935542867d5bd293923a59
+  sudo docker pull ghcr.io/rusiksoft-afk/tbot-web@sha256:5705a7baf471c5f16ae8035774a600f2966e63e410b7ebc3725d19610d5f5fdc
+  sudo docker pull ghcr.io/rusiksoft-afk/tbot-engine@sha256:b0740c89ae501ee4a6ad2940976e8fdad0e40b2214a37fe0361c407f57406b21
+  sudo docker pull ghcr.io/rusiksoft-afk/tbot-jobs@sha256:9adee970b314c4aed3b113137d26f9c8280a483b13e9e00cbd964b6770f832a3
+  sudo docker pull ghcr.io/rusiksoft-afk/tbot-tgbot@sha256:5d009e000b0fdc98732c37e969037dd775b99c8ad256e7a2cd7c04193dcc1a19
   sudo docker pull postgres@sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412
   sudo docker image inspect --format "{{.Id}} {{.RepoDigests}}" \
-    ghcr.io/rusiksoft-afk/tbot-web@sha256:f4e2521d4deb156ad2bd9fa7d0d563f37e83327c2637b292416bb5379e9d1c8c'
+    ghcr.io/rusiksoft-afk/tbot-web@sha256:5705a7baf471c5f16ae8035774a600f2966e63e410b7ebc3725d19610d5f5fdc'
 ```
 
 `docker login` пишет только `Login Succeeded` (имя пользователя не секрет). Вывод `docker pull`
