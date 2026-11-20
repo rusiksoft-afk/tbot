@@ -21,6 +21,7 @@ from fastapi.responses import JSONResponse
 from packages.common import metrics
 from packages.common.clock import utc_now
 from packages.common.config import ConfigError, Settings, load_settings
+from packages.common.db import psycopg_dsn
 from packages.common.health_server import CheckResult
 from packages.common.ids import new_trace_id
 from packages.common.logging import (
@@ -40,7 +41,7 @@ def check_database(settings: Settings) -> CheckResult:
     """Проверка доступности PostgreSQL (только для `/readyz`)."""
     if settings.db_url is None:
         return False, "db_url не настроен (секретный файл или TBOT_DB_URL)"
-    dsn = settings.db_url.get_secret_value()
+    dsn = psycopg_dsn(settings.db_url.get_secret_value())
     try:
         with (
             psycopg.connect(dsn, connect_timeout=3) as connection,

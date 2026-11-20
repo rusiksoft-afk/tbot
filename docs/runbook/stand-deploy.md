@@ -317,3 +317,42 @@ Windows пропускаются (прогон `44746558946`, разбор — `
 совпадают, закреплена контрактом `test_права_монтируемых_секретов_совпадают_с_gid_процесса_в_образе`;
 факт чтения изнутри контейнера в CI проверяется задачей T-715.
 
+## 10. `web` unhealthy, `caddy` не стартует: форма DSN и прямое подключение psycopg3
+
+Симптом: `up -d web caddy` отвечает `dependency failed to start: container tbot-web-1 is
+unhealthy`, в журнале healthcheck'а — `FAIL http://127.0.0.1:8080/readyz status=503
+…"postgres недоступен: ProgrammingError"`, при этом uvicorn запущен и слушает 8080, а база
+`healthy` и миграции применены.
+
+Диагностика без вывода значения (DSN читается из секрета внутри контейнера, в вывод идут только
+схема, тип ошибки и длина):
+
+```bash
+sudo sh -c "cd /opt/tbot && docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml \
+  --env-file deploy/tbot.prod.env run --rm --no-deps --entrypoint python web - <<'PY' | \
+  sed -E 's#(://[A-Za-z0-9_]+:)[^@[:space:]]+@#\1***@#g'
+import pathlib, psycopg
+dsn = pathlib.Path('/run/secrets/db_url').read_text(encoding='utf-8').strip()
+print('scheme=', dsn.split('://', 1)[0], 'len=', len(dsn))
+try:
+    psycopg.conninfo.make_conninfo(dsn)
+    print('conninfo=OK')
+except Exception as exc:
+    print('conninfo=FAIL', type(exc).__name__)
+PY"
+```
+
+Что это значит: psycopg3 собственный парсер conninfo **не принимает** диалектную приставку, в
+которой проект хранит адрес (`postgresql+psycopg://`, TZ §14.9) — ошибка
+`missing "=" after "postgresql+psycopg://…" in connection info string`. Alembic и SQLAlchemy этой
+проблемы не видят (для них существует `sqlalchemy_url`), а прямые подключения — `check_database` в
+`apps/web/main.py` (проба `/readyz`, на которой держится healthcheck и, через `depends_on`, старт
+`caddy`) и `database`-проба в `scripts/deploy_check.py` — обязаны проходить через
+`packages.common.db.psycopg_dsn`. Проверено на площадке и на dev-машине с одним и тем же
+пиннингом (`psycopg 3.2.13`), то есть к подготовке ВМ это отношения не имеет.
+
+Ремонт — только через пересъёмку образов: `Image` workflow собирает образы на push в `main`, затем
+`deploy/tbot.prod.env` получает новые digest'ы (пара «прогон → коммит», `AGENTS.md`), и только
+потом `pull` и `up -d web caddy` на площадке. Правка «на живую» (пересборка образа руками на ВМ)
+ломает прослеживаемость деплоя и приёмку по digest — так делать нельзя.
+

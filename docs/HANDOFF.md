@@ -619,6 +619,39 @@
 
 ---
 
+### 1.17 Первый срез дошёл до healthcheck'а: `web` нездоров из-за формы DSN при прямом подключении
+
+- После `--remed` (ADR-005) `run --rm migrate` прошёл: `migrate_exit=0`, alembic применил
+  `0001`. `up -d web caddy` → `dependency failed to start: container tbot-web-1 is unhealthy`.
+- Healthcheck `web` — это `packages.common.health_probe` против `http://127.0.0.1:8080/readyz`, а
+  `/readyz` отдавал 503: `{"database":{"ok":false,"detail":"postgres недоступен:
+  ProgrammingError"}}`. Сам uvicorn при этом запущен и слушает 8080 — то есть процесс жив,
+  не готова только проба базы.
+- Причина выяснилась пробой внутри контейнера (значение DSN не выводилось, печатались только
+  схема и код ошибки): `psycopg.connect` **не принимает собственную диалектную приставку**,
+  которую проект хранит в `db_url`:
+  `ProgrammingError: missing "=" after "postgresql+psycopg://tbot:***@postgres:5432/tbot" in
+  connection info string`. Тот же результат на dev-машине с тем же пиннингом
+  (`psycopg[binary,pool]>=3.2,<3.3`, локально 3.2.13) — значит дело не в площадке и не в пароле.
+  Alembic/SQLAlchemy этой формы не видят (для них и нужен `sqlalchemy_url`), а `check_database` в
+  web и `database`-проба в `scripts/deploy_check.py` звали `psycopg.connect` с сырым DSN.
+- CI это поймать не мог: в `tests/integration/test_web_app.py` фикстура использовала «плоскую»
+  форму `postgresql://…`, а мок `connect` игнорировал аргументы — то есть ровно та форма, которая
+  работает, и ровно та проверка, которая ничего не сверяет. Исправлено: фикстура хранит форму
+  площадки, тест сверяет, что именно ушло в драйвер (`postgresql://…` без `+psycopg`).
+- Сделано: `packages/common/db.py` получил `psycopg_dsn` (обратное направление того же
+  развода: хранится форма SQLAlchemy, подключаются напрямую в форме psycopg3; чужие схемы,
+  включая `+psycopg2` и `+asyncpg`, отклоняются явно). Применено в `apps/web/main.py
+  ::check_database` и `scripts/deploy_check.py::check_database`. Новые офлайн-тесты:
+  `tests/unit/test_db_url.py` (обе формы, круг `sqlalchemy_url(psycopg_dsn(x)) == sqlalchemy_url(x)`,
+  регресс «храняемая форма не разбирается самим psycopg») и обновлённый интеграционный тест web.
+- Локальные гейты: ruff format/check чистые, `mypy --strict` 58 файлов,
+  `pytest -m "not live_api and not e2e"` → 384 passed / 7 skipped, покрытие 95.18%, подавлений 14.
+- Следствие для площадки: образы собирает workflow `Image` (`.github/workflows/image.yml`, push в
+  `main`), поэтому починка доезжает до контейнера только через **пересъёмку digest'ов**
+  `deploy/tbot.prod.env` (пара «прогон → коммит», `AGENTS.md`) и `pull` на ВМ. До этого `web` и
+  `caddy` не поднимаются, 80/443 приёмку проводить не на чем.
+
 ## 2. Следующие шаги (по порядку)
 
 1. `T-713` + остаток `T-712` — **деплой на `153.51.172.30` по `docs/runbook/stand-deploy.md`**
@@ -627,15 +660,17 @@
    (§1.12). Площадка тоже подготовлена и обновлена до текущего HEAD (§1.13): клон `f67ab76`,
    `config` + `prod_compose_check` 13/13 на compose 2.40.3, `prod_bootstrap_check` — `ГОТОВО`,
    `ufw` 22/80/443 tcp + 443 udp, 64 ГиБ свободны.
-   Состояние на конец 2026-11-20 (§1.16): секреты размещены (пять файлов, `--check` зелёный),
-   `ghcr_token` с правами на пакеты, `docker login` успешен, `pull` по digest выполнен и совпал с
-   `deploy/tbot.prod.env`, `postgres` поднят и `healthy`. Действий заказчика, которые это
-   блокируют, не осталось; блокировавший ранее шаг (токен без прав) закрыт. Ближайший порядок
-   (`stand-deploy §5…§7`): `git pull` клона площадки (только с явным deploy-ключом, §2 ранбука) →
-   `secrets-setup.sh --remed` (ADR-005: права монтируемых секретов `640` + `gid 10001`) →
-   `--check` → `run --rm migrate` → `up -d web caddy`. Порядок «сначала секрет, потом база»
-   выполнен и остаётся обязательным для любых будущих пересборок тома: пароль роли зафиксирован в
-   томе `pgdata` при `initdb`, перегенерация `db_password` = новый том и потеря данных (§1.13).
+   Состояние на конец 2026-11-20 (§1.16, §1.17): секреты размещены (пять файлов, `--check` зелёный,
+   права по ADR-005), `ghcr_token` с правами на пакеты, `docker login` успешен, `pull` по digest
+   выполнен и совпал с `deploy/tbot.prod.env`, `postgres` поднят и `healthy`, `migrate` применён
+   (`0001`). Дальше площадка уперлась в дефект самого образа/кода: `/readyz` в `web` не проходил из-
+   за формы DSN (§1.17), поэтому `web` unhealthy и `caddy` не стартует. Действий заказчика, которые
+   это блокируют, не осталось; нужен пересъём digest'ов после зелёного workflow `Image`.
+   Ближайший порядок (`stand-deploy §5…§7`): `git pull` клона площадки (только с явным deploy-ключом,
+   §2 ранбука) → `secrets-setup.sh --remed` (уже сделано) → `--check` → `run --rm migrate` (уже
+   сделано) → `up -d web caddy`. Порядок «сначала секрет, потом база» выполнен и остаётся
+   обязательным для любых будущих пересборок тома: пароль роли зафиксирован в томе `pgdata` при
+   `initdb`, перегенерация `db_password` = новый том и потеря данных (§1.13).
    Дальше — то, чего без контура не проверить: выпуск сертификата ACME (эмитент Let's Encrypt,
    SAN ровно `tbot.rusiksoft.ru`), `curl -I https://tbot.rusiksoft.ru/healthz` (200), живой
    редирект :80→:443 (`308`), отказ `openssl s_client -tls1_1`, заголовки §4 против живого `web`,

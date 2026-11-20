@@ -33,6 +33,7 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 
 from packages.common.config import ConfigError, Contour, Settings, load_settings
+from packages.common.db import psycopg_dsn
 
 ROOT = ensure_repo_root_on_path()
 
@@ -568,7 +569,9 @@ def check_db(settings: Settings | None) -> CheckResult:
         )
     try:
         with (
-            psycopg.connect(settings.db_url.get_secret_value(), connect_timeout=5) as connection,
+            psycopg.connect(
+                psycopg_dsn(settings.db_url.get_secret_value()), connect_timeout=5
+            ) as connection,
             connection.cursor() as cursor,
         ):
             cursor.execute("SELECT version()")

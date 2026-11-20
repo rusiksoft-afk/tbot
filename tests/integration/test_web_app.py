@@ -18,12 +18,17 @@ def client(settings: Settings) -> TestClient:
 
 @pytest.fixture
 def client_with_db(secrets_dir: Path) -> TestClient:
-    """Клиент с настроенным адресом базы: проверка `database` доходит до драйвера."""
+    """Клиент с настроенным адресом базы: проверка `database` доходит до драйвера.
+
+    Форма адреса — ровно та, что лежит на площадке в секретном файле `db_url`
+    (`postgresql+psycopg://…`, TZ §14.9): с «плюсовой» схемой `psycopg.connect` падает ещё до
+    соединения с сервером, и тест на обычной схеме этого бы не поймал.
+    """
     from pydantic import SecretStr
 
     settings = Settings(
         secrets_dir=secrets_dir,
-        db_url=SecretStr("postgresql://tbot:secretvalue@localhost:5432/tbot"),
+        db_url=SecretStr("postgresql+psycopg://tbot:secretvalue@postgres:5432/tbot"),
     )
     return TestClient(create_app(settings), base_url="http://testserver")
 
@@ -75,10 +80,20 @@ def test_readyz_готов_при_исправной_базе(
         def cursor(self) -> _Cursor:
             return _Cursor()
 
-    monkeypatch.setattr("apps.web.main.psycopg.connect", lambda *_a, **_k: _Connection())
+    подключено: list[str] = []
+
+    def _connect(dsn: str, **_kw: object) -> _Connection:
+        подключено.append(dsn)
+        return _Connection()
+
+    monkeypatch.setattr("apps.web.main.psycopg.connect", _connect)
     response = client_with_db.get("/readyz")
     assert response.status_code == 200
     assert response.json()["checks"]["database"]["ok"] is True
+    # Что именно ушло в драйвер: форма SQLAlchemy для psycopg3 неподъёмна, прямое
+    # подключение обязано получить `postgresql://…` (замер на площадке 2026-11-20:
+    # ProgrammingError «missing "=\"» и нездоровый `web`).
+    assert подключено == ["postgresql://tbot:secretvalue@postgres:5432/tbot"]
 
 
 def test_readyz_не_готов_при_ошибке_базы(
