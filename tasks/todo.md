@@ -114,11 +114,34 @@
 - [ ] **T-009** `storage`: Alembic + первые миграции (users, sessions, invitations, totp, backup_codes, audit_log с append-only правами)
   - Приёмка: `REQ-identity-04`, `REQ-storage-01/02`; `upgrade head` → `downgrade base` → `upgrade head`
   - Проверка: `make migrate`, `test_audit_append_only_role`
-  - Файлы: `migrations/versions/0001_*.py`, `deploy/postgres/roles.sql`
+  - Файлы: `packages/storage/{base,models}.py`, `migrations/versions/0002_identity_access.py`,
+    `deploy/postgres/roles.sql`, `tests/contract/test_identity_schema.py`,
+    `tests/integration/test_identity_schema_db.py`
   - Статус 2026-11-19: часть выполнена — каркас Alembic (`env.py`, `script.py.mako`) и ревизия
     `0001_app_meta` есть, цикл up/down/up проверяется в CI job'ом `migrations`. Таблицы
     идентичности и `roles.sql` переносятся в M1 (T-101…T-106): выдумывать схему доступа раньше
     модели доступа смысла нет.
+  - Статус 2026-11-20 (первый срез, гейты зелёные): ORM-определение схемы
+    `packages/storage/{base,models}.py` (одна конвенция имён ограничений), ревизия
+    `0002_identity_access` — восемь таблиц §4.1 + `CREATE EXTENSION citext`, `migrations/env.py`
+    читает `target_metadata` из моделей и конвенцию из `base.py`. Проверки:
+    `tests/contract/test_identity_schema.py` (16, живая база не нужна: офлайн-SQL
+    `alembic upgrade head --sql` против моделей по таблицам, колонкам, именам ограничений и
+    индексов; обратная миграция снимает всё созданное; `REQ-storage-02` — нет вещественных типов;
+    время только с поясом; FK только `RESTRICT`; история ревизий линейна) и
+    `tests/integration/test_identity_schema_db.py` (9, только живая база — для неё в job'е
+    `migrations` добавлен шаг: каталог базы против моделей, регистронезависимость `citext`, `CHECK`
+    против bcrypt-хэша пароля, окна TOTP 5, мусорного хэша цепочки и срока сессии в прошлом,
+    частичный уникальный индекс привязки TOTP, `RESTRICT` на удалении пользователя со сессией,
+    identity у `audit_log.id`). Цикл `upgrade head → downgrade base → upgrade head` в job'е
+    остался; `alembic check` приёмкой схемы не стал (эвристика Alembic на `server_default` даёт
+    фантомные различия на приводимых типах). Решения сверх буквального §4.1 вынесены заказчику:
+    семь мест перечислены в `docs/HANDOFF.md §4`, обзор среза — `§1.21`.
+  - Остаток (второй срез): `deploy/postgres/roles.sql` + `test_audit_append_only_role` — по
+    `AC-identity-04` роль приложения не имеет на `audit_log` ни `UPDATE`, ни `DELETE`
+    (триггер-«запретить правку» не делается намеренно: критерий требует **найти** изменённую
+    вручную копию дампа по цепочке хэшей). Затем `pull` + `run --rm migrate` на площадке и
+    протокол приёмки в `docs/acceptance/`.
 - [ ] **T-010** Параметры рабочей ВМ (`153.51.172.30`): лимиты Postgres под 3.8 ГиБ, swap, ретенция-конфиг, алерты диска — раньше задача формулировалась как «инфраструктура test-стенда (`192.168.1.40`)»
   - Приёмка: TZ §14.2 (все ограничения применены), замеры задокументированы
   - Проверка: `nproc/free -h/df -h` → протокол, или целиком `python3 scripts/prod_bootstrap_check.py`;
