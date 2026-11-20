@@ -347,7 +347,13 @@ jobs:
           test "$(stat -c %s "$tmp/ghcr_token")" -eq 40
           test "$(stat -c %s "$tmp/telegram_token")" -eq 45
           test "$(stat -c %a "$tmp/ghcr_token")" -eq 600
-          test "$(stat -c %U:%G "$tmp/db_url")" = root:root
+          test "$(stat -c %u:%g "$tmp/ghcr_token")" = 0:0
+          # ADR-005: файл, который compose монтирует в контейнер, читает процесс под uid/gid
+          # 10001 (deploy/Dockerfile: USER 10001:10001), а bind-маунт приносит хозяйские права с
+          # хоста. Поэтому монтируемые файлы — 640 и gid контейнера; 600 root:root даёт
+          # PermissionError уже на migrate (замер на площадке 2026-11-20).
+          test "$(stat -c %a "$tmp/db_url")" -eq 640
+          test "$(stat -c %u:%g "$tmp/db_url")" = 0:10001
 
           # (c) db_url обязан быть собран из того же пароля, что лежит в db_password: рассинхон
           # этой пары и есть причина падения migrate на площадке. Значения не печатаются — только
@@ -378,6 +384,30 @@ jobs:
             exit 1
           fi
           grep -q 'ghcr_token: 40 байт, 644' "$tmp/chk2"
+          # (е) ADR-005: 600 у монтируемого секрета — тоже ошибка прав: процесс в образе работает
+          # под uid/gid 10001, bind-маунт сохраняет хозяйские права. На площадке это выглядело как
+          # migrate_exit=1 с PermissionError: '/run/secrets/db_url'.
+          chmod 600 "$tmp/db_url"
+          if TBOT_SECRETS_SETUP_DIR="$tmp" bash "$script" --check >"$tmp/chk3" 2>&1; then
+            echo "FAIL: --check не заметил режим 600 у монтируемого секрета db_url" >&2
+            exit 1
+          fi
+          grep -q 'db_url: [^\n]*600[^\n]*нужно 640' "$tmp/chk3"
+
+          # (ё) --remed: права приводятся без касания значений. На площадке пароль базы уже осел в
+          # томе pgdata при initdb, а внешние токены нельзя переливать повторно (ADR-004: такое
+          # значение считается скомпрометированным). Поэтому сверяются контрольные суммы.
+          before=$(cd "$tmp" && md5sum db_password db_url ghcr_token telegram_token | md5sum)
+          TBOT_SECRETS_SETUP_DIR="$tmp" bash "$script" --remed >"$tmp/rem" 2>&1
+          grep -q 'приведено файлов: 2' "$tmp/rem"
+          after=$(cd "$tmp" && md5sum db_password db_url ghcr_token telegram_token | md5sum)
+          if [ "$before" != "$after" ]; then
+            echo "FAIL: --remed изменил содержимое файлов — права приводятся без перезаписи" >&2
+            exit 1
+          fi
+          TBOT_SECRETS_SETUP_DIR="$tmp" bash "$script" --check >"$tmp/chk4" 2>&1 || true
+          test "$(grep -c '^OK:' "$tmp/chk4")" -eq 4
+
           EOS
 
       - name: 'docker compose config: боевой overlay'

@@ -87,6 +87,12 @@ IdentitiesOnly=yes -i /root/.ssh/tbot_deploy_key" pull --ff-only` — замер
 по `ghcr_token`, код 1; `prod_bootstrap_check.py` → `ГОТОВО` (диск 71.03 ГиБ, свободно
 63.66 ГиБ). CI на `4f837b0` — 9 job'ов `success` (run 44760258594), включая `gitleaks`.
 
+**Актуальный `sha256sum` скрипта ввода (2026-11-20, ADR-005):**
+`ee9c4b208380a67b2c89b43a5397aa5712ba4f3a075f6423e3b8fc8b8359b610` — в скрипте появились политика
+прав (`CONTAINER_GID`, `apply_policy`) и режим `--remed`. Прежние значения (`b8266865…9191f` и
+`5499b18679…fe7f35`) остаются в тексте как история: сверять надо актуальное, и для этого клон
+обязан быть подтянут (`git pull` с явным deploy-ключом, выше).
+
 Проверка, что клон соответствует ожидаемому commit: хеш из `git log --oneline -1` обязан совпадать
 с commit, из которого собраны digest'ы в `deploy/tbot.prod.env` (иначе на площадку поедет чужой
 конфиг при своих образах). Разрешённое исключение замерено 2026-11-20 14:21 UTC: набор собран из
@@ -170,6 +176,16 @@ sudo docker images --digests | grep -E 'tbot|postgres|caddy'
 образов нужны одновременно: откат по digest, `ADR-002`).
 
 ## 5. Миграция, затем запуск первого среза
+
+**До первой команды раздела — привести права файлов секретов (ADR-005).** Если каталог создан до
+2026-11-20, все файлы лежат в `600 root:root`, и процесс контейнера под `uid/gid 10001` свои секреты
+не прочитает: первый `run --rm migrate` даёт `PermissionError: [Errno 13] Permission denied:
+'/run/secrets/db_url'` при полностью зелёном `--check`. Приводка прав ничего не меняет в значениях:
+
+```bash
+sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --remed
+sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --check
+```
 
 ```bash
 cd /opt/tbot
@@ -287,4 +303,17 @@ Windows пропускаются (прогон `44746558946`, разбор — `
 `docs/runbook/secrets-on-host.md §3` делает то же самое на чистом bash. `deploy-check`
 (`make deploy-check`, в CI — шаг с `python scripts/deploy_check.py --json`) остаётся машиной
 разработчика и CI: ему нужны зависимости приложения, которых на площадке нет.
+
+## 9. Секрет примонтирован, но не читается: `600 root:root` + `USER 10001` (ADR-005)
+
+Симптом: `migrate` падает с `PermissionError: [Errno 13] Permission denied: '/run/secrets/db_url'`,
+при этом `--check` зелёный, состав разобран без замечаний, а файл секрета на месте. Разбор и
+замеры — `docs/adr/ADR-005-secret-file-modes-for-container-readability.md`; коротко: bind-маунт
+приносит хозяйские права, процесс в образе non-root (`USER 10001:10001`), а compose 2.40.3 не
+принимает `uid`/`gid`/`mode` у file-секретов. Лечение на площадке — `secrets-setup.sh --remed`
+(права: `640` + группа с `gid 10001` для монтируемых файлов, `600 root:root` для `ghcr_token`).
+Попытка «просто сделать 644» запрещена политикой: файл секретов не обязан читаться локальными
+пользователями. Проверка, что `CONTAINER_GID` в скрипте и числовая `USER` в `deploy/Dockerfile`
+совпадают, закреплена контрактом `test_права_монтируемых_секретов_совпадают_с_gid_процесса_в_образе`;
+факт чтения изнутри контейнера в CI проверяется задачей T-715.
 

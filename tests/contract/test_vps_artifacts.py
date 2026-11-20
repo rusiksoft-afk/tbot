@@ -12,7 +12,7 @@ import json
 import re
 from typing import Any, cast
 
-from tests.paths import COMPOSE_PROD, ROOT, VPS, load_compose_yaml
+from tests.paths import COMPOSE_PROD, DOCKERFILE, ROOT, VPS, load_compose_yaml
 
 RULES = VPS / "ufw.rules"
 FIREWALL = VPS / "firewall.sh"
@@ -310,8 +310,16 @@ def test_скрипт_пишет_файлы_с_правами_из_тз() -> Non
     запись = _bash_func("write_file")
     assert "umask 077" in код
     assert 'install -d -m 700 -o root -g root "$SECRETS_DIR"' in код
-    assert 'chmod 600 "$path"' in запись
-    assert 'chown root:root "$path"' in запись
+    политика = _bash_func("apply_policy")
+    assert 'apply_policy "$name" "$path"' in запись, (
+        "write_file обязан ставить права по имени файла: 600 root:root у секрета, который compose "
+        "монтирует в контейнер, означает недоступный секрет для процесса под uid/gid 10001 "
+        "(ADR-005)"
+    )
+    assert 'chmod 640 "$path"' in политика, "монтируемым секретам не выдаётся режим по группе"
+    assert 'chown "0:$CONTAINER_GID" "$path"' in политика, "монтируемым секретам не ставится gid"
+    assert 'chmod 600 "$path"' in политика, "файлу хозяйственного инструмента обязан остаться 600"
+    assert 'chown root:root "$path"' in политика, "файл хозяйственного инструмента теряет 0:0"
     assert (
         """printf '%s' "$val" >"$path\"""" in запись
     ), "значение обязано писаться через printf без завершающего перевода строки"
@@ -323,6 +331,69 @@ def test_скрипт_пишет_файлы_с_правами_из_тз() -> Non
         "скрипт обязан требовать root: иначе владелец файла — пользователь, и compose не сможет "
         "прочитать секрет"
     )
+
+
+def test_права_монтируемых_секретов_совпадают_с_gid_процесса_в_образе() -> None:
+    """ADR-005: режим и владелец файла секрета обязан подходить процессу внутри контейнера.
+
+    Замер на площадке 2026-11-20: `run --rm migrate` упал с `PermissionError: [Errno 13] Permission
+    denied: '/run/secrets/db_url'` (migrate_exit=1). Причина не в площадке, а в сочетании требований:
+    bind-маунт секрета сохраняет владельца и режим с хоста, процесс в образе работает под
+    uid/gid 10001 (`deploy/Dockerfile`: `USER 10001:10001`), а compose 2.40.3 отказывается принимать
+    `uid`/`gid`/`mode` у file-секретов (`secrets.db_url additional properties 'uid', 'gid', 'mode'
+    not allowed`). Значит единственный рычаг — права на хосте, и они обязаны совпадать с gid
+    процесса: 640 и группа с gid 10001. Замеры хоста того же дня: учётной записи с uid или gid
+    10001 на хосте нет, поэтому «мир» и локальные пользователи по-прежнему ничего не читают.
+    """
+    код = _setup_code()
+    m = re.search(r"CONTAINER_GID=(\d+)", код)
+    assert m, "в скрипте нет CONTAINER_GID: политика прав не выражена явным числом"
+    gid = m.group(1)
+    образ = re.search(r"(?m)^USER (\d+):(\d+)$", DOCKERFILE.read_text(encoding="utf-8"))
+    assert образ, "в deploy/Dockerfile нет числовой USER: gid процесса нечем сверить"
+    assert (образ.group(1), образ.group(2)) == (gid, gid), (
+        f"gid процесса в образе {образ.group(1)}:{образ.group(2)} не совпадает с CONTAINER_GID={gid}: "
+        "монтируемые секреты окажутся нечитаемыми"
+    )
+
+    состав = load_compose_yaml(COMPOSE_PROD)["secrets"]
+    монтируемые = {
+        str(spec["file"]).rsplit("/", 1)[-1]
+        for spec in состав.values()
+        if isinstance(spec, dict) and spec.get("file")
+    }
+    m_mount = re.search(r"MOUNTED_NAMES=\(([^)]*)\)", код)
+    assert m_mount, "в скрипте нет MOUNTED_NAMES: список «файл монтируется в контейнер» потерян"
+    assert set(m_mount.group(1).split()) == монтируемые, (
+        f"политика прав разошлась с составом: в контейнеры монтируются {sorted(монтируемые)}, "
+        f"а по группе доступ настроен для {sorted(m_mount.group(1).split())}"
+    )
+    m_host = re.search(r"HOST_READ_ONLY_NAMES=\(([^)]*)\)", код)
+    assert m_host, "в скрипте нет HOST_READ_ONLY_NAMES: не описано, какой файл читает только хост"
+    assert set(m_host.group(1).split()) == set(SETUP_NAMES) - монтируемые, (
+        "файл, который читает только хозяйственный инструмент, обязан быть ровно "
+        "«имена скрипта минус монтируемые»: иначе 600 получит читаемый контейнером файл"
+    )
+
+
+def test_remed_приводит_права_не_касаясь_значений() -> None:
+    """Переход площадки на ADR-005 возможен только без перезаписи значений.
+
+    Пароль базы при initdb оседает в томе `pgdata`: перегенерация означала бы новый том и потерю
+    данных, а внешние токены (ADR-004) при повторном вводе считаются скомпрометированными. Поэтому
+    режим и владелец приводятся отдельной операцией, которая читает метаданные и ничего не пишет в
+    содержимое файлов.
+    """
+    текст = _setup_text()
+    assert "--remed) REMEDIATE_ONLY=1 ;;" in текст, "у скрипта нет режима приведения прав"
+    тело = _bash_func("remediate")
+    assert "apply_policy" in тело, "`--remed` не вызывает политику прав"
+    assert "stat -c '%a'" in тело, "`--remed` не сверяет текущий режим: он чинит только отклонения"
+    assert "stat -c '%u:%g'" in тело, "`--remed` не сверяет текущий gid: он чинит только отклонения"
+    for запрещено in ('>"$path"', """printf '%s' "$""", "read -", "$(<"):
+        assert (
+            запрещено not in тело
+        ), f"`--remed` трогает содержимое файла ({запрещено!r}): значения перезаписывать нельзя"
 
 
 def test_имена_секретов_совпадают_с_боевым_составом() -> None:
@@ -556,8 +627,17 @@ def test_режим_check_не_трогает_файлы_и_не_печатае�
     assert (
         'if [ "$size" -eq 0 ]; then' in диагностика
     ), "пустой файл состава не отличается от рабочего: 0 байт — это тоже «секрет на месте»"
-    assert 'if [ "$mode" != "600" ]' in диагностика, "`--check` не сверяет режим с TZ §14.3"
-    assert '!= "root:root"' in диагностика, "`--check` не сверяет владельца с TZ §14.3"
+    assert 'if [ "$mode" != "$(expected_mode "$name")" ]' in диагностика, (
+        "`--check` не сверяет режим с политикой ADR-005: у монтируемых в контейнер файлов нужен "
+        "640, у файла хозяйственного инструмента — 600"
+    )
+    assert (
+        '"$(expected_owner "$name")"' in диагностика
+    ), "`--check` не сверяет владельца с политикой ADR-005 (gid контейнера)"
+    assert "stat -c '%u:%g'" in диагностика, (
+        "`--check` сверяет владельца по имени группы: на хосте у gid контейнера имени может не "
+        "быть, и проверка начнёт сравнивать NULL с NULL"
+    )
     for запись_файла in ("chmod ", "chown ", "install -d ", "read -", """printf '%s' "$"""):
         assert запись_файла not in диагностика, (
             f"`--check` что-то меняет или читает из терминала ({запись_файла!r}): "

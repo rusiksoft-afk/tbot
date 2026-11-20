@@ -11,11 +11,14 @@
 #   sudo bash deploy/vps/secrets-setup.sh                 # ввод
 #   sudo bash deploy/vps/secrets-setup.sh --check         # только диагностика
 #   sudo bash deploy/vps/secrets-setup.sh --only ghcr_token telegram_token   # перезалить одно
+#   sudo bash deploy/vps/secrets-setup.sh --remed                # только права, значения не тронуты
 #
 # Что гарантирует скрипт:
 #   - значения читаются скрыто (`IFS= read -r -s`) и не попадают в argv, stdout, stderr или
 #     историю оболочки (`set +o history`);
-#   - файл получает режим 600 и владельца root:root, каталог — 700 (TZ §8.3, §14.3);
+#   - права ставит скрипт, а не оператор: каталог 700 root:root; файлы, которые compose монтирует
+#     в контейнер, получают 640 root:gid10001 (ADR-005); файлу, который читает только
+#     хозяйственный инструмент под root, достаточно 600 root:root (TZ §8.3, §14.3);
 #   - в файле нет завершающего перевода строки (`printf '%s'`): DSN и токен читаются «как есть»,
 #     лишний `\n` в DSN ломает подключение к базе уже на `migrate`;
 #   - значение проверяется по форме ДО записи. Наличие файла и режим 600 о значении не говорят
@@ -56,12 +59,77 @@ SECRET_NAMES=(db_password db_url ghcr_token telegram_token)
 # Файлы, которые состав обязано потребовать, но создаёт не этот скрипт.
 HOST_ONLY_NAMES=(telegram_socks_pass)
 
+# ───────────────────────── политика прав (ADR-005) ─────────────────────────
+# bind-маунт секрета сохраняет владельца и режим с хоста, а процессы состава работают под
+# uid/gid 10001 (deploy/Dockerfile: USER 10001:10001). compose 2.40.3 не принимает uid/gid/mode
+# для file-секретов (замер на площадке 2026-11-20: secrets.db_url additional properties 'uid',
+# 'gid', 'mode' not allowed), поэтому 600 root:root у монтируемого файла означает, что процесс
+# не может прочитать свой секрет (замер того же дня: PermissionError: [Errno 13] Permission
+# denied: '/run/secrets/db_url', migrate_exit=1). Значит монтируемые файлы получают 640 и группу
+# с gid 10001; на хосте такой учётной записи нет (замеры: getent group 10001 и getent passwd 10001
+# пусты), то есть доступ остаётся у root и у gid контейнера, а «мир» не видит ничего.
+CONTAINER_GID=10001
+# Файл, который читает только хозяйственный инструмент под root (docker login --password-stdin).
+HOST_READ_ONLY_NAMES=(ghcr_token)
+# Прочие файлы состава монтируются в контейнеры — им нужен режим по группе.
+MOUNTED_NAMES=(db_password db_url telegram_token telegram_socks_pass)
+
+is_host_read_only() {
+    local n
+    for n in "${HOST_READ_ONLY_NAMES[@]}"; do
+        [ "$n" = "$1" ] && return 0
+    done
+    return 1
+}
+
+expected_mode() {
+    if is_host_read_only "$1"; then printf '600'; else printf '640'; fi
+}
+
+expected_owner() {
+    if is_host_read_only "$1"; then printf '0:0'; else printf '0:%s' "$CONTAINER_GID"; fi
+}
+
+policy_hint() {
+    if is_host_read_only "$1"; then
+        printf 'файл читает только хозяйственный инструмент под root'
+    else
+        printf 'файл монтируется в контейнер под uid/gid %s (ADR-005)' "$CONTAINER_GID"
+    fi
+}
+
+ensure_container_group() {
+    # Имя группы нужно только для читаемого ls; ядру достаточно числового gid. Если gid занят в
+    # системе — не создаём ничего и работаем числами.
+    if getent group "$CONTAINER_GID" >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v groupadd >/dev/null 2>&1; then
+        groupadd -r -g "$CONTAINER_GID" tbot >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+apply_policy() {
+    local name="$1" path="$2"
+    if is_host_read_only "$name"; then
+        chown root:root "$path"
+        chmod 600 "$path"
+    else
+        ensure_container_group
+        chown "0:$CONTAINER_GID" "$path"
+        chmod 640 "$path"
+    fi
+}
+
 CHECK_ONLY=0
+REMEDIATE_ONLY=0
 FORCE=0
 ONLY=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --check) CHECK_ONLY=1 ;;
+        --remed) REMEDIATE_ONLY=1 ;;
         --force) FORCE=1 ;;
         --only)
             shift
@@ -77,7 +145,7 @@ while [ $# -gt 0 ]; do
             ;;
         --only=*) ONLY=",${1#--only=}," ;;
         --help | -h)
-            sed -n '1,32p' "$0"
+            sed -n '1,48p' "$0"
             exit 0
             ;;
         *)
@@ -137,7 +205,7 @@ shape_ok() {
 check_mode() {
     # --check ничего не записывает: читает метаданные и форму значения, печатает имя, размер,
     # режим, владельца и вердикт формы. Значение в переменную кладёт в локальную и не выводит.
-    local name path size mode owner probe failed=0
+    local name path size mode owner ogid probe failed=0
     for name in "${SECRET_NAMES[@]}" "${HOST_ONLY_NAMES[@]}"; do
         path="$SECRETS_DIR/$name"
         if [ ! -f "$path" ]; then
@@ -162,8 +230,11 @@ check_mode() {
             continue
         fi
         probe=""
-        if [ "$mode" != "600" ] || [ "$owner" != "root:root" ]; then
-            printf 'FAIL: %s: %s байт, %s, %s (нужно 600 root:root)\n' "$name" "$size" "$mode" "$owner" >&2
+        ogid=$(stat -c '%u:%g' "$path")
+        if [ "$mode" != "$(expected_mode "$name")" ] || [ "$ogid" != "$(expected_owner "$name")" ]; then
+            printf 'FAIL: %s: %s байт, %s, %s (нужно %s %s: %s)\n' \
+                "$name" "$size" "$mode" "$owner" "$(expected_mode "$name")" \
+                "$(expected_owner "$name")" "$(policy_hint "$name")" >&2
             failed=1
             continue
         fi
@@ -181,8 +252,43 @@ check_mode() {
     return "$failed"
 }
 
+# ──────────────── диагностика: --remed (права без касания значений) ────────────────
+remediate() {
+    # Меняет только владельца и режим. Значения не читаются, не печатаются и не переписываются:
+    # площадка переходит на политику ADR-005 без перегенерации пароля базы (он уже осел в томе
+    # pgdata при initdb) и без повторного ввода внешних токенов.
+    local name path fixed=0
+    ensure_container_group
+    for name in "${SECRET_NAMES[@]}" "${HOST_ONLY_NAMES[@]}"; do
+        path="$SECRETS_DIR/$name"
+        if [ ! -f "$path" ]; then
+            printf 'WARN: нет файла: %s — привести нечего\n' "$path" >&2
+            continue
+        fi
+        if [ "$(stat -c '%a' "$path")" = "$(expected_mode "$name")" ] &&
+            [ "$(stat -c '%u:%g' "$path")" = "$(expected_owner "$name")" ]; then
+            printf 'OK:   %s: %s, %s — уже по политике\n' "$name" \
+                "$(stat -c '%a' "$path")" "$(stat -c '%U:%G' "$path")"
+            continue
+        fi
+        printf 'FIX:  %s: было %s %s -> %s %s\n' "$name" "$(stat -c '%a' "$path")" \
+            "$(stat -c '%U:%G' "$path")" "$(expected_mode "$name")" "$(expected_owner "$name")"
+        apply_policy "$name" "$path"
+        fixed=$((fixed + 1))
+    done
+    printf 'приведено файлов: %s (значения не изменялись)\n' "$fixed"
+    return 0
+}
+
 if [ "$CHECK_ONLY" -eq 1 ]; then
     check_mode
+    exit $?
+fi
+
+if [ "$REMEDIATE_ONLY" -eq 1 ]; then
+    remediate
+    printf '\nпроверка готовности:\n'
+    printf '  sudo bash %s --check\n' "$0"
     exit $?
 fi
 
@@ -219,8 +325,7 @@ write_file() {
         esac
     fi
     printf '%s' "$val" >"$path"
-    chmod 600 "$path"
-    chown root:root "$path"
+    apply_policy "$name" "$path"
     printf '  %s: записано (%s байт)\n' "$name" "$(stat -c '%s' "$path")"
     return 0
 }
