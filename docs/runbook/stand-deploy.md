@@ -66,7 +66,7 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINLDO6mbx5f5R1gtTC3wqbVygUWDXHuUpMnRbKGe7MpX
 (`sha256:89005d59c960c1733b3b5dc14512bef6927443414552d30f4c98791013e3370b`), так что секреты
 можно завести до клона.
 
-**Замер 2026-11-20 17:35:** клон подтянут до `f67ab76` (`sudo git -C /opt/tbot pull --ff-only`,
+**Замер 2026-11-20 14:23 UTC:** клон подтянут до `f67ab76` (`sudo git -C /opt/tbot pull --ff-only`,
 дерево чистое). Грабля, из-за которой первая попытка выглядела как «репозиторий сломан»:
 `/opt/tbot` — 750 `root:root`, и под `rusiksoft` в него нельзя войти: `cd /opt/tbot` →
 `Permission denied`, а следом `git` отвечает `not a git repository`. Правильный порядок для
@@ -77,7 +77,7 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINLDO6mbx5f5R1gtTC3wqbVygUWDXHuUpMnRbKGe7MpX
 
 Проверка, что клон соответствует ожидаемому commit: хеш из `git log --oneline -1` обязан совпадать
 с commit, из которого собраны digest'ы в `deploy/tbot.prod.env` (иначе на площадку поедет чужой
-конфиг при своих образах). Разрешённое исключение замерено 2026-11-20 17:35: набор собран из
+конфиг при своих образах). Разрешённое исключение замерено 2026-11-20 14:21 UTC: набор собран из
 `1ce4be6`, клон — `f67ab76`, а `git diff --name-only 1ce4be6..f67ab76` даёт только `.github`,
 `deploy/tbot.prod.env`, `deploy/vps/secrets-setup.sh`, `scripts/deploy_check.py`, тесты и
 документы — ни одного пути из перечня ниже, значит образы собирались из того же кода.
@@ -123,7 +123,7 @@ sudo docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml \
 нельзя: она старше репозитория и принимает значения любой формы (замер sha256
 `89005d59…3370b` против `b8266865…9191f` в репозитории).
 
-**Переснято 2026-11-20 17:35 на HEAD `f67ab76`** (compose тот же — 2.40.3): `config --quiet` →
+**Переснято 2026-11-20 14:22 UTC на HEAD `f67ab76`** (compose тот же — 2.40.3): `config --quiet` →
 exit 0, `config --format json | python3 scripts/prod_compose_check.py` → 13/13 `OK`,
 «ГОТОВО: боевой состав разобран без замечаний». Там же ещё раз подтверждён пункт 1 готовности:
 `sudo python3 /opt/tbot/scripts/prod_bootstrap_check.py` → `ГОТОВО`, exit 0, `clock_offset`
@@ -184,6 +184,16 @@ $COMPOSE ps
 Первый выпуск сертификата — отдельная точка риска: у Let's Encrypt лимит 5 выпусков на домен в
 неделю, а сертификат живёт в томе `caddy_data`. Прежде чем удалять том, см. `ADR-002` и
 `docs/acceptance/tls-edge.md`.
+
+**Контур первого среза — `sandbox`** (замер на площадке 2026-11-20 14:29 UTC, compose 2.40.3 с
+`--env-file deploy/tbot.prod.env`): разобранный состав подставляет всем процессам
+`TBOT_CONTOUR: sandbox` и `TBOT_CONFIRM_PRODUCTION: "false"`, потому что в
+`deploy/tbot.prod.env` этих переменных нет, а `deploy/compose.prod.yaml` задаёт их как
+`${TBOT_CONTOUR:-sandbox}` и `${TBOT_CONFIRM_PRODUCTION:-false}`. Следствия: (1) требование
+TZ §14.7 шаг 3 — бэкапы и WAL-архив (T-702) до первого **боевого** запуска — этот срез не
+блокирует, но и торговать он не будет: это панель, база и прокси; (2) включение `paper` или
+`production` — отдельный шаг с явным `TBOT_CONTOUR` в env-файле, а для `production` ещё
+`TBOT_CONFIRM_PRODUCTION=true` и закрытая T-702, иначе `check_contour` в образе не пропустит старт.
 
 `engine`, `jobs` и `tgbot` в этот срез не входят: контуры `paper`/`production` включаются отдельно
 (`TBOT_CONTOUR`, `TBOT_CONFIRM_PRODUCTION`), торговля — только после приёмки периметра (§14 TZ).
