@@ -214,6 +214,14 @@
    нечего. Пишется вместе с `deploy/compose.prod.yaml` (единственный публикуемый наружу порт —
    80/443 Caddy; база не публикуется никогда) и `deploy/tbot.prod.env` с дайджестами образов.
    Повторить после этого пробы 80/443 (критерий T-708 «коннект устанавливается» со слушателем).
+   Черновик этих трёх файлов закоммичен в `b83aa16`, но **приёмка T-713/T-712 не пройдена**: ни `caddy validate`,
+   ни `docker compose -f compose.yaml -f compose.prod.yaml --env-file tbot.prod.env config` не запускались
+   (Docker на dev-машине нет), job'а с разбором прод-overlay в CI нет и тестов, знающих про
+   `deploy/compose.prod.yaml`, в дереве тоже нет — то есть боевой состав сейчас не проверяется ничем.
+   Первый шаг в этой ветке — контракт/CI-разбор overlay (наружу только 80/443, у прикладных сервисов
+   `build: !reset null`, секреты только `/etc/tbot/secrets`, лимиты памяти по OQ-11), потом пробы на хосте.
+   Дайджесты в `tbot.prod.env` сняты с commit `4fa1b51`; после любого нового зелёного `Image` их надо
+   переснять одним коммитом (`docs/runbook/ghcr-pull.md §2`), иначе «pull по digest» проверяет не тот релиз.
 2. `T-712` остаток — read-only токен GHCR как файл-секрет (`docs/runbook/ghcr-pull.md §3`) →
    `docker login --password-stdin` → `docker pull …@sha256:…` → конвейер
    `pull → migrate → restart` и учебный откат на предыдущий digest (TZ §12.7).
