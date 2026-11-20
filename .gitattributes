@@ -34,3 +34,8 @@ deploy/vps/*.local text eol=lf
 # Защита от случайного коммита ключей и секретов (двойная страховка к .gitignore).
 *.pem binary
 *.key binary
+
+# Файлы боевого запуска: их читает docker compose и Caddy на Linux. CRLF в env-file
+# ломает значение тихо — CR попадает в digest, и pull требует несуществующий образ.
+deploy/caddy/Caddyfile text eol=lf
+deploy/*.env text eol=lf

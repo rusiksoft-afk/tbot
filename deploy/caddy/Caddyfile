@@ -1,0 +1,75 @@
+# Caddyfile боевого контура (T-713; TZ §8.3, §14.6).
+#
+# Кладётся в контейнер read-only (deploy/compose.prod.yaml). Сертификат Caddy получает сам
+# через ACME: 80 и 443 должны быть доступны снаружи (SG Yandex Cloud + ufw — T-708), а DNS
+# `tbot.rusiksoft.ru` — указывать на 153.51.172.30 (OQ-2, проверено).
+#
+# Проверка конфигурации без запуска:
+#   docker run --rm -v "$PWD/deploy/caddy/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2 \
+#     caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+
+tbot.rusiksoft.ru {
+	# ACME-почта не указана: Let's Encrypt не требует её обязательно, но без письма
+	# предупреждение о скором истечении сертификата придёт только в логи Caddy.
+	# Когда заказчик определит ящик — раскомментировать.
+	# email ops@rusiksoft.ru
+
+	protocols tls1.2 tls1.3
+
+	# 443 отдаём наружу, HTTP оставляет для редиректа и ACME-вызовов: Caddy сам строит
+	# редирект :80 -> :443, отдельный сайт-блок не нужен.
+
+	header {
+		# TZ §8.3: HSTS с max-age 2 года и includeSubDomains. Указан большой срок —
+		# это обещание, а не настройка «на пробу»: после первого визита браузер больше
+		# никогда не придёт на http по этому домену и его поддоменам.
+		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+
+		# TZ §8.3: CSP фиксированный, без 'unsafe-inline' и без внешних источников.
+		Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'; frame-src 'none'; object-src 'none'"
+
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		# Разрешаем только геолокацию и камеру-микротон запрещаем: панель их не использует.
+		Permissions-Policy "geolocation=(), camera=(), microphone=(), payment=()"
+
+		# Панель приватная, кэш на прокси не нужен; сертификаты и HTML не должны осесть
+		# в общем кэше браузера после выхода из кабинета.
+		Cache-Control "no-store"
+		-Server
+	}
+
+	# Ограничение на размер тела запроса: форма импорта сделок и API не должны
+	# позволить выложить в панель большой файл через request body.
+	request_body 10485760
+
+	# Методы, которые нигде не используются легитимно: TRACE/TRACK — классический вектор
+	# XST/`Max-forwards`-разведки. DELETE не блокируем: он появится в API панели позже (M1+),
+	# и запрет на прокси сломал бы приложение молча.
+	route {
+		@forbidden method TRACE TRACK
+		handle @forbidden {
+			respond 405
+		}
+
+		handle {
+			reverse_proxy web:8080 {
+				# web слушает внутри сети tbot-public; наружу у него порта нет
+				# (deploy/compose.prod.yaml: публикуется только 80/443 Caddy).
+				header_up X-Forwarded-Proto {scheme}
+				header_up X-Real-IP {remote_host}
+			}
+		}
+	}
+
+	# Логи доступа в stdout контейнера (json-file с ротацией задаёт daemon.json),
+	# уровень ERROR — чтобы доступ к панели не раздувал логи (TZ §14.6).
+	log {
+		output stderr
+		format json
+	}
+
+	# Файл блокировки ACME не переиспользуется между запусками: каталог /data смонтирован
+	# именованным volumes, то есть сертификат и ACME-аккаунт переживают `up -d`.
+}
