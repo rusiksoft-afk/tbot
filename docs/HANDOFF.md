@@ -534,7 +534,14 @@
   Подставить локальный `gh`-токен нельзя: scopes — `gist, read:org, repo, workflow`,
   `read:packages` нет (`gh api -i /user`), а анонимный обмен
   `ghcr.io/token?scope=repository:rusiksoft-afk/tbot-web:pull` отвечает `401` — пакеты приватные.
-- **Открытый риск после этого шага:** `telegram_token` уже засвечен в рабочих чатах и локальной
+- Площадка синхронизирована (замер 15:10 UTC): клон `/opt/tbot` подтянут до `4f837b0`, sha256
+  скрипта на ВМ совпал с репозиторной версией (`5499b186…f7f35`), `--check` на новой версии —
+  те же четыре `OK` и `FAIL` по `ghcr_token`, `prod_bootstrap_check.py` → `ГОТОВО`.
+  Грабля для следующих сессий: `sudo git -C /opt/tbot pull` без ключа даёт
+  `Permission denied (publickey)` — в `/root/.ssh` нет `config`, поэтому обязателен
+  `-c core.sshCommand="ssh -o IdentitiesOnly=yes -i /root/.ssh/tbot_deploy_key"` (в ранбуке
+  это записано в §2 для клона, но не для `pull`).
+- Открытый риск после этого шага: `telegram_token` уже засвечен в рабочих чатах и локальной
   истории → подлежит ротации в `@BotFather` (`--force --only telegram_token`,
   `docs/runbook/telegram-token.md`). До ротации бот доступен тому, у кого есть копия переписки.
 

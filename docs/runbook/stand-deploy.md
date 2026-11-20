@@ -67,15 +67,25 @@ ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINLDO6mbx5f5R1gtTC3wqbVygUWDXHuUpMnRbKGe7MpX
 можно завести до клона.
 
 **Замер 2026-11-20 14:23 UTC:** клон подтянут до `f67ab76` (`sudo git -C /opt/tbot pull --ff-only`,
-дерево чистое). Грабля, из-за которой первая попытка выглядела как «репозиторий сломан»:
+дерево чистое; команда в скобках неполная — `pull` требует явного ключа, см. абзац ниже). Грабля, из-за которой первая попытка выглядела как «репозиторий сломан»:
 `/opt/tbot` — 750 `root:root`, и под `rusiksoft` в него нельзя войти: `cd /opt/tbot` →
 `Permission denied`, а следом `git` отвечает `not a git repository`. Правильный порядок для
 не-root-сессии: `sudo git -C /opt/tbot …` и абсолютные пути ко всем файлам (`sudo bash
-/opt/tbot/deploy/vps/secrets-setup.sh`, `sudo python3 /opt/tbot/scripts/…`).
+/opt/tbot/deploy/vps/secrets-setup.sh`, `sudo python3 /opt/tbot/scripts/…`). Git-операции на ВМ требуют того же ключа, что и клон: `sudo git -C /opt/tbot -c core.sshCommand="ssh -o
+IdentitiesOnly=yes -i /root/.ssh/tbot_deploy_key" pull --ff-only` — замер 2026-11-20 15:10 UTC:
+без `-c core.sshCommand` `pull` отвечает `git@github.com: Permission denied (publickey)`,
+потому что в `/root/.ssh` нет `config` и ключ по умолчанию не предлагается.
 `sha256sum` скрипта ввода на ВМ — `b8266865bcb5f0672224c8a4589af114f767cfa1b6afcd9b95457bed52f9191f`,
 совпадает с репозиторной версией. После правки заголовка скрипта по ADR-004 (2026-11-20, только
 комментарии) репозиторная версия — `5499b18679ea466aab06f23322beb17bb30dff8cff44dfcfa57adb04f7fe7f35`:
-перед сверкой нужен `sudo git -C /opt/tbot pull --ff-only`.
+перед сверкой нужен `sudo git -C /opt/tbot -c core.sshCommand="ssh -o IdentitiesOnly=yes -i
+/root/.ssh/tbot_deploy_key" pull --ff-only`.
+**Замер 2026-11-20 15:10 UTC:** клон подтянут до `4f837b0`; `sha256sum` скрипта на ВМ =
+`5499b18679ea466aab06f23322beb17bb30dff8cff44dfcfa57adb04f7fe7f35` — совпал с репозиторной
+версией после правки заголовка по ADR-004; `--check` уже на новой версии скрипта: четыре `OK`
+(`db_password` 48, `db_url` 93, `telegram_token` 46, `telegram_socks_pass` 24) и `FAIL`
+по `ghcr_token`, код 1; `prod_bootstrap_check.py` → `ГОТОВО` (диск 71.03 ГиБ, свободно
+63.66 ГиБ). CI на `4f837b0` — 9 job'ов `success` (run 44760258594), включая `gitleaks`.
 
 Проверка, что клон соответствует ожидаемому commit: хеш из `git log --oneline -1` обязан совпадать
 с commit, из которого собраны digest'ы в `deploy/tbot.prod.env` (иначе на площадку поедет чужой
