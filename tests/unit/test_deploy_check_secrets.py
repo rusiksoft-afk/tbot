@@ -100,17 +100,63 @@ def test_слоты_знают_обе_пары_имён() -> None:
         (sandbox.secrets_dir / name).name in DEV_SET for name in by_key["telegram_token"].names
     )
 
+    # Выбор имён по контуру — чистая логика без файловой системы. Проверяется здесь, а не в
+    # POSIX-ветках, потому что на dev-машине те пропускаются, а дефект выбора имени всплыл
+    # только в CI (раннер не root, файлы конфигурации закрыли собой «файла нет»).
+    assert deploy_check.slot_names(by_key["telegram_token"], prod) == ("telegram_token",)
+    assert deploy_check.slot_names(by_key["telegram_socks_pass"], prod) == ("telegram_socks_pass",)
+    assert deploy_check.slot_names(by_key["telegram_token"], sandbox) == (
+        "telegram_token",
+        "tg_bot_token",
+    )
+    assert deploy_check.slot_foreign_names(by_key["telegram_token"], prod) == ("tg_bot_token",)
+    assert deploy_check.slot_foreign_names(by_key["telegram_socks_pass"], prod) == (
+        "tg_socks_password",
+    )
+    assert deploy_check.slot_foreign_names(by_key["telegram_token"], sandbox) == ()
+    # Имена, которые различаются в двух парах, — только telegram_*: у db_* имена совпадают.
+    for key in ("db_password", "db_url"):
+        assert deploy_check.slot_names(by_key[key], prod) == by_key[key].names
+        assert deploy_check.slot_foreign_names(by_key[key], prod) == ()
+
 
 @POSIX_ONLY
 def test_боевой_контур_требует_хостовые_имена_а_не_имена_конфигурации(
-    secrets_dir: Path,
+    secrets_dir: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Имена лежат в каталоге площадки, а не внутри контейнера (`compose.prod.yaml`).
+
+    Владелец замазан намеренно: тест про имена. Без подмены на Linux-раннере (uid 1001)
+    первой претензией к `tg_bot_token` становился владелец, и проверка молчала о том, что
+    файлового имени не хватает вовсе — так этот тест и падал в прогоне 44746558946.
+    """
+    monkeypatch.setattr(deploy_check, "secret_ownership_ok", lambda _stat_result: True)
     _fill(secrets_dir, DEV_SET)
     result = deploy_check.check_secret_files(_settings(secrets_dir, Contour.PRODUCTION))
     assert not result.ok
     assert "telegram_token: файла нет" in result.detail
     assert "telegram_socks_pass: файла нет" in result.detail
     assert "ghcr_token: файла нет" in result.detail
+    assert result.severity == deploy_check.FATAL
+
+
+@POSIX_ONLY
+def test_лишнее_имя_контейнера_в_бою_называется_лишним_а_не_готовностью(
+    secrets_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """«Файла нет» и «есть файл с чужим именем» — разные претензии, и подсказка обязана это показывать.
+
+    Иначе вывод зовёт создать `tg_bot_token` в `/etc/tbot/secrets`, чего состав не прочитает
+    (`docs/runbook/stand-deploy.md §8`).
+    """
+    monkeypatch.setattr(deploy_check, "secret_ownership_ok", lambda _stat_result: True)
+    _fill(secrets_dir, DEV_SET)
+    result = deploy_check.check_secret_files(_settings(secrets_dir, Contour.PRODUCTION))
+    assert not result.ok
+    assert "tg_bot_token: файл с именем контейнера" in result.detail
+    assert "tg_socks_password: файл с именем контейнера" in result.detail
+    assert "telegram_token: файла нет (имя этого контура: telegram_token)" in result.detail
+    assert "telegram_token, tg_bot_token" not in result.detail
     assert result.severity == deploy_check.FATAL
 
 

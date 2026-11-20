@@ -367,8 +367,9 @@ def check_telegram_path(settings: Settings | None) -> CheckResult:
 # tg_socks_password}`, `packages.common.config.SECRET_FIELDS`), а на хосте площадки файлы названы
 # по `deploy/compose.prod.yaml` — `db_url`, `db_password`, `telegram_token`,
 # `telegram_socks_pass` и `ghcr_token` (последний нужен хосту для `docker login ghcr.io` и в
-# контейнеры не монтируется). Ниже — слоты: логический секрет, его возможные имена (в порядке
-# предпочтения) и обязан ли он существовать.
+# контейнеры не монтируется). Ниже — слоты: логический секрет, его имена (хостовое первым, имя
+# конфигурации вторым) и обязан ли он существовать. Какое из имён принимает конкретный контур —
+# решает `slot_names`, а не порядок в кортеже.
 @dataclass(frozen=True)
 class _SecretSlot:
     key: str
@@ -421,6 +422,34 @@ def slot_required(slot: _SecretSlot, settings: Settings) -> bool:
     return slot.required_in_production_only and settings.contour is Contour.PRODUCTION
 
 
+def slot_names(slot: _SecretSlot, settings: Settings) -> tuple[str, ...]:
+    """Имена файла, которые читает именно этот контур.
+
+    Боевой контур — это каталог площадки, а состав, который его запускает,
+    (`deploy/compose.prod.yaml`) монтирует `/etc/tbot/secrets/telegram_token` и
+    `…/telegram_socks_pass`. Имена `tg_bot_token` и `tg_socks_password` существуют только
+    **внутри** контейнера (`packages.common.config.SECRET_FIELDS`), и файл с таким именем в
+    каталоге площадки состав не прочитает. Принимать его за наличие слота — значит соврать
+    дважды: и про готовность, и про то, какой файл надо создать (замер 2026-11-20,
+    `docs/runbook/stand-deploy.md §8`).
+
+    Вне боя каталог секретов — `deploy/secrets/` dev-стенда, где штатные имена как раз из
+    конфигурации, поэтому там принимаются оба варианта.
+    """
+    return slot.names[:1] if settings.contour is Contour.PRODUCTION else slot.names
+
+
+def slot_foreign_names(slot: _SecretSlot, settings: Settings) -> tuple[str, ...]:
+    """Имена из другой пары, которые этот контур не читает, но которые могут лежать рядом.
+
+    Лишний файл с именем конфигурации в каталоге площадки — признак подмены пары имён: кто-то
+    уже пытался починить красный `secret_files` созданием лишнего секрета. Наружу это выводится
+    отдельной строкой, чтобы «файла нет» и «есть не тот файл» не путались.
+    """
+    admissible = set(slot_names(slot, settings))
+    return tuple(name for name in slot.names if name not in admissible)
+
+
 def check_secret_files(settings: Settings | None) -> CheckResult:
     """Наличие, права и владелец файлов секретов; содержимое не выводится (REQ-sec-04)."""
     if settings is None:
@@ -430,8 +459,9 @@ def check_secret_files(settings: Settings | None) -> CheckResult:
     problems: list[str] = []
     present: list[str] = []
     for slot in SECRET_SLOTS:
+        names = slot_names(slot, settings)
         found = False
-        for name in slot.names:
+        for name in names:
             path = settings.secrets_dir / name
             try:
                 stat = path.stat()
@@ -456,7 +486,13 @@ def check_secret_files(settings: Settings | None) -> CheckResult:
             present.append(f"{name} ({stat.st_size} байт)")
             break
         if not found and slot_required(slot, settings):
-            problems.append(f"{slot.key}: файла нет (допустимые имена: {', '.join(slot.names)})")
+            problems.append(f"{slot.key}: файла нет (имя этого контура: {', '.join(names)})")
+        for foreign in slot_foreign_names(slot, settings):
+            if (settings.secrets_dir / foreign).is_file():
+                problems.append(
+                    f"{foreign}: файл с именем контейнера, а не хоста — этот контур читает "
+                    f"{', '.join(names)} (deploy/compose.prod.yaml)"
+                )
     if problems:
         return CheckResult("secret_files", False, "; ".join(problems), _severity(settings))
     return CheckResult(
@@ -491,7 +527,7 @@ def check_secret_shapes(settings: Settings | None) -> CheckResult:
         shape = _SECRET_SHAPES.get(slot.key)
         if shape is None:
             continue
-        for name in slot.names:
+        for name in slot_names(slot, settings):
             path = settings.secrets_dir / name
             try:
                 raw = path.read_bytes()
