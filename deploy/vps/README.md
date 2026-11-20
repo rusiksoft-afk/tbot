@@ -10,6 +10,7 @@
 | `firewall.sh` | `/tmp/tbot-ops/` | применяет правила и включает ufw; умеет `--revert` |
 | `fail2ban-jail.local` | `/etc/fail2ban/jail.d/tbot.local` | бан источника за неудачные входы: 3 попытки / 10 минут → 30 минут, с ростом до 24 ч (TZ §8.3) |
 | `docker-daemon.json` | `/etc/docker/daemon.json` | ротация логов контейнеров 50 МБ × 10 (TZ §14.6) и пул сетей Docker вне адресного пространства ВМ |
+| `secrets-setup.sh` | запускается из клона репозитория (`/opt/tbot`) | ввод секретов площадки заказчиком: `read -s`, `600`, `root:root`, режим `--check` без содержимого (TZ §14.3, `docs/runbook/secrets-on-host.md`) |
 
 Применение (порядок важен: файрвол включается до запуска контейнеров):
 
@@ -38,5 +39,14 @@ ssh rusiksoft@153.51.172.30 'sudo cp /tmp/tbot-ops/fail2ban-jail.local /etc/fail
   только файлами с правами `600`, владельцем `root`. Они не попадают ни в git, ни в `docker run -e`,
   ни в compose-файлы, ни в логи (TZ §14.3); контейнеры читают их mount'ом `tmpfs`/read-only.
   Проверка: `grep -R "token\\|passw" deploy/ | grep -v "secrets/"` даёт только переменные без значений.
+  Готовность к деплою проверяется не содержимым, а режимом: `sudo bash vps/secrets-setup.sh --check`
+  печатает имя, размер в байтах, режим и владельца. Лишний перевод строки в значении (его дописывает
+  `echo` вместо `printf '%s'`) выглядит как «пароль не подходит» и видно именно по размеру.
+- **`443/udp` и HTTP/3.** Правило `allow 443/udp comment caddy-http3` связано с `protocols h1 h2 h3`
+  в `deploy/caddy/Caddyfile`: контракт
+  `test_HTTP_3_объявлен_только_вместе_с_открытым_UDP_443` не даёт им разъехаться. Открыт только
+  `tcp` — браузер получает `Alt-Svc: h3`, уходит в QUIC и теряет терпение до фолбэка на HTTP/2;
+  открыт `udp`, но `h3` убран — порт работает впустую. Проход UDP снаружи проверяется счётчиком
+  правила: датаграммы на 443 → `sudo iptables -L ufw-user-input -n -v | grep udp.dpt:443`.
 
 Приёмка этого раздела — `docs/acceptance/prod-firewall.md`.

@@ -41,6 +41,7 @@ from tests.paths import (
     DEPLOY,
     PROD_ENV,
     README,
+    VPS,
     load_compose_yaml,
 )
 
@@ -663,14 +664,18 @@ def test_Caddyfile_фиксирует_TLS_и_не_отключает_выпус�
     )
 
 
-def test_Caddyfile_не_обещает_HTTP_3_которого_нет_в_файрволе() -> None:
-    """`Alt-Svc: h3` при закрытом UDP/443 — это обещание, которое сеть не выполняет.
+def test_HTTP_3_объявлен_только_вместе_с_открытым_UDP_443() -> None:
+    """Caddyfile и правила `ufw` обязаны двигаться одним шагом: `h3` ↔ `allow 443/udp`.
 
-    Замер локально (v2.11.9): без `protocols h1 h2` Caddy сам добавляет
-    `Alt-Svc: h3=":443"`, а правила ufw на площадке пропускает только tcp 22/80/443 (T-708), и
-    TZ §8.5 наружу разрешает ровно 443 и 22. Браузер первый раз идёт по QUIC, получает тайм-аут
-    и только потом откатывается на HTTP/2. Возврат HTTP/3 возможен только вместе с UDP/443 в
-    ufw и в security group — это решение заказчика, а не файла.
+    Причина — замер, а не догадка. Локально на v2.11.9: без явного `protocols` Caddy сам навешивает
+    `Alt-Svc: h3=":443"`, и первый визит браузера уходит в QUIC; если udp/443 не проходит, часть
+    клиентов получает тайм-аут вместо рабочего HTTP/2. Обратный риск не меньше: открыть `443/udp` и
+    забыть включить `h3` — значит держать порт открытым без пользы.
+
+    Поэтому правило проверяется как пара. Проход UDP/443 через облачную группу безопасности и `ufw`
+    подтверждён замером на площадке 2026-11-20: 20 датаграмм с dev-машины подняли счётчик цепочки
+    `ufw-user-input` (правило `udp dpt:443`) ровно до 20 пакетов / 900 байт —
+    `docs/acceptance/tls-edge.md §3.6`. Снять udp-правило можно только вместе с `h3`.
     """
     строки = [
         line for _, chain, line in _caddy_directive_lines("protocols") if chain[-1:] == ("servers",)
@@ -682,12 +687,15 @@ def test_Caddyfile_не_обещает_HTTP_3_которого_нет_в_фай�
         "protocols",
         "h1",
         "h2",
-    ], f"в `servers` ожидался набор `protocols h1 h2`, получено {строки[0]!r}"
-    код = "\n".join(line for _, _, line in _caddy_scopes() if line)
-    assert "h3" not in код, (
-        "HTTP/3 в коде Caddyfile появился — значит надо открывать UDP/443 (ufw + security "
-        "group Yandex Cloud), а это выходит за рамки принятой приёмки T-708"
+        "h3",
+    ], f"в `servers` ожидался набор `protocols h1 h2 h3`, получено {строки[0]!r}"
+
+    правила = (VPS / "ufw.rules").read_text(encoding="utf-8")
+    assert "allow 443/udp" in правила, (
+        "в `deploy/vps/ufw.rules` нет `allow 443/udp`, но Caddyfile уже объявляет h3: браузер "
+        "получит Alt-Svc на транспорт, который файрвол не пропускает"
     )
+    assert "allow 443/tcp" in правила, "443/tcp обязан остаться: это HTTPS-панель"
 
 
 def test_журнал_прокси_не_выписывает_токены_из_query_и_api_ключ() -> None:
@@ -819,8 +827,10 @@ def test_в_README_описан_тот_же_прод_состав_что_и_в_�
 
     Расхождение с реальными файлами означает «команда из README не работает»: прод-состав нельзя
     поднять без env-файла дайджестов, а проверка состава живёт в job `prod-config` и скрипте.
-    Отдельно держится упоминание фильтра журнала и `protocols h1 h2` — это те две правки, которые
-    дала поведенческая проба Caddy (docs/acceptance/tls-edge.md §5).
+    Отдельно держится упоминание фильтра журнала и набора `protocols h1 h2 h3`: обе правки дала
+    поведенческая проба Caddy (docs/acceptance/tls-edge.md §3–§4). Список имён файлов секретов и
+    путь к runbook деплоя — тоже часть контракта: оператор на площадке обязан видеть те же имена,
+    что читает compose, и скрипт, которым эти имена создаются.
     """
     readme = README.read_text(encoding="utf-8")
     for needle in (
@@ -830,9 +840,13 @@ def test_в_README_описан_тот_же_прод_состав_что_и_в_�
         "prod-config",
         "/etc/tbot/secrets",
         "caddy_data",
-        "protocols h1 h2",
+        "protocols h1 h2 h3",
         "format filter",
         "stop_grace_period",
         "docs/acceptance/tls-edge.md",
+        "secrets-setup.sh",
+        "POSTGRES_PASSWORD_FILE",
+        "docs/runbook/stand-deploy.md",
+        "allow 443/udp",
     ):
         assert needle in readme, f"в deploy/README.md нет {needle!r}"
