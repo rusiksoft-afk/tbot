@@ -70,7 +70,11 @@ tgbot `sha256:5d009e00…1a19`, engine `sha256:b0740c89…6b21`, jobs `sha256:9a
 
    ```bash
    ssh -i ~/.ssh/tbot/ssh-key-1795095923419 rusiksoft@153.51.172.30 \
-     'sudo install -d -m 750 -o root -g root /etc/tbot/secrets'
+     'sudo install -d -m 700 -o root -g root /etc/tbot/secrets'
+
+   Режим каталога — `700`. На замере 2026-11-20 каталог был `750` (его создавала настройка
+   туннеля Telegram), и `--check` на это жалуется `WARN`; скрипт ввода секретов сам делает
+   `install -d -m 700`, так что отдельная команда не обязательна.
    ```
 
 3. Значение вводится **локально, без эха**, и уходит на ВМ по stdin того же SSH-канала — так
@@ -81,6 +85,41 @@ tgbot `sha256:5d009e00…1a19`, engine `sha256:b0740c89…6b21`, jobs `sha256:9a
      -i ~/.ssh/tbot/ssh-key-1795095923419 rusiksoft@153.51.172.30 \
      'sudo umask 077 && sudo tee /etc/tbot/secrets/ghcr_token >/dev/null' && unset TOK
    ```
+
+### Кому принадлежит токен: как узнать логин, не поднимая токен в argv
+
+Логин нужен для `sudo docker login ghcr.io --username <логин> --password-stdin`. Заказчик
+предложил выяснять его на площадке запросом `GET /user`, но в такой форме токен уходит в
+аргументы процесса: `-H "Authorization: Bearer $(cat /etc/tbot/secrets/ghcr_token)"` видно в
+`ps` любому локальному пользователю в момент вызова. Форма ниже читает файл внутри процесса и
+не показывает значение:
+
+```bash
+ssh -i ~/.ssh/tbot/ssh-key-1795095923419 rusiksoft@153.51.172.30 \
+  'sudo python3 - <<PY
+import json, urllib.request, urllib.error
+tok = open("/etc/tbot/secrets/ghcr_token").read().strip()
+req = urllib.request.Request("https://api.github.com/user",
+                             headers={"Authorization": "Bearer " + tok,
+                                      "User-Agent": "tbot-deploy"})
+try:
+    with urllib.request.urlopen(req) as r:
+        print("login:", json.load(r).get("login"))
+except urllib.error.HTTPError as e:
+    print("HTTP", e.code, e.reason)
+PY'
+```
+
+Ограничение, которое нельзя забыть: `GET /user` отвечает классическим токеном. У
+fine-grained PAT этот эндпоинт может ответить `403`, и тогда логин либо сообщается владельцем
+токена, либо берётся из ответа на `GET /rate_limit` — у fine-grained токена GitHub отдаёт
+служебный заголовок владельца. Проверять надо по факту, а не по догадке: на замере 2026-11-20
+у классического OAuth-токена `gh` таких заголовков нет (есть `x-oauth-scopes`), поэтому
+инструкция фиксируется как проба, а не как гарантированный способ.
+
+Есть и более прямой тест готовности — не «чей токен», а «тянет ли он образ»: обмен в
+`https://ghcr.io/token?scope=repository:rusiksoft-afk/tbot-web:pull` и GET манифеста по digest.
+Если манифест отдаётся, pull на площадке пройдёт независимо от того, какой логин показало API.
 
 4. Проверка прав (вывод не содержит значения):
 
