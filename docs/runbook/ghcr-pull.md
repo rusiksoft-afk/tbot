@@ -81,14 +81,28 @@ tgbot `sha256:5d009e00…1a19`, engine `sha256:b0740c89…6b21`, jobs `sha256:9a
    `install -d -m 700`, так что отдельная команда не обязательна.
    ```
 
-3. Значение вводится **локально, без эха**, и уходит на ВМ по stdin того же SSH-канала — так
-   токен не попадает в чат, в аргументы команды (`ps`), в `.bash_history` и в логи CI:
+3. Значение вводится **без эха** и уходит на ВМ по stdin того же SSH-канала — так токен
+   не попадает в чат, в аргументы команды (`ps`), в `.bash_history` и в логи CI. Единственный
+   правильный получатель значения — `deploy/vps/secrets-setup.sh`: он проверяет форму **до**
+   записи, ставит `600 root:root` и пишет без завершающего `\n` (см. ниже два
+   варианта):
 
    ```bash
-   read -rs -p "GHCR read-only token: " TOK && printf '%s' "$TOK" | ssh \
-     -i ~/.ssh/tbot/ssh-key-1795095923419 rusiksoft@153.51.172.30 \
-     'sudo umask 077 && sudo tee /etc/tbot/secrets/ghcr_token >/dev/null' && unset TOK
+   # вариант 1: значение с клавиатуры на самой ВМ (ввод без эха)
+   sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --only ghcr_token
+
+   # вариант 2: значение вводится на dev-машине и проливается в stdin скрипта по SSH-каналу
+   read -rs -p "GHCR read-only token: " TOK
+   printf '%s' "$TOK" | ssh -i ~/.ssh/tbot/ssh-key-1795095923419 rusiksoft@153.51.172.30 \
+     'sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --force --only ghcr_token'
+   unset TOK
    ```
+
+   `--force` во втором варианте обязателен: прогон не интерактивный (без терминала скрипт
+   писать не станет), и перезатирать уже лежащий мусор придётся без вопроса. После записи —
+   `sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --check`, ожидание: пять `OK` и код 0.
+   Прежний рецепт с `sudo tee` устарел с 2026-11-20: он пишет любое значение без проверки
+   формы — именно так в файл и попали 11 символов не-PAT.
 
 ### Кому принадлежит токен: как узнать логин, не поднимая токен в argv
 
