@@ -28,13 +28,26 @@
 
 ```bash
 sudo install -d -m 750 /opt/tbot
-sudo ssh-keygen -t ed25519 -f /root/.ssh/tbot_deploy_key -N '' -C 'deploy-key/tbot-vm'
+sudo ssh-keygen -t ed25519 -f /root/.ssh/tbot_deploy_key -N '' -C 'deploy-key/tbot-vm-2026-11-20'  # уже создан 2026-11-20 — не пересоздавать
 sudo cat /root/.ssh/tbot_deploy_key.pub          # публичная часть — не секрет
 # владелец репозитория добавляет её: Settings → Deploy keys → Add (не ставить write access)
 sudo sh -c 'ssh-keyscan -t ed25519 github.com >> /root/.ssh/known_hosts'
 sudo git clone git@github.com:rusiksoft-afk/tbot.git /opt/tbot
 cd /opt/tbot && git log --oneline -1
 ```
+
+**Статус на 2026-11-20:** ключ уже создан на ВМ (`/root/.ssh/tbot_deploy_key` 600 root:root,
+`.pub` 644), пересоздавать его нельзя — публичная часть будет добавлена заказчиком как deploy key
+и повторная генерация рассинхронизирует её с GitHub. Замеренные значения:
+
+```
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINLDO6mbx5f5R1gtTC3wqbVygUWDXHuUpMnRbKGe7MpX deploy-key/tbot-vm-2026-11-20
+отпечаток: SHA256:bYb6ZnLlpjbjQoAG3GomNid/zWuRgL0yXvr8N6KVYxI
+```
+
+`known_hosts` для github.com на ВМ **нет** — перед клоном нужен `ssh-keyscan` (или `ssh -o
+StrictHostKeyChecking=accept-new`), иначе `git clone` спросит подтверждение ключа хоста в
+неинтерактивном прогоне и упадёт.
 
 Проверка, что клон соответствует ожидаемому commit: хеш из `git log --oneline -1` обязан совпадать
 с commit, из которого собраны digest'ы в `deploy/tbot.prod.env` (иначе на площадку поедет чужой

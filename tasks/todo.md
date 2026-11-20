@@ -500,7 +500,13 @@
     (клон по read-only deploy-ключу, `config` на ВМ, `pull` по digest, `migrate`, первый срез
     `postgres + web + caddy`); ввод секретов — новый артефакт `deploy/vps/secrets-setup.sh` и
     `docs/runbook/secrets-on-host.md`; `AGENTS.md` приведён к `ADR-001`; дайджесты в
-    `deploy/tbot.prod.env` пересняты с commit `21579ba` (run `Image` 44708907667).
+    `deploy/tbot.prod.env` пересняты с commit `b235d29` (run `Image` 44716926556).
+    Предыдущий набор `21579ba` / run 44708907667 остаётся в истории как точка отката.
+    Deploy-ключ ВМ создан 2026-11-20: `/root/.ssh/tbot_deploy_key` (600 root:root), отпечаток
+    `SHA256:bYb6ZnLlpjbjQoAG3GomNid/zWuRgL0yXvr8N6KVYxI`, публичная часть — в
+    `docs/runbook/stand-deploy.md §2`. Сборка образов не воспроизводима по digest: наборы
+    меняются после каждого мержа, поэтому пересъёмка делается непосредственно перед деплоем
+    (`docs/runbook/ghcr-pull.md §2`).
   - Новая подзадача остатка: `scripts/deploy_check.py` ищет в каталоге секретов имена
     *конфигурации* (`tg_bot_token`, `tg_socks_password`), а на площадке файлы названы по TZ §14.3
     (`telegram_token`, `telegram_socks_pass`) → `secret_files` краснеет на готовой площадке.
@@ -539,8 +545,11 @@
     `docs/runbook/stand-deploy.md`, доступ к Docker — через `sudo`, ограничитель запросов
     перенесён в приложение (TZ §8.3 поправлен с разрешения заказчика, `ADR-003 §4`), `443/udp`
     открыт, `80/tcp` остаётся, секреты кладёт заказчик скриптом `deploy/vps/secrets-setup.sh`.
-    Ждут только действия владельца площадки (секреты, deploy-ключ, логин владельца `ghcr_token`,
-    согласие на рестарт docker и ребут) — `docs/acceptance/tls-edge.md §7`.
+    Ждут только действия владельца площадки (секреты, **добавление deploy-ключа ВМ в GitHub**,
+    логин владельца `ghcr_token`, сужение SG, согласие на рестарт docker и ребут) —
+    `docs/HANDOFF.md §4`, `docs/acceptance/tls-edge.md §7`.
+  - 2026-11-20 13:25: PR #2 влито в `main` (мерж `b235d29`), CI зелёный целиком, включая
+    `prod-config`; набор дайджестов переснят с прогона `Image` 44716926556 (commit `b235d29`).
 
 ## Позже (вне M0–M7, зафиксировано объёмом ТЗ)
 
