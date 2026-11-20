@@ -6,7 +6,9 @@ Dev-стенд покрыт `test_compose_contract.py` и job'ом `compose-smok
 `compose-smoke` (HANDOFF §1.2, §1.4): файл разбирается, но проверяет не то. Что держится этим
 контрактом:
 
-*   образы берутся из реестра **по digest**, локальная сборка сброшена (`build: !reset null`);
+*   образы берутся из реестра **по digest**, а локальной сборки в боевом разборе нет вовсе
+    (`build` объявлен только в dev-дополнении: `!reset null` в overlay её не отключает —
+    проверено первым прогоном job'а `prod-config`);
 *   наружу публикуется **только** 80/443 Caddy: опубликованный Docker-портом порт доступен
     снаружи независимо от `ufw` (правила уходят в `FORWARD`/`nat`), поэтому «какой порт
     наружу» решает этот файл, а не файрвол (`docs/acceptance/prod-firewall.md §5`);
@@ -34,6 +36,7 @@ from packages.common.config import Settings
 from tests.paths import (
     CADDYFILE,
     COMPOSE_BASE,
+    COMPOSE_OVERRIDE,
     COMPOSE_PROD,
     DEPLOY,
     PROD_ENV,
@@ -83,19 +86,18 @@ NEVER_PUBLISHED = ("5432", "8080", "9101", "9102", "9103", "10800")
 # хостовый том нельзя.
 ALLOWED_OVERLAY_KEYS: dict[str, set[str]] = {
     "postgres": {"image", "restart", "mem_limit", "cpus"},
-    "web": {"image", "restart", "mem_limit", "cpus", "networks", "build", "environment"},
+    "web": {"image", "restart", "mem_limit", "cpus", "networks", "environment"},
     "engine": {
         "image",
         "restart",
         "mem_limit",
         "cpus",
         "stop_grace_period",
-        "build",
         "environment",
     },
-    "tgbot": {"image", "restart", "mem_limit", "cpus", "build", "environment"},
-    "jobs": {"image", "restart", "mem_limit", "cpus", "build", "environment"},
-    ONE_SHOT: {"image", "mem_limit", "build"},
+    "tgbot": {"image", "restart", "mem_limit", "cpus", "environment"},
+    "jobs": {"image", "restart", "mem_limit", "cpus", "environment"},
+    ONE_SHOT: {"image", "mem_limit"},
 }
 ALLOWED_OVERLAY_ENV_KEYS = {"TBOT_CONTOUR", "TBOT_CONFIRM_PRODUCTION"}
 
@@ -297,36 +299,34 @@ def _split_csp(value: str) -> dict[str, str]:
     return directives
 
 
-def test_боевой_overlay_разбирается_и_не_собирает_образы_на_площадке() -> None:
-    """`!reset` — единственный способ сказать compose «здесь не собирай».
+def test_боевой_разбор_вообще_не_содержит_локальной_сборки() -> None:
+    """Ни `build`, ни «отключённый» `build`: в паре compose.yaml + compose.prod.yaml его нет.
 
-    Без него `up` с отсутствующим образом соберёт его прямо на площадке: на 2 vCPU это
-    остановит всё остальное, а связь «запустили ровно то, что собрали в CI» (TZ §14.6,
-    `docs/runbook/ghcr-pull.md §1`) потеряется молча — compose не считает это ошибкой.
+    Первый прогон job'а `prod-config` (2026-11-20) опроверг допущение, что `build: !reset null`
+    в overlay отключает сборку: после слияния в `config --format json` у web/engine/tgbot/jobs/
+    migrate остались `context` (каталог проекта) и `dockerfile` из базового файла — тег не
+    сбросил отображение. Пока `build` в модели есть, `up -d` с отсутствующим локально образом
+    соберёт его прямо на площадке: на 2 vCPU это остановит остальное, а связь «запустили ровно
+    то, что собрали в CI» (TZ §14.6, `docs/runbook/ghcr-pull.md §1`) потеряется молча — compose
+    не считает это ошибкой. Поэтому `build` переехал в dev-дополнение: полагаться на семантику
+    тегов слияния больше не нужно, а `no_local_build` в `scripts/prod_compose_check.py` смотрит
+    на разобранную модель.
     """
-    raw = COMPOSE_PROD.read_text(encoding="utf-8")
-    build_lines = [line.strip() for line in raw.splitlines() if line.strip().startswith("build:")]
-    assert build_lines, "в overlay нет ни одного сброса сборки: площадка соберёт образы сама"
-    assert all(line == "build: !reset null" for line in build_lines), (
-        f"сборка сбрасывается не полностью: {build_lines} — строка `build:` без тега compose "
-        "читает как пустую конфигурацию сборки и начнёт собирать образ на площадке"
-    )
-    services = _prod_services()
-    anchor = _prod()["x-prod-app"]
-    assert "build" in anchor, (
-        "общий якорь прикладных процессов потерял сброс сборки: у четырёх сервисов "
-        "`!reset` исчезнет вместе с ним"
-    )
-    for name in (*APP_SERVICES, ONE_SHOT):
-        assert name in services, f"в боевом составе нет сервиса {name}"
-        assert (
-            "build" in services[name]
-        ), f"{name}: сброса сборки нет ни в якоре, ни в самом сервисе"
-        assert services[name]["build"] is None, f"{name}: build обязан быть сброшен"
-        assert _base()["services"][name].get("build"), (
-            f"{name}: в базовом файле сборки нет — `!reset` охранял от того, чего не "
-            "существовало, а реальная сборка появилась в другом месте"
+    for name, spec in _base()["services"].items():
+        assert "build" not in spec, (
+            f"{name}: сборка объявлена в базовом файле — боевой разбор унаследует её, даже "
+            "если overlay попытается её сбросить"
         )
+    for name, spec in _prod_services().items():
+        assert "build" not in spec, f"{name}: сборка объявлена в боевом overlay"
+    override = _load(COMPOSE_OVERRIDE)["services"]
+    built = {
+        name for name, spec in override.items() if isinstance(spec, dict) and spec.get("build")
+    }
+    assert built == {*APP_SERVICES, ONE_SHOT}, (
+        f"сборки объявлены не там, где ожидается: {sorted(built)} — dev-стенд нечем собрать, "
+        "или сборка утекла в боевой разбор"
+    )
 
 
 def test_образы_боевого_состава_зафиксированы_по_digest() -> None:

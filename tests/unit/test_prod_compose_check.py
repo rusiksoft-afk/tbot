@@ -216,12 +216,32 @@ def test_образ_базы_тоже_обязан_быть_по_digest() -> Non
 
 
 def test_оставшаяся_сборка_в_составе_отклоняется() -> None:
-    """`build: !reset null` из overlay может не дожить до разбора — тогда `up` соберёт на площадке."""
+    """Так выглядел первый прогон `prod-config`: `!reset null` в overlay не дожил до разбора."""
     модель = _model()
     модель["services"]["engine"]["build"] = {"context": ".", "dockerfile": "deploy/Dockerfile"}
     проверка = _imap(модель)["no_local_build"]
     assert not проверка.ok
     assert "engine" in проверка.detail
+
+
+def test_ключ_build_даже_со_значением_null_отклоняется() -> None:
+    """`build: null` в разобранном составе — не «сборки нет», а попытка её отключить.
+
+    Разница между «ключа нет» и «ключ есть со значением null» — ровно та стена, на которой
+    compose v5.1.3 оставил context/dockerfile из базового файла. Проверка не даёт решить,
+    что достаточно дописать тег: `build` обязан исчезнуть из боевого разбора целиком.
+    """
+    модель = _model()
+    модель["services"]["web"]["build"] = None
+    проверка = _imap(модель)["no_local_build"]
+    assert not проверка.ok, "пустой `build` принят как «сборки нет»"
+    assert "web" in проверка.detail
+
+
+def test_в_эталоне_боевого_разбора_ключа_build_нет_ни_у_одного_сервиса() -> None:
+    """Иначе предыдущие два теста проверяют отсутствие ключа, которого в модели нет вовсе."""
+    for name, spec in _model()["services"].items():
+        assert "build" not in spec, f"{name}: в эталоне появился build"
 
 
 def test_сеть_с_egress_у_базы_отклоняется() -> None:

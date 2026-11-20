@@ -10,23 +10,42 @@
 # Значения боевого контура сюда не попадают никогда.
 
 services:
-  postgres:
-    ports:
-      - "127.0.0.1:5433:5432"
-
+  # Сборка — только здесь (её нет в базовом файле): боевой состав (`compose.yaml` +
+  # `compose.prod.yaml`) обязан не содержать пути к локальной сборке вообще, потому что
+  # `up -d` с `build` в разобранной модели собирает образ на площадке вместо pull по digest.
+  # Те же четыре образа в бою собираются шагами `.github/workflows/image.yml`.
   web:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        APP: web
     ports:
       - "127.0.0.1:8080:8080"
     environment:
       TBOT_LOG_JSON: "false"
       TBOT_LOG_LEVEL: DEBUG
 
+  postgres:
+    ports:
+      - "127.0.0.1:5433:5432"
+
   engine:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        APP: engine
     environment:
       TBOT_LOG_JSON: "false"
       TBOT_LOG_LEVEL: DEBUG
 
   tgbot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        APP: tgbot
     environment:
       TBOT_LOG_JSON: "false"
       TBOT_LOG_LEVEL: DEBUG
@@ -35,5 +54,17 @@ services:
       TBOT_INSTANCE_NAME: dev-stand
 
   jobs:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        APP: jobs
     environment:
       TBOT_LOG_JSON: "false"
+
+  migrate:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        APP: web

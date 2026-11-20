@@ -484,9 +484,14 @@
     выполнена: `postgres:16.4` = `sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412`.
   - Что сделано дополнительно 2026-11-20: `deploy/compose.prod.yaml` написан (единственные
     публикуемые наружу порты — 80/443 Caddy, секреты файлами из `/etc/tbot/secrets`, лимиты под
-    3.8 ГиБ, все образы по digest, `build: !reset null`);
-    compose 2.40.3 на площадке понимает теги `!reset`/`!override` — проверено на самой машине
-    (`docker compose version`); состав разбирается и проверяется в CI (job `prod-config`:
+    3.8 ГиБ, все образы по digest, включая образ базы); блоки `build:` вынесены из
+    `compose.yaml` в `compose.override.yaml`, потому что `build: !reset null` в overlay
+    **не убирает сборку** из разобранной модели compose — в `config --format json` остаются
+    `context`/`dockerfile` из базового файла (нашёл первый прогон job'а `prod-config`,
+    `docs/acceptance/tls-edge.md §5, п.6`);
+    compose на площадке — **2.40.3** из пакета Ubuntu, на CI-раннёре — **v5.1.3**, поэтому
+    разбор в CI проверяет более новую реализацию и требует повторного `config` на ВМ;
+    состав разбирается и проверяется в CI (job `prod-config`:
     `docker compose config` + `scripts/prod_compose_check.py` + `caddy validate` внутри образа с
     закреплённым digest) и статически (`test_compose_prod_contract`, `test_prod_compose_check`).
     Остаток задачи — реальный `pull → migrate → restart` и учебный откат на площадке.

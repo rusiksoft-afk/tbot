@@ -9,7 +9,15 @@
 #   * у каждого процесса есть healthcheck, поэтому `depends_on` опирается на готовность,
 #     а не на «поспать десять секунд».
 #
-# Локальные отличия (публикация портов, каталоги dev-секретов) — в compose.override.yaml.
+# Локальные отличия (публикация портов, каталоги dev-секретов и **сборка образов**) —
+# в compose.override.yaml. `build` здесь не объявлен намеренно: боевой контур собирается
+# командами `.github/workflows/image.yml` и запускается парой `compose.yaml +
+# compose.prod.yaml`, где `build` не встречается ни в одном файле. Причина найдена
+# первым прогоном job'а `prod-config`: `build: !reset null` в overlay НЕ убирает сборку из
+# разобранной модели compose (в `config --format json` остаются `context` и `dockerfile`),
+# а пока `build` в модели есть, `up -d` с отсутствующим локально образом соберёт его прямо
+# на площадке. Держит это `no_local_build` в `scripts/prod_compose_check.py` и
+# `test_локальная_сборка_объявлена_только_в_dev_дополнении`.
 
 name: tbot
 
@@ -112,11 +120,6 @@ services:
     <<: *db-runtime
 
   web:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      args:
-        APP: web
     image: tbot-web:dev
     environment:
       <<: *app-env
@@ -145,11 +148,6 @@ services:
     <<: *default-runtime
 
   engine:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      args:
-        APP: engine
     image: tbot-engine:dev
     environment:
       <<: *app-env
@@ -176,11 +174,6 @@ services:
     <<: *default-runtime
 
   tgbot:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      args:
-        APP: tgbot
     image: tbot-tgbot:dev
     environment:
       <<: *app-env
@@ -210,11 +203,6 @@ services:
     <<: *default-runtime
 
   jobs:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      args:
-        APP: jobs
     image: tbot-jobs:dev
     environment:
       <<: *app-env
@@ -245,11 +233,6 @@ services:
     <<: *default-runtime
 
   migrate:
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile
-      args:
-        APP: web
     image: tbot-web:dev
     profiles: ["tools"]
     environment:
