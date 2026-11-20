@@ -17,25 +17,42 @@
 # Проверка и запуск (каталог репозитория на площадке — /opt/tbot):
 #   docker compose -f compose.yaml -f compose.prod.yaml --env-file tbot.prod.env config
 #   docker compose ... up -d postgres && ... run --rm migrate alembic upgrade head && ... up -d
-# Разбор `config` — часть приёмки T-712: он ловит и отсутствующий файл секрета, и невалидный
-# digest, и попытку собрать образ вместо pull.
+# Разбор состава проверяется не только руками: job `prod-config` в `.github/workflows/ci.yml`
+# исполняет `config` на CI-раннёре (Docker на dev-машине нет) и дополнительно прогоняет
+# `caddy validate` внутри того самого образа, digest которого зафиксирован в `tbot.prod.env`.
+# Статическая половина — контрактный тест `tests/integration/test_compose_prod_contract.py`.
 
 name: tbot
 
 # Единый якорь для всех прикладных процессов: боевой restart, отказ от локальной сборки и
 # потолок по умолчанию. Повторить `<<:` дважды в одном отображении YAML не позволяет, поэтому
 # всё, что общее, лежит здесь.
+#
+# `environment` здесь дополняет (а не заменяет) базовый якорь `x-app-env`: слияние compose идёт
+# по ключам. Контур обязан быть явным: по умолчанию `Settings.contour = sandbox`, и боевой
+# процесс с `TBOT_CONTOUR=production` не стартует без `TBOT_CONFIRM_PRODUCTION=true` (TZ §2.4,
+# `packages/common/config.py`). Оба значения — не секреты, но и не решение прошлого: значение
+# по умолчанию здесь — прежнее (sandbox/false), а включение боя даёт оператор при деплое.
 x-prod-app: &prod-app
   restart: always
   build: !reset null
   mem_limit: 384m
   cpus: 0.5
+  environment:
+    TBOT_CONTOUR: ${TBOT_CONTOUR:-sandbox}
+    TBOT_CONFIRM_PRODUCTION: ${TBOT_CONFIRM_PRODUCTION:-false}
 
 services:
   postgres:
     restart: always
+    # Образ базы тоже по digest (TZ §14.6, `docs/runbook/ghcr-pull.md §2`): база не из GHCR, но
+    # CI-стенд и площадка обязаны получать один и тот же образ, иначе «учение на площадке»
+    # проверяет не ту версию Postgres, что в CI. Без этой строки базовый `image: postgres:16.4`
+    # (тег = перемещаемая метка) остался бы единственной незафиксированной частью состава.
+    image: postgres@${TBOT_POSTGRES_DIGEST}
     # 768 МиБ при shared_buffers 256 МБ (deploy/postgres/tbot.conf): запас на work_mem ×
     # число соединений и кэш ОС. Без потолка OOM-killer выбирает самое крупное — то есть базу.
+    # Потолок ниже значения TZ §14.6 (3 GiB) из-за OQ-11: «без расширения», 3.8 ГиБ на всех.
     mem_limit: 768m
     cpus: 1.5
 
@@ -46,6 +63,12 @@ services:
     # Панель отвечает за людей: 0.5 vCPU хватает, потому что тяжёлые вычисления делают engine
     # и jobs, а не web.
     cpus: 0.5
+    # Списки `networks` в overlay сливаются с базовыми по имени сети, а не заменяют их:
+    # здесь web остаётся и на базовой `tbot-edge`. Это намеренно оставлено как есть:
+    # `tbot-edge` в базовом файле — `internal: true`, то есть она не даёт никакого пути
+    # наружу; доступ к панели извне идёт только через `tbot-public` (см. ниже), а доступ
+    # web к базе — через `tbot-backend`. Контракт на «у каких сервисов есть egress» —
+    # `test_egress_получают_только_разрешённые_сервисы` + шаг CI с реальным разбором compose.
     networks:
       - tbot-backend
       - tbot-public
@@ -55,15 +78,15 @@ services:
     image: ghcr.io/rusiksoft-afk/tbot-engine@${TBOT_ENGINE_DIGEST}
     mem_limit: 896m
     cpus: 1.0
-    # SIGTERM + 30 секунд: ядро обязано успеть отписаться от потока брокера и записать
-    # состояние, иначе после рестарта сверка позиций идёт «с нуля» (TZ §7.6).
-    stop_grace_period: 30s
+    # SIGTERM + 60 секунд (TZ §14.6): ядро обязано успеть отписаться от потока брокера и
+    # записать состояние, иначе после рестарта сверка позиций идёт «с нуля» (TZ §7.6).
+    stop_grace_period: 60s
 
   tgbot:
     <<: *prod-app
     image: ghcr.io/rusiksoft-afk/tbot-tgbot@${TBOT_TGBOT_DIGEST}
     mem_limit: 256m
-    cpus: 0.3
+    cpus: 0.25
 
   jobs:
     <<: *prod-app
@@ -81,9 +104,10 @@ services:
   # HTTP→HTTPS, HSTS и базовые охранные заголовки, прокси на web.
   caddy:
     image: caddy@${CADDY_DIGEST}
+    # Лимиты — ровно из TZ §14.6 («caddy restart always; limits 128M CPU 0.25»).
     restart: always
-    mem_limit: 192m
-    cpus: 0.3
+    mem_limit: 128m
+    cpus: 0.25
     command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
     ports:
       - "80:80"
@@ -114,9 +138,14 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    # Единственное точечное исключение для Caddy: слушать 80/443 без capability он не может
-    # (привилегированный диапазон). Минимальность закреплена контрактом
-    # `test_прокси_получает_только_net_bind_service`.
+    # Точечное исключение: официальный образ Caddy работает от root и слушает 80/443, а без
+    # NET_BIND_SERVICE привилегированный диапазон недоступен. Это отклонение от абзаца
+    # TZ §8.5 «не-root пользователь в контейнерах» — осознанное: перевести официальный образ на
+    # непривилегированного пользователя нельзя без доработки entrypoint (именованные тома
+    # /data и /config создаются root-владельцами, а пересборка образа с плагином означала бы
+    # отказ от публичного digest). Остальная охрана при этом сохранена: cap_drop ALL,
+    # no-new-privileges, read-only rootfs, pids_limit. Минимальность исключения держит контракт
+    # `test_caddy_получает_ровно_net_bind_service` — набор не имеет права расти.
     cap_add:
       - NET_BIND_SERVICE
     read_only: true
@@ -133,6 +162,12 @@ networks:
   tbot-public:
     # Сеть с доступом наружу (не internal) ровно для двух участников — Caddy и web: в неё не
     # подключены база, engine, jobs и tgbot, поэтому опубликованный 443 не даёт доступа к ним.
+    # Почему web обязан быть в сети с egress: Caddy ходит к нему как к upstream по имени сервиса,
+    # а сам прокси обязан иметь исходящие — ACME выпускает сертификат не только входящим
+    # HTTP-01 вызовом, но и обращениями к каталогу ACME (см. `deploy/caddy/Caddyfile`).
+    # Последствие для TZ §8.5: у web появляется исходящий трафик, которого в dev-стенде нет;
+    # политика «какие адреса разрешены» держится цепочкой `DOCKER-USER` на хосте
+    # (`docs/acceptance/prod-firewall.md §5`, `deploy/vps/README.md`), а не этим файлом.
     driver: bridge
 
 volumes:
