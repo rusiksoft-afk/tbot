@@ -26,23 +26,34 @@ gh run view <run-id> --repo rusiksoft-afk/tbot --log 2>/dev/null \
   | sed -E 's/pushing manifest for //' | sort -u
 ```
 
-Состояние на 2026-11-20 14:40 MSK (commit `21579ba`, run `44708907667`):
+Состояние на 2026-11-20 13:12 MSK (commit `b235d29` — мерж PR #2, run `44716926556`):
 
 | Образ | Тег | Digest |
 | --- | --- | --- |
-| `ghcr.io/rusiksoft-afk/tbot-web` | `main`, `sha-21579ba` | `sha256:c33283cf507dfd9245c48a8718ab07913d5b5578bf260698f1b7572c6985edbd` |
-| `ghcr.io/rusiksoft-afk/tbot-tgbot` | `main`, `sha-21579ba` | `sha256:413b1df8590ef8966f193afada7dc55280709b8b3ce6e8913128414fe68b9834` |
-| `ghcr.io/rusiksoft-afk/tbot-engine` | `main`, `sha-21579ba` | `sha256:ae6faf72422a9c2363fa457cce882ccdb22d4ca3656d159ac9648474eea33914` |
-| `ghcr.io/rusiksoft-afk/tbot-jobs` | `main`, `sha-21579ba` | `sha256:a88004338ed8b1563069fd6c4d0b9a4943c3f78deacdf33f370ecbc8ef32c0fc` |
+| `ghcr.io/rusiksoft-afk/tbot-web` | `main`, `sha-b235d29` | `sha256:0f48265114538fbc60aa407cefb9b183f6fa29aa868d2d7590c54eaaea5f970d` |
+| `ghcr.io/rusiksoft-afk/tbot-tgbot` | `main`, `sha-b235d29` | `sha256:873152b3a9178290736f0676ed253817b52702c1db60bd1f788ac4ac6db2e37e` |
+| `ghcr.io/rusiksoft-afk/tbot-engine` | `main`, `sha-b235d29` | `sha256:c5c1af5e451db1ddf4b7e1d7efed8accf6fac23fb4e7bed564de069670006e03` |
+| `ghcr.io/rusiksoft-afk/tbot-jobs` | `main`, `sha-b235d29` | `sha256:04070e40b269dce3ed264b131d98cedac5d1c0fca2f1e0cc868f75f3c702753f` |
 | `postgres` (публичный, Docker Hub) | `16.4` | `sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412` |
 | `caddy` (публичный, Docker Hub) | `2` (v2.11.9) | `sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b` |
 
-Предыдущий набор (он же точка отката по TZ §12.7: commit `4fa1b51`, run `44689994900`):
-web `sha256:5705a7ba…5fdc`, tgbot `sha256:5d009e00…1a19`, engine `sha256:b0740c89…6b21`,
-jobs `sha256:9adee970…5a3`. Полные значения — в истории git (`git show HEAD~1:deploy/tbot.prod.env`
-или более ранний коммит с сообщением «дайджесты образов пересняты»); именно поэтому файл
+Предыдущие наборы — точки отката по TZ §12.7. Commit `21579ba`, run `44708907667`: web
+`sha256:c33283cf…970d`, tgbot `sha256:413b1df8…637e`, engine `sha256:ae6faf72…3914`, jobs
+`sha256:a8800433…753f`. Commit `4fa1b51`, run `44689994900`: web `sha256:5705a7ba…5fdc`,
+tgbot `sha256:5d009e00…1a19`, engine `sha256:b0740c89…6b21`, jobs `sha256:9adee970…32a3`.
+Полные значения — в истории git по сообщению «дайджесты образов пересняты»; именно поэтому файл
 `deploy/tbot.prod.env` обязан обновляться **одним** коммитом вместе с номером commit и номером
 прогона.
+
+**Сборка не воспроизводима по digest.** Два прогона одного и того же кода дают разные манифесты
+(метки времени слоёв): набор меняется после каждого мержа в `main` — даже если `apps/`,
+`packages/`, `deploy/Dockerfile` и `pyproject.toml` не менялись вовсе (проверено 2026-11-20:
+наборы `21579ba` и `b235d29` различаются при неизменном коде приложения). Отсюда правило, которое
+снимает бесконечную гонку: пересъёмка делается **непосредственно перед деплоем**, а деплоится тот
+коммит, чей набор записан в файле. Соответствие проверяется по паре «run → commit» из заголовка
+файла: дайджесты обязаны существовать в реестре и быть выложенными в указанном прогоне, но
+совпадать с дайджестами самого свежего прогона они не обязаны. Сам коммит пересъёмки запускает
+`Image` и порождает следующий набор — это ожидаемо и очередной пересъёмки не требует.
 
 `postgres` берётся не из GHCR, но тоже пинится по digest: сборка CI и площадка должны получать
 один и тот же образ базы, иначе «учение на площадке» проверяет не ту версию, что в CI. Проверка
