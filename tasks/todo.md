@@ -70,10 +70,19 @@
     CI-стенде не запускается (его `/readyz` требует пробы Bot API; приёмка канала управления — M3),
     `make dev` как команда на dev-машине не выполнялась (нет Docker) — стенд поднимался той же
     парой `-f`-файлов, что и в стенде разработчика.
-- [ ] **T-006** Сертификат НУЦ Минцифры в образе + `SSL_TBANK_VERIFY` + коннект-тест контуров
+- [x] **T-006** Сертификат НУЦ Минцифры в образе + `SSL_TBANK_VERIFY` + коннект-тест контуров
   - Приёмка: `REQ-broker-gateway-02`, `AC-broker-gateway-02`
   - Проверка: `make deploy-check` (TLS-часть), тест с mock
   - Файлы: `deploy/ca/`, `deploy/Dockerfile.engine`, `scripts/deploy_check.py`
+  - Статус 2026-11-20: принято — протокол `docs/acceptance/broker-tls.md` (CI run `44675985821`,
+    8 job'ов из 8 ✓). Корень `deploy/ca/ru-trusted-root-ca.pem` закреплён отпечатком в
+    `scripts/ca_policy.py` (единственный источник), образ кладёт его как
+    `/usr/local/share/ca-certificates/ru-trusted-root-ca.crt`. Новая пара проверок в CI:
+    job `broker-tls` («без корня — `unverified`, с корнем — `verified`», mock-ЦС + живые точки
+    обоих контуров) и шаг `compose-smoke` (корень в системной связке образа + живой handshake
+    из контейнера). `ssl_tbank_verify=false` по-прежнему не проходит валидатор. Из
+    запланированного имени `deploy/Dockerfile.engine` в проекте есть один
+    `deploy/Dockerfile` (multi-target, `--build-arg APP=…`).
 - [x] **T-007** Базовые health/metrics: `/healthz`, `/readyz`, `/metrics`, `tbot_build_info`
   - Приёмка: метрики TZ §12.2 (базовый набор); compose-зависимости по health
   - Проверка: интеграционный тест `test_health_readyz`, ручной `curl /metrics`
@@ -380,6 +389,13 @@
   - Приёмка: `AC-broker-gateway-02` на реальной ВМ; в `deploy-check` вывод срока сертификата (текущий до 2027-08-24)
   - Проверка: `curl` без `-k` → 401 (не ошибка TLS); контейнер без корня → ошибка; CI валится
   - Файлы: `deploy/ca/`, `deploy/Dockerfile.*`, `scripts/deploy_check.py`
+  - Статус 2026-11-20 (`in progress`, принята не-ВМ-половина): образ ✓, CI «без доверия —
+    падает» ✓ и «с корнем — работает» ✓ (job `broker-tls`, шаг `compose-smoke`), контроль
+    срока корня и сертификата брокера в `deploy-check` ✓, `SSL_TBANK_VERIFY` ✓ (отключить
+    нельзя). Инструкцию по установке на хост и на рабочий компьютер даёт
+    `docs/runbook/nucc-ca.md` (§2 сервер, §3 десктоп, §4 срок и `certifi`, §5 смена ЦС).
+    Не выполнено и не может быть выполнено на паузе T-011: установка корня на прод-ВМ и
+    `curl` без `-k` → 401 на площадке; проверка на test-стенде — после T-010.
 - [ ] **T-710** Транспорт Telegram, схема A (прод): пул `TG_API_ENDPOINTS` с health-check `getMe`, проверкой SNI/цепочки, backoff и метриками; дублирующий канал критичных алертов (e-mail)
   - Приёмка: `docs/tz/10 §10.7`, `AC-telegram-04`, `docs/research/03 §3.4`; живой адрес сейчас только `149.154.167.220:443`; дайджест и тестовый алерт реально доставлены с прод-площадки; при недоступности всех адресов — статус «канал Telegram: деградация» в панели ≤60 с
   - Проверка: `tests/integration/test_tg_transport.py` (переключение, подмена имени в сертификате → отказ от адреса + алерт), ручной прогон `/status` с прод-ВМ
