@@ -137,11 +137,27 @@
     остался; `alembic check` приёмкой схемы не стал (эвристика Alembic на `server_default` даёт
     фантомные различия на приводимых типах). Решения сверх буквального §4.1 вынесены заказчику:
     семь мест перечислены в `docs/HANDOFF.md §4`, обзор среза — `§1.21`.
-  - Остаток (второй срез): `deploy/postgres/roles.sql` + `test_audit_append_only_role` — по
-    `AC-identity-04` роль приложения не имеет на `audit_log` ни `UPDATE`, ни `DELETE`
-    (триггер-«запретить правку» не делается намеренно: критерий требует **найти** изменённую
-    вручную копию дампа по цепочке хэшей). Затем `pull` + `run --rm migrate` на площадке и
-    протокол приёмки в `docs/acceptance/`.
+  - Статус 2026-11-20 (второй срез): права выданы на уровне базы — `deploy/postgres/roles.sql`
+    (роль `tbot_app`: без права входа и без прав кластера, полный DML по `public`, отзыв
+    `UPDATE`/`DELETE`/`TRUNCATE`/`REFERENCES`/`TRIGGER` на `audit_log`, `ALTER DEFAULT
+    PRIVILEGES` на таблицы и `USAGE` на последовательности, `REVOKE CREATE ON SCHEMA public
+    FROM PUBLIC`), идемпотентно, без секретов (ADR-004). Реестр «только дописываемых» таблиц —
+    `APPEND_ONLY_TABLES` в `packages/storage/base.py`. Проверки: `test_audit_append_only_role`
+    и ещё 7 проверок поведения на живой базе (`tests/integration/test_postgres_roles.py`, CI job
+    `migrations`) и 8 офлайн-проверок файла прав (`tests/contract/test_db_roles.py`: реестр ↔
+    перечень `REVOKE`, секретов в файле нет, `GRANT ALL` и прав `PUBLIC` нет, шаги CI на месте).
+    Порядок применения закреплён в `docs/runbook/postgres-roles.md` (§3 миграции → права, §4
+    проверка через `SET ROLE` с ожиданием `SQLSTATE 42501`, §5 переключение, §6 откат). В job'е
+    `migrations` исправлена установка зависимостей: был `pip install -e .` без dev-экстры, шаг с
+    тестами падал с «No module named pytest».
+  - Остаток — платформенный: `pull` + `run --rm migrate` + `deploy/postgres/roles.sql` на
+    площадке, и переключение приложения на `tbot_app` (`docs/runbook/postgres-roles.md §5`;
+    без него `REQ-identity-04` на живой ВМ не действует, потому что приложение ходит владельцем
+    схемы, а у владельца `REVOKE` прав не отнимает — вопрос заказчику в `docs/HANDOFF.md §4`).
+    После этого — протокол приёмки в `docs/acceptance/`.
+  - Явно не входит в задачу: `make audit-verify` (вторая половина `AC-identity-04` — поиск
+    разрыва в изменённой копии дампа, TZ §14.10) и триггер «запретить правку журнала»
+    (критерий требует находить подделку по цепочке хэшей, а не делать её невозможной).
 - [ ] **T-010** Параметры рабочей ВМ (`153.51.172.30`): лимиты Postgres под 3.8 ГиБ, swap, ретенция-конфиг, алерты диска — раньше задача формулировалась как «инфраструктура test-стенда (`192.168.1.40`)»
   - Приёмка: TZ §14.2 (все ограничения применены), замеры задокументированы
   - Проверка: `nproc/free -h/df -h` → протокол, или целиком `python3 scripts/prod_bootstrap_check.py`;
