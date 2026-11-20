@@ -19,6 +19,11 @@
 *.po text eol=lf
 *.pot text eol=lf
 
+# Файлы хоста из deploy/vps их читает bash на Linux (парсер ufw.rules, jail.local):
+# CRLF в рабочих копиях Windows ломает разбор тихо, без ошибки.
+deploy/vps/*.rules text eol=lf
+deploy/vps/*.local text eol=lf
+
 *.png binary
 *.jpg binary
 *.ico binary

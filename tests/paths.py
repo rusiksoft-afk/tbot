@@ -15,6 +15,7 @@ POSTGRES_CONF = DEPLOY / "postgres" / "tbot.conf"
 DOCKERFILE = DEPLOY / "Dockerfile"
 CONFIG_EXAMPLE = ROOT / "configs" / "tbot.example.yaml"
 CA_FILE = DEPLOY / "ca" / "ru-trusted-root-ca.pem"
+VPS = DEPLOY / "vps"
 SCRIPTS = ROOT / "scripts"
 
 

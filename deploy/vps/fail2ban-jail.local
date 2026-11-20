@@ -1,0 +1,27 @@
+# fail2ban для рабочей ВМ (TZ §8.3 «fail2ban: 3 неудачи → бан 30 минут»; задача T-708).
+#
+# На площадке файл кладётся как /etc/fail2ban/jail.d/tbot.local (файлы из jail.d читаются
+# вместе с jail.conf, расширение .local не затирается апстримом при обновлении пакета).
+# Проверка: sudo fail2ban-client status sshd (счётчик Ban - сейчас и список забаненных).
+
+[DEFAULT]
+# Читаем journalctl: на Ubuntu 24.04 sshd пишет в journald, файла auth.log по умолчанию нет.
+backend = systemd
+
+bantime  = 1800
+findtime = 600
+maxretry = 3
+
+# Свой канал не перекрываем: loopback (через него идёт SOCKS-туннель) и приватная сеть ВМ.
+# Публичный адрес рабочей станции в список исключений НЕ вносится: учение с реальными
+# пробами ценнее удобства, а бан снимается одной командой
+# (sudo fail2ban-client set sshd unbanip <адрес>).
+ignoreip = 127.0.0.1/8 ::1 10.0.0.0/8 192.168.0.0/16
+
+# Постепенное удлинение бана при повторных нарушениях (30 мин → 1 ч → 2 ч, потолок 24 ч).
+bantime.increment = true
+bantime.maxtime   = 24h
+
+[sshd]
+enabled = true
+port    = 22
