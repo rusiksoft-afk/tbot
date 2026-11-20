@@ -26,15 +26,23 @@ gh run view <run-id> --repo rusiksoft-afk/tbot --log 2>/dev/null \
   | sed -E 's/pushing manifest for //' | sort -u
 ```
 
-Состояние на 2026-11-20 11:50 (commit `4fa1b51`, run `44689994900`):
+Состояние на 2026-11-20 14:40 MSK (commit `21579ba`, run `44708907667`):
 
 | Образ | Тег | Digest |
 | --- | --- | --- |
-| `ghcr.io/rusiksoft-afk/tbot-web` | `main`, `sha-4fa1b51` | `sha256:5705a7baf471c5f16ae8035774a600f2966e63e410b7ebc3725d19610d5f5fdc` |
-| `ghcr.io/rusiksoft-afk/tbot-tgbot` | `main`, `sha-4fa1b51` | `sha256:5d009e000b0fdc98732c37e969037dd775b99c8ad256e7a2cd7c04193dcc1a19` |
-| `ghcr.io/rusiksoft-afk/tbot-engine` | `main`, `sha-4fa1b51` | `sha256:b0740c89ae501ee4a6ad2940976e8fdad0e40b2214a37fe0361c407f57406b21` |
-| `ghcr.io/rusiksoft-afk/tbot-jobs` | `main`, `sha-4fa1b51` | `sha256:9adee970b314c4aed3b113137d26f9c8280a483b13e9e00cbd964b6770f832a3` |
+| `ghcr.io/rusiksoft-afk/tbot-web` | `main`, `sha-21579ba` | `sha256:c33283cf507dfd9245c48a8718ab07913d5b5578bf260698f1b7572c6985edbd` |
+| `ghcr.io/rusiksoft-afk/tbot-tgbot` | `main`, `sha-21579ba` | `sha256:413b1df8590ef8966f193afada7dc55280709b8b3ce6e8913128414fe68b9834` |
+| `ghcr.io/rusiksoft-afk/tbot-engine` | `main`, `sha-21579ba` | `sha256:ae6faf72422a9c2363fa457cce882ccdb22d4ca3656d159ac9648474eea33914` |
+| `ghcr.io/rusiksoft-afk/tbot-jobs` | `main`, `sha-21579ba` | `sha256:a88004338ed8b1563069fd6c4d0b9a4943c3f78deacdf33f370ecbc8ef32c0fc` |
 | `postgres` (публичный, Docker Hub) | `16.4` | `sha256:e62fbf9d3e2b49816a32c400ed2dba83e3b361e6833e624024309c35d334b412` |
+| `caddy` (публичный, Docker Hub) | `2` (v2.11.9) | `sha256:4851e54a46b206517c574821bb5cc67f170d2156041e9fbc4c9193b45e84a75b` |
+
+Предыдущий набор (он же точка отката по TZ §12.7: commit `4fa1b51`, run `44689994900`):
+web `sha256:5705a7ba…5fdc`, tgbot `sha256:5d009e00…1a19`, engine `sha256:b0740c89…6b21`,
+jobs `sha256:9adee970…5a3`. Полные значения — в истории git (`git show HEAD~1:deploy/tbot.prod.env`
+или более ранний коммит с сообщением «дайджесты образов пересняты»); именно поэтому файл
+`deploy/tbot.prod.env` обязан обновляться **одним** коммитом вместе с номером commit и номером
+прогона.
 
 `postgres` берётся не из GHCR, но тоже пинится по digest: сборка CI и площадка должны получать
 один и тот же образ базы, иначе «учение на площадке» проверяет не ту версию, что в CI. Проверка
