@@ -31,11 +31,13 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# Артефакт в репозитории и его место в образе/на хосте. В образе файл лежит в подкаталоге `tbot`,
-# чтобы не столкнуться с одноимённым файлом из другого пакета (см. deploy/Dockerfile).
+# Артефакт в репозитории и его место в образе/на хосте. Расширение `.crt` и верхний уровень
+# каталога — требование Debian: `update-ca-certificates` читает только `*.crt` из
+# `/usr/local/share/ca-certificates`, файл `*.pem` или файл в подкаталоге он не замечает
+# (проверено в CI: сборка оставалась зелёной, а связки — без корня).
 CA_FILE = ROOT / "deploy" / "ca" / "ru-trusted-root-ca.pem"
-CA_IMAGE_DIR = "/usr/local/share/ca-certificates/tbot"
-CA_IMAGE_FILE = f"{CA_IMAGE_DIR}/ru-trusted-root-ca.pem"
+CA_IMAGE_DIR = "/usr/local/share/ca-certificates"
+CA_IMAGE_FILE = f"{CA_IMAGE_DIR}/ru-trusted-root-ca.crt"
 CA_SYSTEM_BUNDLE = "/etc/ssl/certs/ca-certificates.crt"
 
 # Якорь доверия: SHA-256 DER-тела корня НУЦ «Russian Trusted Root CA»

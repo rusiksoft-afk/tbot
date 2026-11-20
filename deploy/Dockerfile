@@ -36,9 +36,12 @@ LABEL org.opencontainers.image.source="https://github.com/rusiksoft-afk/tbot" \
 RUN groupadd --gid 10001 tbot \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin tbot
 
-# Корневой сертификат НУЦ: каталог существует и без .crt, чтобы сборка M0 не падала;
-# наличие и отпечаток проверяет scripts/deploy_check.py (T-709, REQ-broker-gateway-02).
-COPY deploy/ca/ /usr/local/share/ca-certificates/tbot/
+# Корневой сертификат НУЦ: имя и расположение задаёт scripts/ca_policy.py (CA_IMAGE_FILE).
+# Debian `update-ca-certificates` читает только файлы `*.crt` в верхнем уровне
+# `/usr/local/share/ca-certificates`: вариант «`ru-trusted-root-ca.pem` в подкаталоге `tbot/`»
+# собирался зелёным, а в связку корень не попадал (проверено в CI job `compose-smoke`).
+# Подкаталог не случаен: в верхнем уровне имя файла уникально, но расширение — обязательное `.crt`.
+COPY deploy/ca/ru-trusted-root-ca.pem /usr/local/share/ca-certificates/ru-trusted-root-ca.crt
 RUN update-ca-certificates
 
 COPY --from=builder /opt/venv /opt/venv

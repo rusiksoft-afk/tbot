@@ -260,27 +260,44 @@ def test_образ_запускается_от_ne_root() -> None:
     assert "USER 10001:10001" in dockerfile
 
 
-def test_образ_кладёт_корень_нц_до_пересборки_связки_доверия() -> None:
-    """Порядок шагов в Dockerfile — единственное, что гарантирует доверие к брокеру в образе.
+def test_образ_кладёт_корень_так_как_ожидает_его_debian() -> None:
+    """`update-ca-certificates` в Debian читает только `*.crt` из верхнего уровня каталога якорей.
 
-    `update-ca-certificates` пересобирает `/etc/ssl/certs/ca-certificates.crt` из того, что уже
-    лежит в `/usr/local/share/ca-certificates`. Если копирование корня идёт после этого шага,
-    сборка выглядит успешной, а доверия в образе нет: приложение спотыкается уже в бою, где
-    сеть к брокеру есть, а корня нет. Поведенчески это проверяет шаг compose-smoke «корень НУЦ
-    установлен в системный набор доверия образа», а порядок закрепляется здесь.
+    Первый вариант Dockerfile клал файл как `…/ca-certificates/tbot/ru-trusted-root-ca.pem`:
+    сборка и `up --wait` были зелёными, контейнер запускался, а корня в
+    `/etc/ssl/certs/ca-certificates.crt` не было — то есть доверия к брокеру в образе не
+    существовало, и обнаружилось бы это только в бою. Поэтому здесь закреплены сразу три вещи:
+    имя файла с расширением `.crt`, отсутствие подкаталога и порядок шагов (COPY раньше
+    пересборки связки). Поведенчески это же проверяет шаг compose-smoke.
     """
     ca_policy = load_script("ca_policy")
     dockerfile = DOCKERFILE.read_text(encoding="utf-8")
-    copy_marker = f"COPY deploy/ca/ {ca_policy.CA_IMAGE_DIR}/"
+    assert ca_policy.CA_IMAGE_FILE.endswith(
+        ".crt"
+    ), "расширение `.crt` — условие, при котором Debian вообще смотрит на файл якоря"
+    assert (
+        ca_policy.CA_IMAGE_DIR == "/usr/local/share/ca-certificates"
+    ), "подкаталог в каталоге якорей Debian не обходится: файл должен лежать в верхнем уровне"
+    copy_marker = f"COPY deploy/ca/ru-trusted-root-ca.pem {ca_policy.CA_IMAGE_FILE}"
     assert copy_marker in dockerfile, (
-        f"в Dockerfile нет копирования корня в {ca_policy.CA_IMAGE_DIR} — каталог якорей "
-        "разошёлся с scripts/ca_policy.py"
+        f"в Dockerfile нет копирования корня в {ca_policy.CA_IMAGE_FILE} — путь разошёлся "
+        "с scripts/ca_policy.py"
     )
-    copy_at = dockerfile.index(copy_marker)
-    update_at = dockerfile.index("update-ca-certificates")
-    assert copy_at < update_at, (
-        "`update-ca-certificates` исполняется раньше, чем скопирован корень: связка доверия "
-        "образа останется без него"
+    # Порядок ищется по инструкциям, а не по подстроке: комментарий про
+    # `update-ca-certificates` тоже упоминает команду, но командой не является.
+    copy_line = next(
+        number
+        for number, line in enumerate(dockerfile.splitlines(), start=1)
+        if line.strip() == copy_marker
+    )
+    update_line = next(
+        number
+        for number, line in enumerate(dockerfile.splitlines(), start=1)
+        if line.strip().startswith("RUN") and "update-ca-certificates" in line
+    )
+    assert copy_line < update_line, (
+        f"`update-ca-certificates` (строка {update_line}) исполняется раньше, чем скопирован "
+        f"корень (строка {copy_line}): связка доверия образа останется без него"
     )
 
 

@@ -202,37 +202,52 @@ jobs:
         run: |
           # Половинка AC-broker-gateway-02 «с установленным корнем соединение обязано состояться»,
           # проверенная в самом образе: файл кладёт deploy/Dockerfile, а связку пересобирает
-          # update-ca-certificates внутри образа. Отпечаток берётся из scripts/ca_policy.py.
+          # update-ca-certificates внутри образа. Отпечаток передаётся из scripts/ca_policy.py —
+          # единственного места, где он закреплён; путь внутри образа здесь не повторяется: файл
+          # ищется среди якорей, которые образ реально показал.
           set -euo pipefail
           expected=$(python3 scripts/ca_policy.py --print-fingerprint)
           docker compose -f deploy/compose.yaml -f deploy/compose.override.yaml \
             exec -T engine python - "$expected" <<'PY'
-          import base64, hashlib, re, sys
+          import base64, hashlib, pathlib, re, socket, ssl, sys
 
           wanted = sys.argv[1]
+          anchors = pathlib.Path("/usr/local/share/ca-certificates")
+          bundle = pathlib.Path("/etc/ssl/certs/ca-certificates.crt")
+          hosts = ("invest-public-api.tbank.ru", "sandbox-invest-public-api.tbank.ru")
 
           def blocks(text: str) -> list[str]:
               return re.findall(
                   r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", text, re.S
               )
 
-          root = open("/usr/local/share/ca-certificates/tbot/ru-trusted-root-ca.pem").read()
-          found = blocks(root)
-          if len(found) != 1:
-              raise SystemExit(f"в образе ожидался один корень, найдено {len(found)}")
-          fingerprint = hashlib.sha256(base64.b64decode("".join(found[0].split()))).hexdigest()
-          if fingerprint != wanted:
-              raise SystemExit(f"образ содержит корень {fingerprint}, закреплён {wanted}")
-          store = {
-              hashlib.sha256(base64.b64decode("".join(block.split()))).hexdigest()
-              for block in blocks(open("/etc/ssl/certs/ca-certificates.crt").read())
-          }
-          if fingerprint not in store:
+          def fingerprints(path: pathlib.Path) -> dict[str, str]:
+              result: dict[str, str] = {}
+              for block in blocks(path.read_text(encoding="utf-8", errors="replace")):
+                  result[hashlib.sha256(base64.b64decode("".join(block.split()))).hexdigest()] = str(path)
+              return result
+
+          copied: dict[str, str] = {}
+          for item in sorted(p for p in anchors.rglob("*") if p.is_file()):
+              copied.update(fingerprints(item))
+          if wanted not in copied:
               raise SystemExit(
-                  "корень НУЦ не попал в /etc/ssl/certs/ca-certificates.crt: "
-                  "update-ca-certificates в образе не отработал"
+                  f"корень НУЦ не скопирован в {anchors}: найдено {sorted(set(copied.values()))}"
               )
-          print(f"OK: корень {fingerprint[:16]}… входит в системный набор образа ({len(store)} якорей)")
+
+          store = set(fingerprints(bundle))
+          if wanted not in store:
+              raise SystemExit(
+                  f"{copied[wanted]} в образе есть, но в {bundle} его нет: Debian читает только "
+                  f"*.crt верхнего уровня {anchors} — проверьте расширение и каталог"
+              )
+
+          for host in hosts:
+              context = ssl.create_default_context()
+              with socket.create_connection((host, 443), timeout=20) as sock, \
+                      context.wrap_socket(sock, server_hostname=host) as tls:
+                  print(f"OK {host}: цепочка доверена набору образа ({tls.version()})")
+          print(f"OK: корень {wanted[:16]}… из {copied[wanted]} входит в {bundle} ({len(store)} якорей)")
           PY
       - name: у контейнера базы нет исходящего трафика
         # В образе postgres нет python3 (debian-slim + postgresql без recommends), поэтому
