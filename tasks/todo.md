@@ -469,6 +469,13 @@
   - Приёмка: TZ §14.6; `docker compose config` валиден; конвейер `pull → migrate → restart` воспроизведён
   - Проверка: учебный деплой предыдущей версии и откат (TZ §12.7)
   - Файлы: `deploy/compose.yaml`, `deploy/compose.prod.yaml`, `deploy/tbot.prod.env`, `deploy/vps/docker-daemon.json`
+  - Статус 2026-11-20 (вечер, остаток): конвейер `pull → migrate → restart` **воспроизведён на
+    площадке** на наборе digest от `d35f957` (Image run 44773842577): `docker login` (логин
+    `rusiksoft-afk`) → `pull -q` → `run --rm migrate` (`0001`, exit 0) → `up -d web caddy` →
+    `up -d caddy` после правки публикации → `systemctl restart docker` (все контейнера `healthy`
+    через 6 с). Ротация логов `json-file 50m×10` и hardening подтверждены раньше
+    (`docs/acceptance/prod-firewall.md §5`). Остаток один: **учебный откат** на предыдущий набор
+    digest из истории (`1ce4be6`, Image run 44721673799) и возврат на текущий — TZ §12.7.
   - Статус 2026-11-20: **половина принята** — Docker Engine 29.1.3 (`docker.io`) и compose v2 2.40.3
     (`docker-compose-v2`: в Ubuntu нет пакета `docker-compose-plugin`, это имя из вендорного
     Docker CE), юнит active+enabled, `/etc/docker/daemon.json` из `deploy/vps/docker-daemon.json`
@@ -618,6 +625,27 @@
     подключении psycopg3 (`HANDOFF §1.17`), и из-за этого `caddy` не стартует. Задача остаётся
     `[in progress]`: без приёма
     80/443 наружу она не закрывается ни при каких условиях.
+  - 2026-11-20 16:35–16:43 UTC: **контур поднят целиком, приёмка 80/443 пройдена** (`postgres`,
+    `migrate` = `0001`, `web` healthy, `caddy`). Цифры и вердикты — `docs/acceptance/tls-edge.md §9`:
+    сертификат Let's Encrypt `CN=tbot.rusiksoft.ru` (notAfter `Feb 18 2027`), `https://…/healthz`
+    и `/readyz` → 200 через прокси, `http://…` → `308` на `https`, TLS 1.0/1.1 отвергнуты,
+    1.2/1.3 работают, HSTS + CSP + `X-Frame-Options: DENY` + `nosniff` + `Referrer-Policy` +
+    `Permissions-Policy` в ответе, `Server`/`Via` с версией наружу нет, подставленные `Authorization`
+    и `Cookie` в `docker logs` (`caddy` и `web`) не появились, `systemctl restart docker` —
+    все три контейнера `healthy` через 6 с, сертификат не перевыпущен (том `caddy_data` жив,
+    лимит ACME не потрачен), `ufw` = 22/80/443 tcp + 443 udp.
+  - Находка живого замера: **`Alt-Svc: h3` при отсутствующем UDP-слушателе**. Overlay публиковал
+    только `80:80`/`443:443`, Docker публикует UDP отдельной строкой → QUIC внутри контейнера есть,
+    на хосте нет; probe на UDP/443 давал ICMP port unreachable, `ss -lntup` — ни одного udp 443.
+    Исправлено `ba6d687`: `"443:443/udp"` в overlay, `prod_compose_check.py` учитывает протокол
+    (`{80:80/tcp, 443:443/tcp, 443:443/udp}`), контракт `h3 ↔ ufw` требует публикацию. После
+    `up -d caddy` QUIC Initial получает ответ Version Negotiation (35 байт, `version_field=0`) —
+    HTTP/3 подтверждён транспортом, а не заголовком.
+  - Что осталось по `T-713`: (1) поведение после **ребута** площадки — учения TZ §13.5 согласуются
+    отдельно, ребута ещё не было; (2) проверка подмешанного http-контента невозможна, пока у панели
+    нет настоящих HTML-страниц → перенесена в `T-301`; (3) алерт на срок сертификата (TZ §12.4)
+    оформлен отдельной задачей `T-716`, теперь он обязателен: контур живой. Ограничитель частоты
+    запросов — прикладной (`T-102`), к периметру не относится.
 
 - [ ] **T-715** Проба читаемости секрета изнутри контейнера в CI (дефект ADR-005 не должен доезжать
   до площадки)
@@ -636,6 +664,21 @@
     имена из `deploy/compose.prod.yaml`), но не факт, что процесс под `uid 10001` файл читает.
     Разбор: `docs/adr/ADR-005-secret-file-modes-for-container-readability.md`,
     `docs/runbook/secrets-on-host.md §2.1`, `docs/runbook/stand-deploy.md §9`.
+
+- [ ] **T-716** Алерт на срок сертификата TLS-периметра (после включения контура он обязателен)
+  - Приёмка: алерт срабатывает до истечения сертификата (порог обсудить: кандидат — 14 суток,
+    у Let's Encrypt выпуск за 30 суток до конца срока), код — `SYSTEM` из TZ §10.3; проверка —
+    поддельная дата в служебном прогоне, не ожидание реального истечения.
+  - Проверка: `make deploy-check` уже печатает сроки сертификатов (§12.7 «версия, сертификаты,
+    NTP offset»), но печать — не алерт: нужен путь «правило → код оповещения → канал Telegram».
+  - Файлы: `docs/tz/12-observability-and-ops.md` (§12.4 — строки про срок сертификата в таблице
+    сейчас **нет**, её добавление требует разрешения заказчика), `apps/jobs` (планировщик),
+    `scripts/deploy_check.py`, `docs/runbook/`
+  - Повод: с 2026-11-20 16:36 UTC периметр живой и сертификат выпущен по-настоящему
+    (`notAfter Feb 18 2027`), том `caddy_data` переживает `systemctl restart docker`
+    (`docs/acceptance/tls-edge.md §9`, строки 2–3). Молчаливый провал обновления — это падение
+    HTTPS на `tbot.rusiksoft.ru` без единого сообщения; повторный выпуск при лимите
+    Let's Encrypt 5/неделю (`AGENTS.md`) тоже не произойдёт незаметно.
 
 ## Позже (вне M0–M7, зафиксировано объёмом ТЗ)
 

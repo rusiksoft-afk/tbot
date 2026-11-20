@@ -248,16 +248,37 @@ echo | openssl s_client -connect 153.51.172.30:443 -servername tbot.rusiksoft.ru
   | openssl x509 -noout -issuer -subject -ext subjectAltName -dates
 ```
 
-HTTP/3 (после того как `443/udp` подтверждён в SG и `ufw`, `ADR-003 §5`):
+HTTP/3 (после того как `443/udp` подтверждён в SG и `ufw`, `ADR-003 §5`). Доказательство — живой
+UDP-слушатель, а не заголовок `Alt-Svc`: `Alt-Svc` появляется и тогда, когда QUIC никто не слушает
+(так и было на площадке до `ba6d687`, см. §11). `curl` без nghttp3 здесь бесполезен, поэтому проба —
+QUIC Initial с заведомо неизвестным version: сервер обязан ответить Version Negotiation.
 
 ```bash
-curl -sSI --http3 https://tbot.rusiksoft.ru/healthz     # нужен curl с nghttp3
+# площадка: слушатель обязан быть и v4, и v6
+sudo ss -lntup | grep ':443'          # нужен и tcp, и udp
+# dev-машина (любой python, без nghttp3): ждём ~35-байтный ответ с version_field=0
+.venv/Scripts/python.exe - <<'PY'
+import socket, os
+dcid, scid = os.urandom(8), os.urandom(8)
+pkt = bytearray([0xC0]) + (0x0a0a0a0a).to_bytes(4, 'big')
+pkt += bytes([8]) + dcid + bytes([8]) + scid + b'\x00\x00\x00\x00' + os.urandom(1179)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.settimeout(5)
+s.sendto(bytes(pkt), ('153.51.172.30', 443))
+try:
+    d, _ = s.recvfrom(4096)
+    print('quic_reply=', len(d), 'VN=', int.from_bytes(d[1:5], 'big') == 0)
+except Exception as e:
+    print('quic_reply=FAIL', type(e).__name__)   # ConnectionResetError = UDP/443 не публикуется
+PY
+# альтернатива, если curl собран с HTTP/3:
+curl -sSI --http3 https://tbot.rusiksoft.ru/healthz
 ```
 
-Если `curl` без HTTP/3, достаточным доказательством остаётся счётчик правила `ufw`
-(`docs/acceptance/tls-edge.md §3.6`).
+Замер 2026-11-20 16:41 UTC: `quic_reply= 35 VN= True`; до исправления публикации —
+`ConnectionResetError` (ICMP port unreachable).
 
-Журнал прокси: `sudo docker logs caddy` — в строках доступа query-параметры `token`, `key`, `sig` и
+Журнал прокси: `sudo docker logs tbot-caddy-1` (имя контейнера на площадке — с префиксом состава,
+просто `caddy` его не находит) — в строках доступа query-параметры `token`, `key`, `sig` и
 заголовок `X-Api-Key` обязаны быть `REDACTED` (TZ §8.4). Проверить можно на своём же запросе с
 фиктивным токеном в query: значение в логе найтись не должно.
 
@@ -356,3 +377,27 @@ PY"
 потом `pull` и `up -d web caddy` на площадке. Правка «на живую» (пересборка образа руками на ВМ)
 ломает прослеживаемость деплоя и приёмку по digest — так делать нельзя.
 
+## 11. `Alt-Svc: h3` при отсутствующем UDP-слушателе: публикация `443:443/udp` (2026-11-20)
+
+Симптом: в ответе есть `Alt-Svc: h3=":443"; ma=2592000`, `ufw` пропускает `443/udp`, в Caddyfile —
+`protocols h1 h2 h3`, и при этом probe на UDP/443 получает ICMP port unreachable
+(`ConnectionResetError`), а `sudo ss -lntup` не показывает ни одного udp-слушателя на 443. Браузер
+после первого визита получает `Alt-Svc`, уходит в QUIC и получает тайм-аут: часть клиентов видит
+нерабочий сайт при полностью «зелёной» приёмке tcp.
+
+Причина: Docker публикует UDP **только отдельной строкой** с суффиксом `/udp`. Строка `"443:443"`
+публикует tcp; UDP-публикации нет — значит docker-proxy не поднимает udp, хотя внутри контейнера
+Caddy QUIC слушает. Проверки, которые это пропускали: `docker compose config --quiet` (конфиг
+валиден), `prod_compose_check.py` (до `ba6d687` сводил публикации к паре `хостовый:контейнерный` без
+протокола, поэтому `{80:80, 443:443}` совпадало с ожидаемым), контрактный тест `h3 ↔ ufw` (он сверяет
+Caddyfile и `ufw.rules`, а не публикации) и `--check` секретов (к портам отношения не имеет).
+
+Лечение: в `deploy/compose.prod.yaml` у `caddy` рядом с tcp-строками обязано стоять `"443:443/udp"`;
+`scripts/prod_compose_check.py` требует `{80:80/tcp, 443:443/tcp, 443:443/udp}` и различает протоколы
+в обеих формах записи портов; контракт `h3 ↔ ufw` дополнен проверкой публикации
+(`tests/integration/test_compose_prod_contract.py`). После правки — `up -d caddy` и повторная проба
+из §6 (`ss -lntup` + QUIC Version Negotiation). На площадке проба после исправления: udp 443 (v4/v6)
+в `ss`, `quic_reply= 35 VN= True`.
+
+Общий вывод для будущих проверок периметра: заголовок, правило файрвола и конфиг приложения — это
+обещание транспорта; слушатель на хосте проверяется отдельной командой (`ss -lntup`, а не `ss -lntp`).
