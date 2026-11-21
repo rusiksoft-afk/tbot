@@ -140,10 +140,63 @@ sudo TBOT_DB_USER=tbot_app bash /opt/tbot/deploy/vps/secrets-setup.sh --only db_
 # 3) Форма значений.
 sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --check
 
-# 4) Перезапуск сервисов приложения (списком сервисов, не всего состава) и проверка, под кем ходит процесс.
-$COMPOSE up -d web engine jobs
-$COMPOSE exec -T web python -c "from packages.common.config import load_settings; from packages.common.db import engine_from_settings; import sqlalchemy as sa; e = engine_from_settings(load_settings()); print(e.connect().execute(sa.text('select current_user')).scalar())"
+# 4) Перезапуск сервисов приложения (списком сервисов, не всего состава).
+#    ВАЖНО: `up -d` контейнер НЕ пересоздаёт, если состав не менялся — путь секрета тот же,
+#    hash конфигурации тот же. Замер 2026-11-21: после пересборки `db_url` `up -d web` дал
+#    `Container tbot-web-1 Started` без пересоздания, и процесс продолжал держать прежний DSN.
+#    Смена содержимого файла секрета требует `restart` (или `up -d --force-recreate`).
+$COMPOSE restart web engine jobs
+
+# 5) Под кем ходит процесс. Две пробы, обе измеримые:
+#    (а) конфиг внутри контейнера — разбор DSN из смонтированного файла (значение не печатается);
+$COMPOSE exec -T web python -c "import urllib.parse, pathlib; print(urllib.parse.urlparse(pathlib.Path('/run/secrets/db_url').read_text().strip()).username)"
+#    (б) серверное доказательство: временная авторизация в журнале Postgres. `log_connections`
+#    — уровень postmaster, возвращается тем же RESET; окно включения — секунды.
+$COMPOSE exec -T postgres psql -U tbot -d tbot -q   -c "ALTER SYSTEM SET log_connections = on" -c "select pg_reload_conf()"
+curl -sS -m 10 -o /dev/null -w '%{http_code}
+' https://tbot.rusiksoft.ru/readyz
+sudo docker logs --since 60s tbot-postgres-1 2>&1 | grep 'connection authorized' | tail -3
+$COMPOSE exec -T postgres psql -U tbot -d tbot -q   -c "ALTER SYSTEM RESET log_connections" -c "select pg_reload_conf()"
 ```
+
+Ожидаемое: в (а) — `tbot_app`; в (б) — строки вида
+`tbot_app@tbot LOG:  connection authorized: user=tbot_app database=tbot` (административные
+`psql`-сессии при этом дают `user=tbot`). Поллинг `pg_stat_activity` для этого не годится:
+соединение пробы `/readyz` живёт меньше миллисекунды и при выборке раз в 0,1 с не попадает
+(замер 2026-11-21: 40 параллельных запросов + `\watch 0.1` — ни одного попадания).
+
+Проверка прав «в бою» — тем же путём, что и приложение (образ, секрет, `psycopg_dsn`):
+
+```bash
+$COMPOSE exec -T web python - <<'PY'
+import psycopg
+from packages.common.config import load_settings
+from packages.common.db import psycopg_dsn
+
+with psycopg.connect(psycopg_dsn(load_settings().db_url.get_secret_value())) as c:
+    print("роль:", c.execute("select current_user").fetchone()[0])
+    for name, stmt in (("UPDATE", "UPDATE audit_log SET action='x' WHERE id IN (SELECT id FROM audit_log LIMIT 1)"),
+                       ("DELETE", "DELETE FROM audit_log WHERE id IN (SELECT id FROM audit_log LIMIT 1)"),
+                       ("TRUNCATE", "TRUNCATE audit_log")):
+        c.execute("SAVEPOINT p")
+        try:
+            c.execute(stmt)
+            print(name, "audit_log: РАЗРЕШЁН")
+        except psycopg.Error as exc:
+            print(name, "audit_log: sqlstate =", exc.sqlstate)
+        c.execute("ROLLBACK TO SAVEPOINT p")
+    print("строк журнала:", c.execute("select count(*) from audit_log").fetchone()[0])
+PY
+```
+
+Значение `import engine_from_settings` в прежней редакции runbook не существует: в
+`packages/common/db.py` — `sqlalchemy_url()`/`psycopg_dsn()`, а приложение (`apps/web/main.py`)
+работает с psycopg напрямую. Грабля намеренно оставлена текстом: пробы обязано запускать тем же
+путём доступа к базе, которым ходит процесс.
+
+Ещё одна грабля площадки: внутри `bash -s <<HEREDOC` команда `docker exec -i …` **съедает
+остаток скрипта** (stdin тот же поток) — скрипт обрывается без ошибки. Для команд без stdin
+пишутся без `-i` (или с `< /dev/null`).
 
 Ожидаемое в последней строке — `tbot_app`, а не `tbot`. Дальше проверка §4 должна дать тот же
 набор прав уже «в бою», а `web` — отвечать 200 через Caddy.
@@ -206,7 +259,7 @@ ALTER TABLE audit_log:              отказ SQLSTATE=42501
 ```bash
 $COMPOSE exec -T postgres psql -X -v ON_ERROR_STOP=1 -U tbot -d tbot   -c 'ALTER ROLE tbot_app NOLOGIN'
 sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --only db_url --force   # TBOT_DB_USER по умолчанию = tbot
-$COMPOSE up -d web engine jobs
+$COMPOSE restart web engine jobs      # restart, а не up -d: см. п. 4 §5
 ```
 
 Данные при этом не меняются: меняются только учётная запись в DSN и право входа роли

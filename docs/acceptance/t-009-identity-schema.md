@@ -1,14 +1,17 @@
 # Приёмка: схема идентичности и права роли приложения (T-009)
 
 Площадка: `153.51.172.30` (`compute-vm-2-4-74-ssd-1795094860175`, Yandex Cloud, Ubuntu 24.04.5 LTS,
-`fv48ibn5ff3ff5gd0e3v`). Дата работ: 2026-11-20. Основание: TZ §4.1 (`REQ-identity-04`,
+`fv48ibn5ff3ff5gd0e3v`). Даты работ: 2026-11-20 и 2026-11-21 (шаг переключения роли).
+Основание: TZ §4.1 (`REQ-identity-04`,
 `REQ-storage-01`, `REQ-storage-02`), §8.1–§8.4; ADR-003 (деплой разрешён), ADR-005 (права
 файлов секретов), ADR-002 (откат по digest). Задача — **T-009**, веха M1.
 
 Код: ревизия `migrations/versions/0002_identity_access.py`, модели `packages/storage/`,
 права `deploy/postgres/roles.sql`. Коммиты среза: `028902b` (модели + ревизия),
-`03c7eca` (права роли + тесты), `df03e89` (пересъёмка digest'ов). CI: прогон
-`44799084782` (схема и права на живой Postgres 16.4) и `44800434747` (все 9 job'ов зелёные).
+`03c7eca` (права роли + тесты), `df03e89` (пересъёмка digest'ов), `ae4662f` (вариант Б:
+миграции ролью приложения + возврат владения журналом), `5fab972` (guard роли запуска в п. 0).
+CI: прогоны `44799084782` и `44851684679` (схема — 9 проверок, права — 10, живая база
+PostgreSQL 16.4), `44800434747` и `44848903053` (все 9 job'ов зелёные).
 
 ## 1. Что принималось и чем проверяется
 
@@ -157,29 +160,75 @@ http=200  healthz http=200
 `postgres` и `caddy` не пересоздавались (digestы не менялись), том `pgdata` и том `caddy_data`
 не трогались — сертификат Let's Encrypt остаётся в томе (лимит выпуска 5 на домен в неделю).
 
-## 4. Что приёмка НЕ доказывает (остаток T-009)
+### 3.7 Шаг переключения: приложение ходит ролью приложения (2026-11-21 01:44–01:52 UTC)
 
-1. **Приложение ходит ролью-владельцем.** В `db_url` — роль `tbot`: она владелец схемы и
-   суперпользователь кластера (`POSTGRES_USER`). У владельца таблицы `REVOKE` прав не отнимает,
-   поэтому append-only, выданный `roles.sql`, к работе `web` пока не относится. Замер §3.5 получен
-   через `SET ROLE`, то есть доказывает модель прав, а не факт применения к процессу.
-2. **Измеренное препятствие для шага переключения.** Секрет `db_url` смонтирован четырём
-   сервисам — `web`, `engine`, `jobs` **и `migrate`** (`deploy/compose.yaml`, `migrate.command =
-   alembic upgrade head`). Заменить `db_url` на роль приложения — значит перевести на неё и
-   миграции, а под `tbot_app` `CREATE TABLE` уже отказывает (`42501 permission denied for schema
-   public`, замер §3.5). Значит следующая ревизия (M1: `T-101…T-106` создают таблицы) на площадке
-   упадёт. Варианты и их цена — `docs/runbook/postgres-roles.md §5.1`; выбор за заказчиком,
-   потому что один из вариантов меняет перечень секретов состава и TZ §14.9.
-3. **Общий пароль ролей не даёт жёсткой границы.** При выбранном общем пароле `tbot_app` и `tbot`
-   приложение знает свой DSN — а значит знает и пароль роли-владельца, и может войти под ним.
-   Отзыв прав остаётся политикой, а не границей. Жёсткая граница требует разных паролей и двух
-   DSN-секретов (прикладного и владельца) — см. тот же §5.1.
-4. **Вторая половина `AC-identity-04`** (найти изменённую вручную копию дампа по цепочке хэшей) —
-   `make audit-verify`, задача T-109; в T-009 не входила.
+Шаг сделан по решению заказчика (ask `8d2be9bb`: вариант Б — миграции идут ролью приложения,
+пароль роли общий с `db_password`). Перед шагом снято «до»:
 
-Итог по `AC-identity-04` в границах T-009: **принято** — журнал не редактируется правами роли,
-которой приложение будет работать (CI + площадка, коды `42501`); **не принято** — применение этих
-прав к работающему приложению (шаг переключения, п. 1–3).
+```
+роль: tbot | superuser: True
+UPDATE audit_log: РАЗРЕШЁН   DELETE audit_log: РАЗРЕШЁН   TRUNCATE audit_log: РАЗРЕШЁН
+```
+
+Замер из контейнера `web` тем же путём к базе, которым ходит процесс (`psycopg_dsn` из
+секрета `db_url`). То есть до шага приложение могло править, удалять и очищать журнал —
+`REQ-identity-04` на площадке не действовало физически.
+
+Порядок шага и замеры:
+
+| Шаг | Команда (сокращённо) | Результат |
+| --- | --- | --- |
+| права обновлены | `psql -f - < /opt/tbot/deploy/postgres/roles.sql` | `rc=0`; `has_schema_privilege(tbot_app,'public','create') = t`, `has_table_privilege(tbot_app,'audit_log','update') = f`, владелец журнала `tbot` |
+| guard роли запуска | тот же сеанс: `SET ROLE tbot_app;` + содержимое файла | `ERROR: roles.sql обязан запускаться ролью-владельцем схемы, не приложением (п. 0 файла прав)`, `psql_rc=3`; права не изменились |
+| возврат владения (моделирование следующей ревизии) | `ALTER TABLE audit_log OWNER TO tbot_app` → снова `roles.sql` | после передачи: владелец `tbot_app`, `update = t` (у владельца отзыв не работает); после файла прав: владелец `tbot`, `select = t`, `insert = t`, `update/truncate/references/trigger = f` |
+| пароль и вход роли приложения | `psql` c `\set pw \`cat /run/secrets/db_password\`` → `ALTER ROLE tbot_app PASSWORD :'pw'; ALTER ROLE tbot_app LOGIN;` | `rc=0`; в `pg_authid`: `tbot_app` — `rolcanlogin = t`, `rolsuper = f`, хэш `SCRAM-SHA-…`. Значение не печатается и не попадает в argv: его читает `psql` внутри контейнера |
+| DSN приложения | `TBOT_DB_USER=tbot_app secrets-setup.sh --only db_url --force` | `db_url: записано (97 байт)` (было 93); `--check` — пять `OK`, код 0; разбор DSN внутри контейнера: `user=tbot_app`, `scheme=postgresql+psycopg` |
+| перезапуск | `$COMPOSE restart web` | `tbot-web-1 Up (healthy)`. Отдельный замер: `up -d web` контейнер **не пересоздаёт** (состав и путь секрета не менялись), поэтому процесс продолжал держать прежний DSN — перезапуск обязателен |
+| серверное доказательство роли процесса | `ALTER SYSTEM SET log_connections = on` + `pg_reload_conf()`, затем 3 запроса через Caddy, затем `ALTER SYSTEM RESET` | `tbot_app@tbot LOG: connection authorized: user=tbot_app database=tbot` ×3 (административные `psql`-сессии в том же окне дают `user=tbot`). Настройка возвращена: `show log_connections` → `off`, `postgresql.auto.conf` чист. Поллинг `pg_stat_activity` не работает: соединение пробы живёт меньше миллисекунды (40 параллельных запросов + `\watch 0.1` — ни одного попадания) |
+| права «в бою» | та же проба из контейнера `web` | `роль: tbot_app`, `superuser: False`; `UPDATE`/`DELETE`/`TRUNCATE audit_log` → `sqlstate = 42501`; `INSERT` проходит (`id = 2`), транзакт свёрнут, `count(*) = 0`. В журнале Postgres те же отказы сервером: `tbot_app@tbot ERROR: permission denied for table audit_log` ×3 |
+| миграции под ролью приложения | `$COMPOSE run --rm migrate` | `rc=0`; отдельная проба образа migrate: `migrate session role: tbot_app`, `has CREATE on schema public: True`. Под способностью делать DDL — проба под `SET ROLE tbot_app`: `CREATE TABLE`/`ALTER TABLE`/`DROP TABLE` своей таблицы проходят, чужие объекты — отказ |
+| состояние площадки | `sudo python3 /opt/tbot/scripts/prod_bootstrap_check.py` | `ГОТОВО: блокирующих замечаний нет` (диск 61.50 ГиБ свободно) |
+| панель снаружи | `curl https://tbot.rusiksoft.ru/readyz` | `{"status":"ready", …, "checks":{"database":{"ok":true}}}`, `healthz=200`, HTTP/3 работает |
+
+Соответствие клона и закрепленного набора после этих коммитов: клон — `5fab972`, образы — из
+`3ac5849`; `git diff --name-only 3ac5849..HEAD` даёт `deploy/postgres/roles.sql`,
+`deploy/tbot.prod.env`, `tests/…` и документы — ни одного пути из перечня сборки образа
+(`apps/`, `packages/`, `deploy/Dockerfile`, `pyproject.toml`, `deploy/compose*.yaml`,
+`migrations/`, `deploy/caddy/`, `deploy/postgres/tbot.conf`), поэтому пересъёмка digest'ов не
+требовалась (правило — `docs/runbook/stand-deploy.md §2`).
+
+## 4. Вердикт и остаток
+
+`AC-identity-04` в границах `T-009`: **принято**.
+- журнал не редактируется правами роли, которой работает приложение — отказ `42501` на
+  `UPDATE`/`DELETE`/`TRUNCATE` при работающем `INSERT` (CI job `migrations`, 10 проверок;
+  площадка — проба из контейнера `web` и серверные строки Postgres);
+- приложение ходит НЕ владельцем журнала, владение возвращается файлом прав (замер с
+  моделированием следующей ревизии);
+- `REQ-storage-01` (цикл `upgrade head → downgrade base → upgrade head`) и `REQ-storage-02`
+  (нет вещественных типов, время с поясом) — CI + офлайн-контракт.
+
+Что приёмка **не** доказывает и что остаётся осознанным риском:
+
+1. **Общий пароль ролей — по решению заказчика (ask `8d2be9bb`).** Процесс, знающий свой DSN,
+   знает и пароль роли-владельца `tbot`, а `tbot` — суперпользователь кластера: отзыв прав
+   остаётся политикой, а не границей. Обнаружение подделки — цепочка хэшей и `make
+   audit-verify` (T-109), постфактум. Жёсткая граница потребовала бы отдельных паролей и двух
+   DSN-секретов (вариант А); таблица рисков и компенсирующих контролей варианта Б —
+   `docs/runbook/postgres-roles.md §5.1`.
+2. **Владение новыми таблицами — у роли приложения.** Таблицы, которые создадут ревизии M1,
+   будут принадлежать `tbot_app`; append-only держится только для таблиц реестра
+   `APPEND_ONLY_TABLES`, владение которыми возвращает `roles.sql`. Правило для каждой новой
+   таблицы журнала — имя в реестр + `ALTER TABLE … OWNER TO CURRENT_USER` + `REVOKE`
+   (сверяет контрактный тест `tests/contract/test_db_roles.py`, 11 проверок).
+3. **`AC-identity-04` вторая половина** — найти изменённую вручную копию дампа по цепочке
+   хэшей: `make audit-verify`, задача `T-109`. В `T-009` не входила (см. и `tasks/todo.md`).
+4. **`engine`, `jobs` и `tgbot` на площадке не запущены** (контур `sandbox`, торговля
+   отключена): их соединения под `tbot_app` будут проверены тем же способом при включении
+   контуров `paper`/`production`.
+
+Откат шага переключения — `docs/runbook/postgres-roles.md §6` (`ALTER ROLE tbot_app NOLOGIN` +
+пересборка `db_url` с пользователем по умолчанию + `restart`); данные не затрагиваются.
 
 ## 5. Откат
 
@@ -189,15 +238,12 @@ $COMPOSE run --rm migrate alembic downgrade 0001_app_meta
 
 # состав: прежний набор digest скачан, откат = прежние значения в deploy/tbot.prod.env (ADR-002)
 
-# права роли (полное снятие созданного roles.sql)
-sudo docker exec tbot-postgres-1 psql -U tbot -d tbot -v ON_ERROR_STOP=1 <<'SQL'
-BEGIN;
-REVOKE tbot_app FROM tbot;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM tbot_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM tbot_app;
-DROP ROLE IF EXISTS tbot_app;
-COMMIT;
-SQL
+# права роли (полное снятие созданного roles.sql) — без stdin: `docker exec -i` внутри
+# `bash -s <<HEREDOC` забирает остаток скрипта (грабля, runbook `postgres-roles §5`)
+sudo docker exec tbot-postgres-1 psql -U tbot -d tbot -v ON_ERROR_STOP=1   -c 'BEGIN' -c 'REVOKE tbot_app FROM tbot'   -c 'ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON TABLES FROM tbot_app'   -c 'ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE ALL ON SEQUENCES FROM tbot_app'   -c 'DROP ROLE IF EXISTS tbot_app' -c 'COMMIT'
+
+# шаг переключения, если он сделан — docs/runbook/postgres-roles.md §6:
+# ALTER ROLE tbot_app NOLOGIN + пересборка db_url под tbot + restart сервиса (не up -d)
 ```
 
 Права файлов секретов после всех шагов не менялись: `secrets-setup.sh --check` остаётся зелёным,
