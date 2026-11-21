@@ -105,11 +105,17 @@ def test_секрет_попадает_только_тому_процессу_к
 
     Проверка держит соответствие между списком `SECRET_FIELDS` в конфигурации и тем, что
     реально монтируется: лишний секрет в контейнере — это лишний путь утечки в дампе или в логе.
+
+    `kek_file` — не элемент `SECRET_FIELDS` (путь к файлу ключей задаётся настройкой
+    `Settings.kek_file`, а не именем в каталоге секретов), но доступ он требует тот же самый:
+    ключевой материал нужен только панели, потому что привязку TOTP делает она (`R4c`), а
+    `engine`, `jobs` и `migrate` его не читают. Лишний KEK у процесса — это та же цена, что у
+    лишнего токена: компрометация файла ключей вскрывает все привязки сразу (`ADR-014`).
     """
     services = _base()["services"]
     expected = {
         "postgres": {"db_password"},
-        "web": {"db_url"},
+        "web": {"db_url", "kek_file"},
         "engine": {"db_url"},
         "jobs": {"db_url"},
         "migrate": {"db_url"},
@@ -118,6 +124,35 @@ def test_секрет_попадает_только_тому_процессу_к
     for service, names in expected.items():
         mounted = set(services[service].get("secrets", []))
         assert mounted == names, f"{service}: ожидались секреты {names}, получено {mounted}"
+    for service in ("engine", "jobs", "migrate", "tgbot", "postgres"):
+        assert "kek_file" not in services[service].get(
+            "secrets", []
+        ), f"{service}: файл ключей монтироваться не должен"
+
+
+def test_путь_файла_ключей_в_контейнере_задаёт_compose_a_не_настройка() -> None:
+    """`TBOT_KEK_FILE` обязан совпадать с точкой монтирования секрета `kek_file`.
+
+    `Settings.kek_file` по умолчанию указывает на хозяйский путь из TZ §8.4. Внутри контейнера
+    такого файла нет (rootfs read-only, а секрет монтируется в `/run/secrets/<имя секрета>`),
+    поэтому путь внутри контейнера задаёт compose переменной окружения. Расхождение выглядит как
+    «нет файла ключей» при зелёном стенде: приложение ищет не там, где лежит смонтированное.
+    Проверяется и обратное: переменная не должна указывать на каталог секретов по имени поля.
+    """
+    base = _base()
+    environment = base["services"]["web"].get("environment") or {}
+    ожидание = "/run/secrets/kek_file"
+    assert (
+        environment.get("TBOT_KEK_FILE") == ожидание
+    ), f"TBOT_KEK_FILE={environment.get('TBOT_KEK_FILE')!r}, ожидалось {ожидание!r}"
+    assert "kek_file" in base["services"]["web"].get("secrets", []), "секрет не объявлен у web"
+    dev_путь = str(base["secrets"]["kek_file"]["file"])
+    assert dev_путь.startswith(
+        "./secrets/"
+    ), f"dev-копия файла ключей обязана лежать в каталоге dev-секретов: {dev_путь!r}"
+    assert dev_путь.endswith(
+        ".json"
+    ), f"файл ключей обязан быть с расширением .json: его создаёт хозяйственный инструмент, а не просто строка без расширения: {dev_путь}"
 
 
 def test_контекст_сборки_и_dockerfile_существуют() -> None:

@@ -7,6 +7,10 @@
 #   printf 'postgresql://tbot:dev-db-password@postgres:5432/tbot' > deploy/secrets/db_url
 #   printf 'dev-only-token-not-secret' > deploy/secrets/tg_bot_token
 #   printf 'dev-only-socks-password' > deploy/secrets/tg_socks_password
+# Файл ключей `kek.json` — не строка, а JSON с версиями ключей, поэтому его создаёт тот же
+# инструмент, что и на площадке, а не `printf`:
+#   python3 deploy/vps/keys_setup.py --path deploy/secrets/kek.json --expect-owner any
+# (прогон без root: на dev-машине владельца `0:10001` поставить нечем).
 # Значения боевого контура сюда не попадают никогда.
 
 services:

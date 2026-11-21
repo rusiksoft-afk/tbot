@@ -124,9 +124,19 @@ services:
     environment:
       <<: *app-env
       TBOT_WEB_HOST: 0.0.0.0
+      # Путь файла ключей KEK внутри контейнера. Здесь только путь: значение даёт compose, который
+      # монтирует секрет `kek_file` в `/run/secrets/kek_file` (§8.4 «KEK не в БД и не в образе»,
+      # `ADR-014` п. 5). `Settings.kek_file` по умолчанию указывает на хозяйский путь, поэтому
+      # переменная обязана быть: без неё процесс в контейнере искал бы `/etc/tbot/keys/kek.json`
+      # внутри своей read-only корневой ФС и падал бы с «нет файла ключей».
+      TBOT_KEK_FILE: /run/secrets/kek_file
     # Секреты монтируются только туда, где их читают: web ходит в базу, но не знает токен бота.
+    # Файл ключей — тоже только web'у: привязку TOTP делает панель (`R4c`), а `engine`, `jobs` и
+    # `migrate` ключевой материал не читают вовсе (§8.4: доступ минимальный, лишний процесс с KEK
+    # — лишний путь утечки в лог или дамп).
     secrets:
       - db_url
+      - kek_file
     depends_on:
       postgres:
         condition: service_healthy
@@ -265,6 +275,13 @@ secrets:
     file: ./secrets/tg_bot_token
   tg_socks_password:
     file: ./secrets/tg_socks_password
+  # Файл ключей KEK (`ADR-014` п. 5). В боевом составе путь другой — TZ §8.4 называет
+  # `/etc/tbot/keys/kek.json`, и задаёт его `compose.prod.yaml` (см. комментарий там же: это
+  # осознанное исключение из «все секреты в /etc/tbot/secrets»). Здесь dev-копия того же файла,
+  # созданная тем же инструментом, что и на площадке:
+  #   python3 deploy/vps/keys_setup.py --path deploy/secrets/kek.json --expect-owner any
+  kek_file:
+    file: ./secrets/kek.json
 
 volumes:
   pgdata:

@@ -17,6 +17,8 @@
 #      FORWARD/nat), поэтому «какой порт наружу» решается здесь, а не файрволом
 #      (`docs/acceptance/prod-firewall.md §5`);
 #   3) секреты читаются файлами из `/etc/tbot/secrets` (TZ §14.3), не из переменных окружения;
+#      единственное исключение — файл ключей KEK из секции `secrets:` ниже (TZ §8.4 называет для
+#      него отдельный путь `/etc/tbot/keys/kek.json`);
 #   4) лимиты памяти/CPU проставлены под фактическую площадку (2 vCPU / 3.8 ГиБ, OQ-11).
 #
 # Проверка и запуск (каталог репозитория на площадке — /opt/tbot):
@@ -187,9 +189,12 @@ volumes:
 
 secrets:
   # Пути задаются здесь: в dev-стенде секреты лежат в deploy/secrets/, на площадке — в
-  # /etc/tbot/secrets файлами с правами 600 (TZ §14.3). Имена файлов совпадают с тем, что уже
-  # лежит на площадке и с runbook'ами (telegram_token — docs/runbook/telegram-token.md,
-  # telegram_socks_pass — docs/runbook/telegram-egress-proxy.md).
+  # /etc/tbot/secrets файлами; класс прав задан `ADR-005`: `640` и группа
+  # с `gid 10001` у тех, что compose монтирует в контейнер, `600 root:root` — у
+  # тех, что читает только хост (TZ §14.3, перечень — runbook
+  # `secrets-on-host.md §2.1`). Имена файлов совпадают с тем, что
+  # уже лежит на площадке и с runbook'ами (telegram_token —
+  # docs/runbook/telegram-token.md,
   db_password:
     file: /etc/tbot/secrets/db_password
   db_url:
@@ -198,3 +203,19 @@ secrets:
     file: /etc/tbot/secrets/telegram_token
   tg_socks_password:
     file: /etc/tbot/secrets/telegram_socks_pass
+  # Файл ключей KEK — единственное исключение из правила «все секреты из `/etc/tbot/secrets`»,
+  # и задано это исключение заказчиком, а не исполнителем: путь называет сам TZ §8.4 («KEK лежит
+  # файлом `/etc/tbot/keys/kek.json`, не в базе и не в образе»), а `ADR-014` п. 5 и решение
+  # заказчика
+  # от 2026-11-21 (ask `05f7f262-0c56-41e6-9959-12aac2a45edb`) добавили к нему права
+  # `640 root:gid 10001` по образцу `ADR-005`. Держать его рядом с каталогом секретов нельзя
+  # по трём причинам:
+  #   1) разные жизненные циклы: файл ключей переживает пересоздание состава и живёт до ротации
+  #      (`T-107`), а секреты каталога переливает `secrets-setup.sh`;
+  #   2) разные политики прав: `secrets-setup.sh` знает только «строку секрета» и отвечает за
+  #      каталог `SECRETS_ROOT`, а этот файл создаёт `deploy/vps/keys_setup.py`;
+  #   3) другой формат: JSON с версиями ключей, а не одна строка.
+  # Значение в YAML не появляется: compose монтирует файл в контейнер, путь внутри контейнера
+  # задаёт `compose.yaml` (`TBOT_KEK_FILE=/run/secrets/kek_file`).
+  kek_file:
+    file: /etc/tbot/keys/kek.json

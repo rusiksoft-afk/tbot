@@ -113,6 +113,16 @@ PROD_SECRET_FILES: dict[str, str] = {
 }
 SECRETS_ROOT = "/etc/tbot/secrets"
 
+# Файл ключей TOTP — единственное исключение из «все секреты из каталога площадки»: путь называет
+# сам TZ §8.4 (`/etc/tbot/keys/kek.json`), а `ADR-014` п. 5 и решение заказчика от 2026-11-21
+# (ask `05f7f262-0c56-41e6-9959-12aac2a45edb`) задали для него права `640 root:gid 10001`.
+# Исключение держится контрактом явно: перенос файла ключей в `SECRETS_ROOT` выглядел бы как
+# «наведение порядка», но на деле отдаёт права файлу, о котором `secrets-setup.sh` не знает
+# (тот умеет только строку секрета), и отменяет путь, названный TZ.
+KEK_SECRET = "kek_file"
+KEYS_ROOT = "/etc/tbot/keys"
+KEK_PATH = f"{KEYS_ROOT}/kek.json"
+
 CADDY_CAPS: frozenset[str] = frozenset({"NET_BIND_SERVICE"})
 CADDY_MEM_LIMIT = "128m"
 CADDY_CPUS = 0.25
@@ -427,23 +437,56 @@ def test_секреты_боевого_состава_читаются_из_ка
     Проверка держит два свойства сразу: overlay не меняет состав секретов (иначе приложение
     перестал бы видеть нужный файл) и не переводит их в переменные окружения — красное правило
     TZ §8.4 требует, чтобы значение не попадало в `ps aux` и в argv.
+
+    Файл ключей (`kek_file`) — разрешённое исключение по каталогу, но не по форме: он тоже
+    читается файлом, тоже задаётся абсолютным путём и тоже не может собираться из переменной
+    окружения. Поэтому исключение перечислено именем, а не «своим префиксом»: закрытый перечень
+    не дадёт появиться третьему варианту молча.
     """
     base_secrets: dict[str, Any] = _base().get("secrets", {})
     prod_secrets: dict[str, Any] = _prod().get("secrets", {})
     assert set(prod_secrets) == set(base_secrets), "состав секретов в overlay разошёлся с базовым"
-    assert set(prod_secrets) == set(
-        PROD_SECRET_FILES
-    ), f"ожидались секреты {sorted(PROD_SECRET_FILES)}, найдено {sorted(prod_secrets)}"
+    ожидаемые = set(PROD_SECRET_FILES) | {KEK_SECRET}
+    assert (
+        set(prod_secrets) == ожидаемые
+    ), f"ожидались секреты {sorted(ожидаемые)}, найдено {sorted(prod_secrets)}"
     for name, spec in prod_secrets.items():
         source = str(spec.get("file", ""))
-        assert (
-            source == f"{SECRETS_ROOT}/{PROD_SECRET_FILES[name]}"
-        ), f"секрет {name}: путь {source!r} не совпадает с каталогом площадки и runbook'ом"
+        if name == KEK_SECRET:
+            assert (
+                source == KEK_PATH
+            ), f"секрет {name}: путь {source!r} не совпадает с TZ §8.4 ({KEK_PATH})"
+            assert not source.startswith(
+                f"{SECRETS_ROOT}/"
+            ), f"файл ключей нельзя переносить в каталог секретов: права на нём ставит не {SECRETS_ROOT}"
+        else:
+            assert (
+                source == f"{SECRETS_ROOT}/{PROD_SECRET_FILES[name]}"
+            ), f"секрет {name}: путь {source!r} не совпадает с каталогом площадки и runbook'ом"
         assert "${" not in source, f"секрет {name}: путь собран из переменной окружения"
     for name, spec in base_secrets.items():
         assert str(spec.get("file", "")).startswith(
             "./secrets/"
         ), f"{name}: базовый файл обязан оставаться на dev-каталоге — боевые пути только в overlay"
+
+
+def test_путь_файла_ключей_в_составе_совпадает_с_путём_приложения() -> None:
+    """`Settings.kek_file` и `secrets.kek_file.file` в боевом составе — один и тот же путь.
+
+    Расхождение выглядит как «процесс не может открыть файл ключей» уже на площадке: хозяйский
+    инструмент (`deploy/vps/keys_setup.py`) пишет по умолчанию в путь из TZ §8.4, приложение
+    читает путь из своей настройки, а compose монтирует свой. Если значения разъедутся, зелёный
+    `--check` хозяйской диагностики будет соседствовать с красным запуском контейнера.
+    """
+    kek_spec = _prod()["secrets"][KEK_SECRET]
+    путь_compose = str(kek_spec["file"])
+    # `as_posix()` обязателен: на dev-машине Windows это тот же путь, но с обратными слэшами,
+    # и сравнение строк давало бы ложный отказ ровно на той платформе, где тест запускается.
+    путь_приложения = Path(Settings.model_fields["kek_file"].default).as_posix()
+    assert путь_compose == KEK_PATH == путь_приложения, (
+        f"путь файла ключей разошёлся: compose {путь_compose!r}, приложение {путь_приложения!r}, "
+        f"ожидалось {KEK_PATH!r}"
+    )
 
 
 def test_токен_реестра_образов_не_становится_секретом_compose() -> None:

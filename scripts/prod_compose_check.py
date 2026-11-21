@@ -89,14 +89,36 @@ ALLOWED_EXTERNAL_NETWORKS = {"tbot-egress", "tbot-public"}
 # Ожидаемый состав секретов по сервисам. Лишний секрет процессу не нужен, но он лежит у него в
 # памяти и может попасть в лог при неаккуратном дампе окружения (TZ §8.4 — «красное» правило:
 # токен в логах = компрометация).
+# `kek_file` — файл ключей TOTP (`ADR-014`): он нужен только `web`, потому что привязку делает
+# панель, а расшифровкой секрета привязки больше никто не занимается. `engine`, `jobs` и
+# `migrate` ключевой материал не читают, поэтому KEK у них — такая же находка, как токен бота у
+# базы: лишний процесс с ключом = лишний путь утечки.
 SECRETS_BY_SERVICE: dict[str, set[str]] = {
     "postgres": {"db_password"},
     "migrate": {"db_url"},
-    "web": {"db_url"},
+    "web": {"db_url", "kek_file"},
     "engine": {"db_url"},
     "jobs": {"db_url"},
     "tgbot": {"tg_bot_token", "tg_socks_password"},
     PUBLIC_SERVICE: set(),
+}
+
+# Политика путей файловых секретов: имя секрета → путь на хосте. Это закрытый перечень, а не
+# правило «всё из `SECRETS_ROOT`»: файл ключей KEK по TZ §8.4 живёт отдельно, и попытка
+# «унифицировать» его, сдвинув в каталог секретов, на самом деле меняет ему права (политику
+# каталога держит `secrets-setup.sh`, который умеет писать только строку секрета, а не JSON с
+# версиями ключей) и молча отклоняется от §8.4. Точное совпадение пути держит и обратный
+# случай: перенос `db_url` в каталог ключей тоже отказ.
+SECRETS_ROOT = "/etc/tbot/secrets"
+KEYS_FILE = "kek_file"
+KEYS_ROOT = "/etc/tbot/keys"
+KEK_PATH = f"{KEYS_ROOT}/kek.json"
+ALLOWED_SECRET_PATHS: dict[str, str] = {
+    "db_password": f"{SECRETS_ROOT}/db_password",
+    "db_url": f"{SECRETS_ROOT}/db_url",
+    "tg_bot_token": f"{SECRETS_ROOT}/telegram_token",
+    "tg_socks_password": f"{SECRETS_ROOT}/telegram_socks_pass",
+    KEYS_FILE: KEK_PATH,
 }
 # Постоянные процессы обязаны перезапускаться сами (TZ §14.6 «restart always»); `migrate` —
 # одноразовый запуск командой, ему это не касается.
@@ -325,6 +347,66 @@ def check_secrets(model: dict[str, Any]) -> CheckResult:
     )
 
 
+def _secret_file_paths(model: dict[str, Any]) -> tuple[dict[str, str], list[str]]:
+    """Пути файловых секретов из разобранного состава и имена, у которых пути нет.
+
+    Компоновщик отдаёт для файлового секрета поле `file` (в YAML-разборе это видно прямо: рядом
+    с `name` лежит `file: /etc/tbot/secrets/db_password`). Если поля нет, значит секрет пришёл
+    не из файла — `external`, инлайн-`content` или переменная окружения: проверить путь
+    невозможно, и притворяться, что проверка прошла, нельзя.
+    """
+    paths: dict[str, str] = {}
+    no_path: list[str] = []
+    for name, spec in (model.get("secrets") or {}).items():
+        key = str(name)
+        value = spec.get("file") if isinstance(spec, dict) else None
+        if isinstance(value, str) and value:
+            paths[key] = value
+        else:
+            no_path.append(key)
+    return paths, no_path
+
+
+def check_secret_paths(model: dict[str, Any]) -> CheckResult:
+    """Пути файловых секретов совпадают с политикой: каталог секреты + отдельный файл ключей.
+
+    Проверка держит три свойства разом: секрет не переведён в переменные окружения или в
+    инлайн-`content` (TZ §8.4: значение не должно попадать в `ps aux` и в argv), файл ключей
+    не переехал в каталог секретов (§8.4 называет отдельный путь, а `ADR-005` — отдельные права
+    `640 root:gid 10001`), и боевой разбор не показывает dev-каталог `deploy/secrets`.
+    """
+    paths, no_path = _secret_file_paths(model)
+    problems: list[str] = []
+    for name in sorted(no_path):
+        problems.append(
+            f"{name}: в разобранном составе нет поля `file` — секреты читаются файлами "
+            f"(TZ §14.3), а без пути проверка пути невозможна"
+        )
+    extra = sorted(set(paths) - set(ALLOWED_SECRET_PATHS))
+    if extra:
+        problems.append(f"секреты вне политики путей: {extra}")
+    moved = {
+        name: path
+        for name, path in paths.items()
+        if name in ALLOWED_SECRET_PATHS and path != ALLOWED_SECRET_PATHS[name]
+    }
+    for name, path in sorted(moved.items()):
+        problems.append(f"{name}: путь {path} вместо {ALLOWED_SECRET_PATHS[name]}")
+    absent = sorted(set(ALLOWED_SECRET_PATHS) - set(paths))
+    if absent:
+        problems.append(
+            f"в разборе нет секретов {absent}: состав должен совпадать с закрытым перечнем"
+        )
+    return CheckResult(
+        "secret_paths_policy",
+        not problems,
+        "; ".join(problems)
+        if problems
+        else f"пути секретов по политике: {len(paths)} файловых путей, "
+        f"файл ключей отдельно ({KEK_PATH}, вне {SECRETS_ROOT})",
+    )
+
+
 def check_limits(model: dict[str, Any]) -> list[CheckResult]:
     """Лимиты дожили до разобранного состава, не выше ТЗ §14.6 и влезают в бюджет площадки."""
     services = _services(model)
@@ -436,7 +518,13 @@ def collect_checks(model: dict[str, Any]) -> list[CheckResult]:
     results: list[CheckResult] = []
     for group_check in (check_ports, check_egress, check_limits, check_restart_and_grace):
         results.extend(group_check(model))
-    for single_check in (check_images, check_no_build, check_secrets, check_read_only):
+    for single_check in (
+        check_images,
+        check_no_build,
+        check_secrets,
+        check_secret_paths,
+        check_read_only,
+    ):
         results.append(single_check(model))
     return results
 

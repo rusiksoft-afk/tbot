@@ -8,11 +8,28 @@
 
 from __future__ import annotations
 
+import base64
+import importlib.util
 import json
 import re
+import sys
+from pathlib import Path
+from types import ModuleType
 from typing import Any, cast
 
-from tests.paths import COMPOSE_PROD, DOCKERFILE, ROOT, VPS, load_compose_yaml
+import pytest
+
+from packages.common import crypto
+from packages.common.config import Settings
+from tests.paths import (
+    COMPOSE_BASE,
+    COMPOSE_PROD,
+    DOCKERFILE,
+    ROOT,
+    VPS,
+    load_compose_yaml,
+    load_script,
+)
 
 RULES = VPS / "ufw.rules"
 FIREWALL = VPS / "firewall.sh"
@@ -21,6 +38,10 @@ JAIL = VPS / "fail2ban-jail.local"
 DAEMON = VPS / "docker-daemon.json"
 SECRETS_SETUP = VPS / "secrets-setup.sh"
 VPS_README = VPS / "README.md"
+# Имя файла ключей TOTP на хосте (`TZ` §8.4). Политика прав для него живёт не в
+# `secrets-setup.sh`, а в `deploy/vps/keys_setup.py` — поэтому имя вынесено в константу:
+# исключение из «все файловые секреты состава» должно быть названо, а не выведено из каталога.
+KEYS_FILE_NAME = "kek.json"
 
 # Что требует ТЗ §8.5 («вход наружу: 443/tcp, 443/udp, 80/tcp и 22»): 80 — редирект и ACME,
 # 443/udp — HTTP/3 (решение заказчика от 2026-11-20, docs/adr/ADR-003). Набор udp-портов связан
@@ -357,11 +378,26 @@ def test_права_монтируемых_секретов_совпадают_�
     )
 
     состав = load_compose_yaml(COMPOSE_PROD)["secrets"]
-    монтируемые = {
+    все_файлы = {
         str(spec["file"]).rsplit("/", 1)[-1]
         for spec in состав.values()
         if isinstance(spec, dict) and spec.get("file")
     }
+    # Файл ключей — единственный файловый секрет состава, чьи права задаёт не `secrets-setup.sh`:
+    # у значения закрытый JSON-формат, а скрипт умеет писать только строку (`ADR-014` п. 5); норму
+    # прав для него держит `deploy/vps/keys_setup.py` — см.
+    # `test_норма_прав_файла_ключей_строже_предела_приложения_и_совпадает_с_gid_контейнера`.
+    # Исключение названо именем файла, а не «своим каталогом»: иначе новый файловый секрет мог бы
+    # выпасть из политики прав незаметно.
+    ks = _keys_module()
+    assert Path(ks.DEFAULT_PATH).name == KEYS_FILE_NAME, (
+        f"имя файла ключей разошлось: инструмент пишет {Path(ks.DEFAULT_PATH).name!r}, "
+        f"политика ожидает {KEYS_FILE_NAME!r}"
+    )
+    assert (
+        KEYS_FILE_NAME in все_файлы
+    ), "файл ключей пропал из состава: проверку его прав нечем выполнить"
+    монтируемые = все_файлы - {KEYS_FILE_NAME}
     m_mount = re.search(r"MOUNTED_NAMES=\(([^)]*)\)", код)
     assert m_mount, "в скрипте нет MOUNTED_NAMES: список «файл монтируется в контейнер» потерян"
     assert set(m_mount.group(1).split()) == монтируемые, (
@@ -417,8 +453,8 @@ def test_имена_секретов_совпадают_с_боевым_сост
     }
     assert из_состава, "боевой состав не читает файловых секретов"
     assert (
-        из_состава - set(HOST_ONLY_NAMES) <= set(имена)
-    ), f"составу нужен файл, который скрипт не создаёт: {из_состава - set(имена) - set(HOST_ONLY_NAMES)}"
+        из_состава - {KEYS_FILE_NAME} - set(HOST_ONLY_NAMES) <= set(имена)
+    ), f"составу нужен файл, который скрипт не создаёт: {из_состава - set(имена) - set(HOST_ONLY_NAMES) - {KEYS_FILE_NAME}}"
     assert set(имена) - из_состава == {"ghcr_token"}, (
         "у хостового секрета появился лишний сосед или compose перестал читать известный: "
         f"{set(имена) ^ из_состава}"
@@ -445,9 +481,9 @@ def test_состав_требует_пять_файлов_и_все_пять_в
         for spec in состав.values()
         if isinstance(spec, dict) and spec.get("file")
     }
-    assert set(только_хоста) == из_состава - set(SETUP_NAMES), (
+    assert set(только_хоста) == из_состава - {KEYS_FILE_NAME} - set(SETUP_NAMES), (
         "файлы состава разделены между списками не полностью: "
-        f"{из_состава ^ (set(SETUP_NAMES) | set(только_хоста))}"
+        f"{из_состава ^ (set(SETUP_NAMES) | {KEYS_FILE_NAME} | set(только_хоста))}"
     )
     диагностика = _bash_func("check_mode")
     assert '"${SECRET_NAMES[@]}" "${HOST_ONLY_NAMES[@]}"' in диагностика, (
@@ -643,3 +679,254 @@ def test_режим_check_не_трогает_файлы_и_не_печатае�
             f"`--check` что-то меняет или читает из терминала ({запись_файла!r}): "
             "режим проверки обязан остаться только чтением метаданных"
         )
+
+
+# ─── deploy/vps/keys_setup.py: файл ключей TOTP (TZ §8.4, docs/adr/ADR-014 п. 5) ───
+
+KEYS_SETUP = VPS / "keys_setup.py"
+
+# Закрытый список верхних уровней импорта. Инструмент запускается на хосте системным `python3`
+# (`sudo python3 deploy/vps/keys_setup.py`), где окружения проекта нет, а значит любое
+# нестандартное имя (`cryptography`, `packages`) превращает инструкцию в отказ
+# `ModuleNotFoundError`. Числа формата поэтому продублированы из `packages/common/crypto.py`,
+# а не импортированы: этот список и контракт ниже держат границу «хост без зависимостей».
+KEYS_SETUP_STDLIB: frozenset[str] = frozenset(
+    {
+        "__future__",
+        "argparse",
+        "base64",
+        "binascii",
+        "json",
+        "os",
+        "re",
+        "secrets",
+        "stat",
+        "sys",
+        "pathlib",
+        "typing",
+        "dataclasses",
+        "contextlib",
+        "textwrap",
+        "collections",
+        "hashlib",
+        "hmac",
+        "datetime",
+        "enum",
+        "functools",
+        "itertools",
+        "string",
+        "shutil",
+        "uuid",
+    }
+)
+
+
+def _keys_text() -> str:
+    return KEYS_SETUP.read_text(encoding="utf-8")
+
+
+def _keys_module() -> ModuleType:
+    """Загрузить `deploy/vps/keys_setup.py` как модуль: он не установлен в окружение.
+
+    Тот же приём, что у `tests.paths.load_script` для `scripts/`: скрипт хоста загружается файлом
+    по пути, так же, как его запускает оператор и CI.
+    """
+    spec = importlib.util.spec_from_file_location("tbot_vps.keys_setup", KEYS_SETUP)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_инструмент_файла_ключей_не_требует_ничего_кроме_стандартной_библиотеки() -> None:
+    """`python3 deploy/vps/keys_setup.py` на хосте обязан работать без окружения проекта.
+
+    Инструктаж площадки («выполни скрипт») рассчитан на системный интерпретатор: venv на ВМ не
+    поднят, потому что приложение живёт в контейнерах. Импорт `packages.common.crypto` или
+    `cryptography` превратил бы инструкцию в `ModuleNotFoundError`, причём обнаружилось бы это
+    только на площадке. Числа формата из-за этого дублированы — и ровно поэтому их сверку держит
+    контракт ниже, а не импорт.
+    """
+    код = _keys_text()
+    for импорт in re.finditer(r"(?m)^(?:from|import)\s+([a-zA-Z_][\w.]*)", код):
+        верх = импорт.group(1).split(".", 1)[0]
+        assert верх in KEYS_SETUP_STDLIB, (
+            f"инструмент хоста импортирует {верх!r}: на ВМ системный python3 без зависимостей "
+            "проекта, запуск станет невозможным"
+        )
+
+
+def test_константы_файла_ключей_совпадают_с_модулем_криптографии() -> None:
+    """Дубликат чисел формата обязан оставаться идентичным оригиналу.
+
+    Дублирование — осознанная цена за запуск без зависимостей, и оно держится проверкой: расхождение
+    даёт ровно тот класс отказов, который дороже всего чинить на площадке — «файл создан инструментом,
+    а приложение его не принимает» (например `format_version: ожидалось 1, получено 2`).
+    """
+    ks = _keys_module()
+    assert (
+        ks.KEY_BYTES == crypto.AES_KEY_BYTES
+    ), f"длина ключа: инструмент {ks.KEY_BYTES}, приложение {crypto.AES_KEY_BYTES}"
+    assert ks.DOCUMENT_FORMAT_VERSION == crypto.KEY_FILE_FORMAT_VERSION, (
+        f"версия формата документа: инструмент {ks.DOCUMENT_FORMAT_VERSION}, "
+        f"приложение {crypto.KEY_FILE_FORMAT_VERSION}"
+    )
+    assert (ks.KEY_VERSION_MIN, ks.KEY_VERSION_MAX) == (
+        crypto.KEY_VERSION_MIN,
+        crypto.KEY_VERSION_MAX,
+    ), (
+        f"диапазон версий ключа: инструмент {(ks.KEY_VERSION_MIN, ks.KEY_VERSION_MAX)}, "
+        f"приложение {(crypto.KEY_VERSION_MIN, crypto.KEY_VERSION_MAX)} — версии попадают "
+        "в двухбайтное поле заголовка конверта, расхождение означает «привязка зашифрована "
+        "версией, которой нет в файле ключей»"
+    )
+    assert ks.MODE_MAX == crypto.KEK_FILE_MODE_MAX, (
+        f"предел прав, который отвергает приложение: {crypto.KEK_FILE_MODE_MAX:o}, "
+        f"а инструмент считает нормой {ks.MODE_MAX:o}"
+    )
+
+
+def test_норма_прав_файла_ключей_строже_предела_приложения_и_совпадает_с_gid_контейнера() -> None:
+    """Норма инструмента (`0640 root:gid 10001`) — частный случай предела приложения.
+
+    `packages.common.crypto.kek_file_mode_error` разрешает любые биты до `0640` включительно,
+    поэтому `0400` приложение примет, а `--check` инструмента отвергнет: площадка выбрала вариант
+    монтируемого секрета (`ADR-005`), и файл с правами `0600` читает только root, тогда как процесс
+    состава работает под uid/gid 10001 (`deploy/Dockerfile: USER 10001:10001`). Разница двух уровней
+    зафиксирована в `ADR-014` п. 5 и не является противоречием; проверяется здесь, чтобы «чище»
+    не стало ошибкой: `0600` проходит предел приложения и обязан падать на норме инструмента.
+    """
+    ks = _keys_module()
+    assert (ks.FILE_MODE, ks.OWNER_UID) == (0o640, 0), "норма прав инструмента потеряна"
+    assert ks.FILE_MODE <= ks.MODE_MAX, "норма инструмента шире предела приложения"
+    assert crypto.kek_file_mode_error(0o600) is None, (
+        "предел приложения больше не снисходителен к 0600: разница уровней из ADR-014 п. 5 "
+        "утеряна, и «чище нормы» перестаёт быть различимым"
+    )
+    assert crypto.kek_file_mode_error(0o644), "предел приложения перестал отвершать 644"
+
+    образ = re.search(r"(?m)^USER (\d+):(\d+)$", DOCKERFILE.read_text(encoding="utf-8"))
+    assert образ, "в deploy/Dockerfile нет числовой USER: gid процесса нечем сверить"
+    assert int(образ.group(2)) == ks.CONTAINER_GID, (
+        f"группа файла ключей ({ks.CONTAINER_GID}) не совпадает с gid процесса в образе "
+        f"({образ.group(2)}): bind-маунт приносит хозяйские права, и примонтированный "
+        "секрет окажется нечитаемым для состава"
+    )
+    gid_скрипта = re.search(r"CONTAINER_GID=(\d+)", _setup_code())
+    assert gid_скрипта, "в скрипте ввода секретов нет CONTAINER_GID"
+    assert int(gid_скрипта.group(1)) == ks.CONTAINER_GID, (
+        "gid контейнера разошёлся у двух хозяйских инструментов: у файла ключей и у строковых "
+        "секретов доступ выдаётся разным группам"
+    )
+
+
+def test_документ_созданный_инструментом_принимает_парсер_приложения() -> None:
+    """Главная пара среза: файл пишет один код, читает другой, и они обязаны совпасть.
+
+    Константы выше — необходимая, но не достаточная часть: парсер приложения проверяет ещё и
+    неизвестные поля, диапазон версий, канонический base64 и длину ключа. Без этой проверки
+    инструмент мог писать валидный JSON, который приложение отвергает, а на площадке это выглядит
+    как «привязку создать нельзя» — уже после того, как значение ключа стало боевым.
+    """
+    ks = _keys_module()
+    документ = ks.new_document()
+    дефекты, версии, активная, длина = ks.document_problems(документ)
+    assert дефекты == [], f"инструмент не принял собственный документ: {дефекты}"
+    assert (версии, активная, длина) == (
+        [1],
+        1,
+        ks.KEY_BYTES,
+    ), f"неожиданная форма созданного документа: {(версии, активная, длина)}"
+
+    связка = crypto.parse_key_ring_document(документ, source="keys_setup")
+    assert sorted(связка.keys) == [
+        1
+    ], f"парсер приложения увидел другой набор версий: {sorted(связка.keys)}"
+    assert связка.active.version == 1, "активная версия разошлась с тем, что записал инструмент"
+    assert (
+        len(связка.active.key) == crypto.AES_KEY_BYTES
+    ), "ключ из документа инструмента не годится приложению по длине"
+    assert (
+        repr(связка.active).find(base64.b64encode(связка.active.key).decode()) == -1
+    ), "`repr` ключа содержит его значение: §8.4 «красное правило» нарушено"
+
+    # Обратная половина пары: инструмент обязан отклонить то, что отвергает приложение, иначе
+    # зелёный `--check` соседствует с красным запуском контейнера.
+    def mutate_missing_key_field(text: str) -> str:
+        return text.replace('"key"', '"key2"', 1)
+
+    def mutate_unknown_field(text: str) -> str:
+        return text.replace('"keys"', '"keysX"', 1)
+
+    for подпись, портит in (
+        ("запись ключа без поля `key`", mutate_missing_key_field),
+        ("неизвестное поле документа", mutate_unknown_field),
+    ):
+        испорченный = портит(документ)
+        собственные, *_ = ks.document_problems(испорченный)
+        assert собственные, f"инструмент не отклонил дефект «{подпись}»"
+        with pytest.raises(crypto.CryptoError):
+            crypto.parse_key_ring_document(испорченный, source="порт")
+
+
+def test_файл_ключей_входит_в_состав_как_файловый_секрет_а_не_как_tom() -> None:
+    """KEK попадает в контейнер тем же механизмом, что остальные секреты, а не монтированием тома.
+
+    Разница не косметическая: `secrets:` с `file:` compose читает как секрет (в `docker inspect`
+    и в `ps` пути к значениям не размножаются, том же раскрывает хозяйский путь и разрешает
+    запись, если не указан `:ro`), а `TZ` §8.4 требует, чтобы значение не попадало ни в переменные
+    окружения, ни в аргументы процессов. Плюс том, примонтированный к каталогу, открывает составу
+    соседние файлы.
+    """
+    for путь in (COMPOSE_BASE, COMPOSE_PROD):
+        состав = load_compose_yaml(путь)
+        spec = состав["secrets"]["kek_file"]
+        assert isinstance(
+            spec, dict
+        ), f"{путь.name}: секрет kek_file обязан быть файловым (`file:`), получено {spec!r}"
+        assert spec.get(
+            "file"
+        ), f"{путь.name}: секрет kek_file обязан быть файловым (`file:`), получено {spec!r}"
+        assert (
+            "name" not in spec or spec["name"] == "kek_file"
+        ), f"{путь.name}: имя секрета внутри контейнера обязано совпадать с точкой монтирования"
+        for service, config in состав["services"].items():
+            for volume in config.get("volumes") or []:
+                volume_path = str(volume)
+                hit = next((m for m in ("kek", "/keys") if m in volume_path), "")
+                assert not hit, (
+                    f"{путь.name}: {service} получает файл ключей томом ({volume_path!r}) — "
+                    "права на том compose не задаёт, а хозяйский каталог становится виден составу"
+                )
+            environment = config.get("environment") or {}
+            if "TBOT_KEK_FILE" in environment:
+                assert (
+                    service == "web"
+                ), f"{путь.name}: {service} получает путь к ключам чужой настройкой"
+
+
+def test_путь_файла_ключей_назван_одним_значением_во_всех_четырёх_источниках() -> None:
+    """Путь из TZ §8.4 повторяют четыре места: инструмент, настройки, проверка состава, compose.
+
+    Каждый берёт его из своего места по уважительной причине: инструмент пишет файл, приложение
+    читает, `prod_compose_check` сверяет политику путей, `compose.prod.yaml` монтирует. Расхождение
+    любого из них даёт либо «файл есть, приложение его не видит», либо «проверка состава зелёная,
+    а контейнер падает», поэтому сверяется именно значение, а не четыре комментария.
+    """
+    ks = _keys_module()
+    проверка = load_script("prod_compose_check")
+    ожидания = {
+        "deploy/vps/keys_setup.py": ks.DEFAULT_PATH,
+        "packages/common/config.py": Path(Settings.model_fields["kek_file"].default).as_posix(),
+        "scripts/prod_compose_check.py": str(проверка.ALLOWED_SECRET_PATHS["kek_file"]),
+        "deploy/compose.prod.yaml": str(
+            load_compose_yaml(COMPOSE_PROD)["secrets"]["kek_file"]["file"]
+        ),
+    }
+    единое = set(ожидания.values())
+    assert len(единое) == 1, f"путь файла ключей разошёлся по источникам: {ожидания}"
+    assert (
+        ожидания["deploy/compose.prod.yaml"] == "/etc/tbot/keys/kek.json"
+    ), "этот путь называет TZ §8.4 — менять его можно только вместе с формулировкой ТЗ"

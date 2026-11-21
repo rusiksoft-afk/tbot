@@ -237,6 +237,24 @@ jobs:
           printf 'postgresql://tbot:ci-stand-db-password@postgres:5432/tbot' > deploy/secrets/db_url
           printf 'ci-stand-not-a-real-token' > deploy/secrets/tg_bot_token
           printf 'ci-stand-not-a-real-password' > deploy/secrets/tg_socks_password
+      - name: dev-копия файла ключей KEK (создаёт её тот же инструмент, что на площадке)
+        # Пустышка, как и остальные файлы job'а: проверяется путь, монтирование и чтение,
+        # а не значение. Создать её обязан `deploy/vps/keys_setup.py`, а не `printf`: формат
+        # JSON с версиями ключей принимает собственный парсер приложения (`ADR-014` п. 5), и
+        # «просто файл» дал бы зелёный разбор состава с красным чтением ключей. Прогон без root и с
+        # `--expect-owner any`: владелец `0:10001` нерoot-процессом не выставлен.
+        # Дальше — группа, а не «права пошире». Инструмент ставит норму `0640`, и приложение
+        # эту норму требует: `packages.common.crypto.kek_file_mode_error` отклоняет любые биты
+        # шире `0640`, поэтому `chmod 644` (как сделано выше для строковых секретов) для файла
+        # ключей дал бы отказ чтения уже внутри контейнера. Доступ процессу контейнера выдаётся
+        # группой с gid 10001 — ровно тот же приём, что на площадке (`ADR-005`). Владелец
+        # остаётся пользователем runner'а: иначе каталог dev-секретов перестает быть доступным
+        # `docker compose config`, который на раннере запускается не от root.
+        run: |
+          set -euo pipefail
+          python3 deploy/vps/keys_setup.py --path deploy/secrets/kek.json --expect-owner any
+          sudo chgrp 10001 deploy/secrets/kek.json
+          stat -c '%n %a %u:%g %s' deploy/secrets/kek.json
       - name: docker compose config
         run: docker compose -f deploy/compose.yaml -f deploy/compose.override.yaml config --quiet
       - name: собрать образы
@@ -253,6 +271,28 @@ jobs:
         run: |
           docker compose -f deploy/compose.yaml -f deploy/compose.override.yaml \
             exec -T web python -m packages.common.health_probe --url http://127.0.0.1:8080/readyz
+      - name: файл ключей читается изнутри контейнера web (TZ §8.4, ADR-014)
+        # Проверка ровно того, ради чего KEK монтируется: путь из настроек указывает на точку
+        # монтирования секрета, файл открылся процессом контейнера (uid/gid 10001), и связка
+        # ключей разобрана. Наружу выходят только метаданные — версии ключей и активная версия;
+        # значения не печатаются (§8.4 «красное правило» про `repr`, логи и исключения).
+        # Без этого шага «секрет смонтирован» отличался бы от «секрет читается» — ровно тот
+        # дефект, который на площадке дал `PermissionError: /run/secrets/db_url` (`ADR-005`).
+        run: |
+          set -euo pipefail
+          docker compose -f deploy/compose.yaml -f deploy/compose.override.yaml \
+            exec -T web python - <<'KEKREAD'
+          import sys
+
+          from packages.common.config import load_settings
+          from packages.common.crypto import describe_key_ring
+
+          path = load_settings().kek_file
+          if str(path) != "/run/secrets/kek_file":
+              print(f"FAIL: путь файла ключей в контейнере: {path}", file=sys.stderr)
+              raise SystemExit(1)
+          print(describe_key_ring(path))
+          KEKREAD
       - name: engine и jobs живы
         run: |
           # Приёмка T-005 требует «/readyz 200 у web и engine», поэтому у engine проверяются
@@ -357,6 +397,69 @@ jobs:
             sudo chmod 600 "/etc/tbot/secrets/$name"
           done
           sudo ls -l /etc/tbot/secrets
+
+      - name: 'файл ключей KEK: инструмент, --check, сломанные права, --remed, проба DAC'
+        # Файл обязан существовать до разбора состава: compose раннёра (v5.1.3) требует,
+        # чтобы файловые секреты лежали на месте (compose площадки 2.40.3 — не требует,
+        # docs/runbook/stand-deploy.md §3). Создаёт его штатный инструмент и по штатному пути,
+        # поэтому шаг заодно проверяет, что путь инструмента и путь `compose.prod.yaml` не
+        # разъехались. Значение фиктивное: его генерирует сам инструмент (режим (2) `ADR-004`),
+        # боевых ключей в CI нет и в журнал они не попадают — наружу только метаданные.
+        run: |
+          set -euo pipefail
+          kek=/etc/tbot/keys/kek.json
+          sudo python3 deploy/vps/keys_setup.py
+          sudo python3 deploy/vps/keys_setup.py --check
+          # Перезапись существующего файла без разрешения запрещена: потеря значения делает
+          # нечитаемыми уже зашифрованные привязки (`ADR-014`). В неинтерактивном прогоне
+          # подтвердиться нечем, поэтому ожидание — отказ и целой файл (заодно проверяется
+          # ветка «stdin не терминал», которая на Windows ещё и `isatty()` врёт).
+          before=$(sudo sha256sum "$kek")
+          if sudo python3 deploy/vps/keys_setup.py </dev/null; then
+            echo "FAIL: инструмент перезаписал существующий файл ключей без --force" >&2
+            exit 1
+          fi
+          if [ "$before" != "$(sudo sha256sum "$kek")" ]; then
+            echo "FAIL: отказ перезаписать файл ключей не оставил файл нетронутым" >&2
+            exit 1
+          fi
+          # Негативная проба: `--check` обязан падать на режиме, при котором процесс контейнера
+          # файл не читает. Зелёная диагностика при 600 root:root — это ровно тот дефект,
+          # который на площадке выглядел как `migrate_exit=1` с PermissionError (`ADR-005`).
+          sudo chmod 600 "$kek"
+          if sudo python3 deploy/vps/keys_setup.py --check; then
+            echo "FAIL: --check не заметил режим 600 у монтируемого файла ключей" >&2
+            exit 1
+          fi
+          # `--remed` приводит владельца и режим, не касаясь значений (перезаливать KEK нельзя:
+          # привязки, зашифрованные прежним значением, после перезаписи не читаются — это `T-107`).
+          sudo python3 deploy/vps/keys_setup.py --remed
+
+          # Проба DAC из `ADR-005`: процесс в контейнере работает под uid/gid 10001
+          # (`deploy/Dockerfile: USER 10001:10001`), а bind-маунт приносит хозяйские права.
+          # Значит `640 root:gid 10001` обязан читаться этим процессом, а `600 root:root` — нет.
+          # До этого среза половина `ADR-005` про «нужен gid контейнера» проверялась только
+          # руками на живой ВМ (замеры `test -r`), здесь она исполняется в CI.
+          # Каталог файла ключей на площадке закрыт (`0700 root:root`), и составу это не мешает:
+          # bind-маунт файла делает демон от root, а процесс внутри контейнера видит точку
+          # монтирования, а не хозяйский путь. Поэтому проба снимка делается в каталоге с битом
+          # входа (`0711`: вход есть, перечисления нет) — иначе проверялся бы отказ каталога,
+          # а не биты файла.
+          dac=$(sudo mktemp -d /tmp/tbot-kek-dac-XXXXXX)
+          sudo python3 deploy/vps/keys_setup.py --path "$dac/kek.json"
+          sudo chmod 711 "$dac"
+          # Содержимое наружу не печатается: только длина прочитанных байтов.
+          sudo setpriv --reuid=10001 --regid=10001 --clear-groups \
+            python3 -c 'import pathlib,sys; print("DAC_READ_BYTES", len(pathlib.Path(sys.argv[1]).read_bytes()))' "$dac/kek.json"
+          sudo chmod 600 "$dac/kek.json"
+          if sudo setpriv --reuid=10001 --regid=10001 --clear-groups \
+               python3 -c 'import pathlib,sys; pathlib.Path(sys.argv[1]).read_bytes()' "$dac/kek.json"; then
+            echo "FAIL: uid/gid 10001 прочитал файл ключей с правами 600 root:root" >&2
+            exit 1
+          fi
+          sudo rm -rf "$dac"
+          # Итог: норма площадки восстановлена `--remed`, файл на месте и разборный.
+          sudo python3 deploy/vps/keys_setup.py --check
 
       - name: 'скрипт ввода секретов: форма значений, режимы, вердикты --check'
         # Повод — замер 2026-11-20 на площадке: `--check` дал зелёный вывод при значениях не по

@@ -34,6 +34,16 @@ def _secret(name: str) -> dict[str, Any]:
     return {"source": name, "target": name, "uid": 0, "gid": 0, "mode": 256}
 
 
+def _top_secret(name: str, host_path: str) -> dict[str, Any]:
+    """Секрет верхнего уровня разобранного состава: имя монтирования и путь на хосте.
+
+    Поле `file` здесь не украшение: compose отдаёт его в разборе (в YAML-выводе `config` рядом
+    с `name` лежит `file: /etc/tbot/secrets/db_password`), и именно по нему проверяется
+    политика путей. Без него проверять путь нечем — и тест обязан это видеть.
+    """
+    return {"name": f"tbot_{name}", "file": host_path}
+
+
 def _port(target: int, published: str, protocol: str = "tcp") -> dict[str, Any]:
     return {"mode": "ingress", "target": target, "published": published, "protocol": protocol}
 
@@ -108,7 +118,7 @@ def _model() -> dict[str, Any]:
                 "web",
                 WEB_DIGEST_IMAGE,
                 {"tbot-edge": None, "tbot-backend": None, "tbot-public": None},
-                secrets=[_secret("db_url")],
+                secrets=[_secret("db_url"), _secret("kek_file")],
                 mem=320 * MIB,
                 cpus=0.5,
             ),
@@ -147,10 +157,15 @@ def _model() -> dict[str, Any]:
             ),
         },
         "secrets": {
-            "db_password": {"name": "tbot_db_password"},
-            "db_url": {"name": "tbot_db_url"},
-            "tg_bot_token": {"name": "tbot_tg_bot_token"},
-            "tg_socks_password": {"name": "tbot_tg_socks_password"},
+            "db_password": _top_secret("db_password", "/etc/tbot/secrets/db_password"),
+            "db_url": _top_secret("db_url", "/etc/tbot/secrets/db_url"),
+            "tg_bot_token": _top_secret("tg_bot_token", "/etc/tbot/secrets/telegram_token"),
+            "tg_socks_password": _top_secret(
+                "tg_socks_password", "/etc/tbot/secrets/telegram_socks_pass"
+            ),
+            # Файл ключей лежит вне каталога секретов: путь называет TZ §8.4, и это не опечатка
+            # (см. комментарий в `deploy/compose.prod.yaml` и `ADR-014` п. 5).
+            "kek_file": _top_secret("kek_file", "/etc/tbot/keys/kek.json"),
         },
     }
 
@@ -354,6 +369,128 @@ def test_секреты_в_строковой_форме_тоже_понимаю
     модель = _model()
     модель["services"]["postgres"]["secrets"] = ["db_password"]
     assert _imap(модель)["secrets_per_service"].ok
+
+
+def test_файл_ключей_у_чужого_процесса_отклоняется() -> None:
+    """KEK обязан монтироваться только панели: `engine` ключевой материал не читает.
+
+    Лишний монтированный ключ — это не «просто ещё один файл»: `ADR-014` прямо называет цену —
+    компрометация KEK вскрывает все привязки сразу, а процесс, который ключом не пользуется,
+    только добавляет поверхность (лог, дамп, `/proc/<pid>/environ`).
+    """
+    модель = _model()
+    модель["services"]["engine"]["secrets"] = [_secret("db_url"), _secret("kek_file")]
+    проверка = _imap(модель)["secrets_per_service"]
+    assert not проверка.ok
+    assert "kek_file" in проверка.detail
+    assert "engine" in проверка.detail
+
+
+def test_файл_ключей_у_web_обязан_быть_смонтирован() -> None:
+    """Без KEK панель не сможет ни зашифровать секрет привязки, ни прочитать его (§8.4)."""
+    модель = _model()
+    модель["services"]["web"]["secrets"] = [_secret("db_url")]
+    проверка = _imap(модель)["secrets_per_service"]
+    assert not проверка.ok
+    assert "kek_file" in проверка.detail
+
+
+def test_файл_ключей_в_каталоге_секретов_отклоняется() -> None:
+    """Перенос KEK в `SECRETS_ROOT` — это смена политики прав, а не «наведение порядка».
+
+    Каталог секретов обслуживает `secrets-setup.sh` (TZ §14.3): он умеет писать строку и ставить
+    режимы из своего перечня имён, а JSON с версиями ключей он создать не может. Если файл ключей
+    туда переедет, права на него начнёт определять скрипт, который о нём не знает, а TZ §8.4
+    теряет смысл (путь назван явно). Разворот этого решения — только через новый ADR.
+    """
+    модель = _model()
+    модель["secrets"]["kek_file"]["file"] = "/etc/tbot/secrets/kek.json"
+    проверка = _imap(модель)["secret_paths_policy"]
+    assert not проверка.ok
+    assert "kek_file" in проверка.detail
+
+
+def test_путь_секрета_из_dev_каталога_в_боевом_разборе_отклоняется() -> None:
+    """Секрет боевого контура не может читаться из дерева репозитория (TZ §14.3).
+
+    Путь вида `deploy/secrets/db_url` появляется, если overlay не переопределил базовый файл или
+    если состав запускают без `--env-file`/без overlay. значение при этом лежит рядом с git-деревом
+    и попадает в архив репозитория — то есть в тот же канал, из которого его читают все, у кого
+    есть доступ к клону.
+    """
+    модель = _model()
+    модель["secrets"]["db_url"]["file"] = "/opt/tbot/deploy/secrets/db_url"
+    проверка = _imap(модель)["secret_paths_policy"]
+    assert not проверка.ok
+    assert "db_url" in проверка.detail
+
+
+def test_секрет_без_поля_file_не_даёт_зелёного_вердикта() -> None:
+    """Если разбор не отдал пути, проверка путей не может быть зелёной.
+
+    Именно так выглядит тихое отключение проверки: compose перевёл секрет на `external` или
+    инлайн-`content`, и проверка, которая «ничего не нашла», отвечает OK. Здесь отсутствия пути
+    достаточно для отказа.
+    """
+    модель = _model()
+    модель["secrets"]["db_url"] = {"name": "tbot_db_url", "external": True}
+    проверка = _imap(модель)["secret_paths_policy"]
+    assert not проверка.ok
+    assert "db_url" in проверка.detail
+    assert "file" in проверка.detail
+
+
+def test_лишний_секрет_верхнего_уровня_отклоняется() -> None:
+    """Закрытый перечень путей держит и появление нового секретного файла.
+
+    Новый секрет в составе — это изменение политики (кто его создаёт, какие у него права, кто
+    читает), поэтому он обязан появится в скрипте проверки явно, а не «проскочить».
+    """
+    модель = _model()
+    модель["secrets"]["sidecar_token"] = _top_secret("sidecar_token", "/etc/tbot/secrets/sidecar")
+    проверка = _imap(модель)["secret_paths_policy"]
+    assert not проверка.ok
+    assert "sidecar_token" in проверка.detail
+
+
+def test_файл_ключей_обязан_быть_объявлен_в_секции_secrets() -> None:
+    """Монтирование KEK обязательно через `secrets:`, а не через bind-mount каталога.
+
+    Bind-mount (`volumes:`) не даёт ни политики «только туда, где читают», ни read-only по
+    умолчанию, и перестаёт быть секретом в смысле TZ §8.4/§14.3: путь виден в описании сервиса,
+    а права берёт хозяйский каталог. Поэтому отсутствие имени в `secrets:` — отказ.
+    """
+    модель = _model()
+    del модель["secrets"]["kek_file"]
+    проверка = _imap(модель)["secret_paths_policy"]
+    assert not проверка.ok
+    assert "kek_file" in проверка.detail
+
+
+def test_политика_путей_совпадает_с_фактическими_compose_файлами() -> None:
+    """Проверка путей не имеет права сверяться со своей устаревшей копией.
+
+    Как и в случае с потолками лимитов, два артефакта хранят одни и те же пути: скрипт и
+    `deploy/compose.prod.yaml`. Если пути разъедутся, `secret_paths_policy` начнёт подтверждать
+    несуществующий состав, а не фактический.
+    """
+    факты = {
+        str(имя): str(spec["file"])
+        for имя, spec in load_compose_yaml(COMPOSE_PROD)["secrets"].items()
+        if isinstance(spec, dict) and spec.get("file")
+    }
+    assert (
+        факты == check.ALLOWED_SECRET_PATHS
+    ), f"политика путей скрипта разошлась с compose.prod.yaml: {факты ^ check.ALLOWED_SECRET_PATHS}"
+    assert check.ALLOWED_SECRET_PATHS[check.KEYS_FILE].startswith(
+        f"{check.KEYS_ROOT}/"
+    ), "файл ключей обязан оставаться в отдельном каталоге (TZ §8.4)"
+    assert (
+        check.KEYS_FILE not in check.SECRETS_BY_SERVICE["caddy"]
+    ), "прокси ключевой материал не читает"
+    assert check.KEYS_FILE in check.SECRETS_BY_SERVICE["web"]
+    for сервис in ("postgres", "engine", "jobs", "migrate", "tgbot"):
+        assert check.KEYS_FILE not in check.SECRETS_BY_SERVICE[сервис], сервис
 
 
 def test_лимит_памяти_выше_потолка_тз_отклоняется() -> None:
