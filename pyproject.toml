@@ -23,6 +23,16 @@ dependencies = [
     "SQLAlchemy>=2.0.36,<2.1",
     "alembic>=1.14,<1.15",
     "psycopg[binary,pool]>=3.2,<3.3",
+    # Argon2id для `users.password_hash` (TZ §8.1, T-101). Зависимость согласована заказчиком
+    # 2026-11-21 (ask `633f8d2b`) как стоп-точка TZ §15 «новая зависимость»: лицензии
+    # argon2-cffi 25.1.0 — MIT, argon2-cffi-bindings 26.2.0 — MIT, cffi 2.1.1 — MIT-0,
+    # pycparser 3.12 — BSD-3-Clause; база OSV на 2026-11-21: 0 advisory на все четыре версии
+    # (проверка повторяется job'ом `audit`). Своя реализация Argon2 отклонена тем же решением:
+    # при m=64 MiB это десятки строк криптографии с риском ошибки, а схема `0002` уже требует
+    # канонический префикс `$argon2id$` CHECK-ограничением.
+    # Колёса есть под linux (manylinux x86_64 — образ `python:3.12-slim`) и под win_amd64
+    # (локальная разработка) — компилятор в runtime-слое не нужен.
+    "argon2-cffi>=25.1,<26",
     "httpx[socks]>=0.27,<0.28",
     "cryptography>=50.0,<51.0",
     "prometheus-client>=0.21,<0.22",
