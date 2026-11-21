@@ -22,6 +22,13 @@
 зависимость и не доменный слой: `packages/identity/*` меняет объекты ORM и не открывает
 соединений — иначе отзыв сессии и запись журнала разошлись бы по разным транзакциям (§8.7).
 
+**Исключение — счётчик частоты.** `bump_rate_bucket` фиксируется сразу, в момент инкремента
+(`apps/web/security/rate_limit.py`), а не в конце обработчика. Причина не в стиле: отказ «лимит
+исчерпан» обязан оставить след в базе (`ADR-007` — каждый лимитируемый запрос стоит запись), и
+обработчик отказа живёт в обработчике исключения, где никакого вызова `commit()` нет. Отсюда
+порядок вызовов в маршрутах: счётчик двигается **до** того, как обработчик изменил что-то ещё,
+иначе коммит счётчика попутно зафиксировал бы незавершённое состояние.
+
 **`expire_on_commit=False`.** После `commit()` обработчик ещё читает объект сессии (шаг входа,
 `id` для вывода CSRF-токена, отметки для списка устройств). При значении по умолчанию каждое такое
 чтение ушло бы новым запросом, а после закрытия соединения — ошибкой.
@@ -34,17 +41,20 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Protocol
 
 from fastapi import Request
 from sqlalchemy import create_engine, select
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from packages.common.config import Settings
 from packages.common.db import sqlalchemy_url
 from packages.identity.passwords import hash_password, verify_password
-from packages.storage.models import User, UserSession
+from packages.storage.models import RateBucket, User, UserSession
 
 #: Верхняя граница длины `user_agent`: значение приходит из заголовка, которое контролирует клиент,
 #: а колонка `sessions.user_agent` — `TEXT` без CHECK (при этом §8.3 показывает её пользователю в
@@ -84,7 +94,43 @@ class Store(Protocol):
         """
 
     def add(self, obj: User | UserSession) -> None:
-        """Поставить объект в транзакцию текущего запроса."""
+        """Поставить объект в транзакцию текущего запроса.
+
+        `RateBucket` в перечне намеренно нет: счётчик двигается только через `bump_rate_bucket`, а
+        не через `add` — иначе два запроса в одно окно дали бы `IntegrityError` вместо одного
+        счётчика (`ADR-007`: окно живёт в первичном ключе).
+        """
+
+    def bump_rate_bucket(
+        self,
+        *,
+        scope: str,
+        bucket_key: str,
+        window_start: datetime,
+        window_seconds: int,
+    ) -> int:
+        """Увеличить окно счётчика на единицу и вернуть новое значение (`ADR-007`).
+
+        Один запрос, а не «прочитать — сложить — записать»: `INSERT … ON CONFLICT
+        (scope, bucket_key, window_start) DO UPDATE SET attempts = rate_buckets.attempts + 1
+        RETURNING attempts` — единственный способ не потерять попытки, когда в одно окно пришли
+        два запроса из разных процессов.
+        """
+
+    def newest_counted_window(
+        self,
+        *,
+        scope: str,
+        bucket_key: str,
+        min_attempts: int,
+        window_start_after: datetime,
+    ) -> BucketWindow | None:
+        """Самое свежее окно области по субъекту, где счётчик не меньше порога.
+
+        Форма запроса повторяет первичный ключ счётчика («область + субъект + окна не старше
+        границы») — ровно то, для чего составной PK и заведён. Состояние читается из базы, а не
+        держится в памяти: отказ «адрес закрыт» обязан переживать рестарт контейнера (`ADR-007`).
+        """
 
     def commit(self) -> None:
         """Зафиксировать изменения текущего запроса.
@@ -92,6 +138,21 @@ class Store(Protocol):
         Точку вызова выбирает обработчик: у неудачной попытки входа коммит обязателен (счётчик
         неудач обязан пережить запрос, §8.1), у отказа CSRF — нет (состояние не менялось).
         """
+
+
+@dataclass(frozen=True)
+class BucketWindow:
+    """Окно счётчика частоты в том виде, в каком его читает механизм лимитов (`ADR-007`).
+
+    `window_seconds` возвращается вместе с `window_start`, а не подставляется из константы
+    приложения: срок бана выводится из **сохранённой** пары (`window_start + window_seconds +
+    IP_BAN_DURATION`, `docs/adr/ADR-009`, ask `c53daa01`). Правка окна в коде не должна задним
+    числом менять срок уже выданного отказа.
+    """
+
+    window_start: datetime
+    window_seconds: int
+    attempts: int
 
 
 class SqlStore:
@@ -113,6 +174,61 @@ class SqlStore:
 
     def commit(self) -> None:
         self._session.commit()
+
+    def bump_rate_bucket(
+        self,
+        *,
+        scope: str,
+        bucket_key: str,
+        window_start: datetime,
+        window_seconds: int,
+    ) -> int:
+        statement = (
+            postgresql_insert(RateBucket)
+            .values(
+                scope=scope,
+                bucket_key=bucket_key,
+                window_start=window_start,
+                window_seconds=window_seconds,
+                attempts=1,
+            )
+            .on_conflict_do_update(
+                index_elements=["scope", "bucket_key", "window_start"],
+                set_={"attempts": RateBucket.attempts + 1},
+            )
+            .returning(RateBucket.attempts)
+        )
+        value = self._session.execute(statement).scalar_one()
+        return int(value)
+
+    def newest_counted_window(
+        self,
+        *,
+        scope: str,
+        bucket_key: str,
+        min_attempts: int,
+        window_start_after: datetime,
+    ) -> BucketWindow | None:
+        statement = (
+            select(RateBucket.window_start, RateBucket.window_seconds, RateBucket.attempts)
+            .where(
+                RateBucket.scope == scope,
+                RateBucket.bucket_key == bucket_key,
+                RateBucket.attempts >= min_attempts,
+                RateBucket.window_start > window_start_after,
+            )
+            .order_by(RateBucket.window_start.desc())
+            .limit(1)
+        )
+        row = self._session.execute(statement).first()
+        if row is None:
+            return None
+        window_start: datetime = row[0]
+        window_seconds: int = row[1]
+        attempts: int = row[2]
+        return BucketWindow(
+            window_start=window_start, window_seconds=window_seconds, attempts=attempts
+        )
 
 
 def build_session_factory(settings: Settings) -> tuple[Engine | None, sessionmaker[Session] | None]:

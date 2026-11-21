@@ -18,6 +18,7 @@ CSRF-токена и объясняющих страниц должны запу
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated, Final, cast
 
 from fastapi import APIRouter, Depends, FastAPI
@@ -25,12 +26,13 @@ from fastapi.testclient import TestClient
 from httpx import Response
 
 from apps.web.main import create_app
+from apps.web.routes.sessions import RateLimitedMutation
 from apps.web.security.sessions import (
     SESSION_COOKIE_NAME,
     Principal,
     require_full_session,
 )
-from apps.web.store import Store, get_store
+from apps.web.store import BucketWindow, Store, get_store
 from packages.common.config import Settings
 from packages.identity.sessions import IssuedSession, token_hash_of
 from packages.identity.users import new_user
@@ -58,6 +60,7 @@ class MemoryStore:
     def __init__(self) -> None:
         self._users: dict[str, User] = {}
         self._sessions: dict[str, UserSession] = {}
+        self._buckets: dict[tuple[str, str, datetime], tuple[int, int]] = {}
         self.commits: int = 0
         self.hash_lookups: list[str] = []
 
@@ -90,7 +93,58 @@ class MemoryStore:
     def commit(self) -> None:
         self.commits += 1
 
+    # ─── счётчик частоты запросов (срез `R3d`, `ADR-007`) ────────────────────────────
+    #
+    # Здесь хранятся те же окна, что и в `rate_buckets`, но без схемы: атомарность
+    # `INSERT … ON CONFLICT DO UPDATE`, CHECK перечня областей и набора окон, длина ключа и
+    # то, что `DELETE` идёт по индексу `window_start`, проверяет живой файл
+    # `tests/integration/test_rate_limit_mechanism_db.py` (job `migrations`). Переносить его
+    # проверки в память нельзя.
+
+    def bump_rate_bucket(
+        self,
+        *,
+        scope: str,
+        bucket_key: str,
+        window_start: datetime,
+        window_seconds: int,
+    ) -> int:
+        key = (scope, bucket_key, window_start)
+        _, attempts = self._buckets.get(key, (window_seconds, 0))
+        attempts += 1
+        self._buckets[key] = (window_seconds, attempts)
+        return attempts
+
+    def newest_counted_window(
+        self,
+        *,
+        scope: str,
+        bucket_key: str,
+        min_attempts: int,
+        window_start_after: datetime,
+    ) -> BucketWindow | None:
+        candidates = [
+            (start, window_seconds, attempts)
+            for (row_scope, row_key, start), (window_seconds, attempts) in self._buckets.items()
+            if row_scope == scope
+            and row_key == bucket_key
+            and attempts >= min_attempts
+            and start > window_start_after
+        ]
+        if not candidates:
+            return None
+        start, window_seconds, attempts = max(candidates, key=lambda row: row[0])
+        return BucketWindow(window_start=start, window_seconds=window_seconds, attempts=attempts)
+
     # ─── вспомогательное для проверок ─────────────────────────────────────────────────────
+
+    def buckets(self) -> dict[tuple[str, str, datetime], int]:
+        """Снимок окон счётчика для проверок: (область, ключ, начало окна) → attempts.
+
+        Нужен ровно для одного класса проверок: «сколько окон завелось на запрос». Значение
+        `window_seconds` в снимок не входит намеренно — окно проверяют живые проверки схемы.
+        """
+        return {key: attempts for key, (_, attempts) in self._buckets.items()}
 
     def sessions(self) -> tuple[UserSession, ...]:
         return tuple(self._sessions.values())
@@ -116,18 +170,30 @@ class TimingSpy:
 
 
 def probe_router() -> APIRouter:
-    """Маршрут-щуп, охраняемый `require_full_session`.
+    """Два щупа: охраняемый `require_full_session` GET и мутация с пределом частоты.
 
     Боевых маршрутов консоли, требующих `'full'`, в этом срезе ещё нет: они появятся вместе с кодом
     2FA в `T-103`, где их проверит параметризованная `test_route_requires_full_auth`. Пока их нет,
     правило §8.2 («сессия на шаге `'password'` дальше страницы кода и `/logout` не пущена»)
     проверяется на щупе — иначе оно осталось бы записанным в код без единой проверки.
+
+    `POST /probe-mutation` нужен счёту частоты: на настоящем `/logout` предел
+    «60 мутаций в минуту на пользователя» недостижим — первая попытка отзывает сессию, и дальше
+    маршрут отвечает редиректом «сессия не подходит», не доходя до счётчика. Щуп зависит от той же
+    композитной зависимости `RateLimitedMutation`, что и реальный выход, поэтому проверяется именно
+    механизм, а не подделка. Покрытие реальных мутаций держит контрактный тест.
     """
     router = APIRouter()
 
     @router.get("/probe-full")
     def probe(
         principal: Annotated[Principal, Depends(require_full_session)],
+    ) -> dict[str, str]:
+        return {"session_id": str(principal.session.id), "step": principal.session.auth_step}
+
+    @router.post("/probe-mutation")
+    def probe_mutation(
+        principal: RateLimitedMutation,
     ) -> dict[str, str]:
         return {"session_id": str(principal.session.id), "step": principal.session.auth_step}
 

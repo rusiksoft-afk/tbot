@@ -13,13 +13,15 @@
   у Jinja2 по умолчанию экранирование **выключено**;
 * политика отказов слоя входа собрана в обработчиках исключений, а не размазана по маршрутам:
   `SessionRedirect` → `302` на страницу состояния, отказ CSRF → `403` без подробностей, слишком
-  большое тело формы → `413`, нет адреса базы → `503`, повреждённый хэш пароля → `503`. Один
+  большое тело формы → `413`, нет адреса базы → `503`, повреждённый хэш пароля → `503`, предел
+  частоты по адресу и бан адреса → `429` с `Retry-After` (§8.2, §8.3). Один
   обработчик на случай нужен не для красоты: «отзыв отражается немедленно» (§8.3) и «CSRF
   обязателен для всех мутаций» (§8.8) теряются ровно тогда, когда каждый маршрут объясняет
   состояние по-своему.
 
-Заголовки CSP/HSTS/`Referrer-Policy`/`X-Content-Type-Options`/`Permissions-Policy` здесь ещё не
-ставятся — это следующий срез `T-102` (`R3c`), и контракт на них появится вместе с ними.
+Заголовки CSP/HSTS/`Referrer-Policy`/`X-Content-Type-Options`/`Permissions-Policy` ставит
+middleware самого приложения (срез `R3c`): значения побайтово совпадают с `deploy/caddy/Caddyfile`, а
+расхождение ловит контракт. Срез `R3d` добавил отказ `429` — пределы частоты §8.3 и бан адреса §8.2.
 """
 
 from __future__ import annotations
@@ -38,6 +40,7 @@ from apps.web.routes import login as login_routes
 from apps.web.routes import sessions as session_routes
 from apps.web.security.csrf import CsrfRejected
 from apps.web.security.headers import apply_security_headers
+from apps.web.security.rate_limit import RateLimitExceeded
 from apps.web.security.sessions import REASON_QUERY, SessionRedirect, clear_session_cookie
 from apps.web.store import LoginTiming, StoreUnavailableError, build_session_factory
 from packages.common import metrics
@@ -203,6 +206,30 @@ def create_app(settings: Settings) -> FastAPI:
         return JSONResponse(
             {"status": "too_large", "detail": "слишком большое тело формы"},
             status_code=413,
+        )
+
+    @app.exception_handler(RateLimitExceeded)
+    async def _rate_limited(request: Request, exc: RateLimitExceeded) -> JSONResponse:
+        """`429` с `Retry-After` для мутаций, у которых нет своей объясняющей страницы.
+
+        Политика отказа зафиксирована решением заказчика (ask `ba6a9076`): код обязан быть именно
+        `429`, а не `403` и не `200` с текстом — `Retry-After` часть ответа, по нему ориентируются и
+        браузер, и интеграционные проверки.
+
+        Маршруты входа этот ответ не отдают: им нужна ссылка на страницу состояния `/locked` (§9),
+        поэтому они ловят исключение сами и объясняют его HTML-страницей. Один обработчик на
+        остальные мутации нужен потому, что иначе «429 без Retry-After» появилось бы ровно там, где
+        никто не проверял. Запись в `audit_log` (§8.7) здесь не делается осознанно: имена событий и
+        цепочка хэшей — `T-109`, перенос зафиксирован `docs/adr/ADR-009`.
+        """
+        log.warning("rate_limited", path=request.url.path, scope=exc.scope)
+        return JSONResponse(
+            {
+                "status": "rate_limited",
+                "detail": "слишком много запросов, повторите позже",
+            },
+            status_code=429,
+            headers={"Retry-After": str(exc.retry_after)},
         )
 
     @app.exception_handler(StoreUnavailableError)

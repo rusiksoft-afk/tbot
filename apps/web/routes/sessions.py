@@ -26,7 +26,10 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from apps.web.security.csrf import csrf_context, require_csrf
+from apps.web.security.rate_limit import MUTATION_USER_SCOPE, enforce_scope
 from apps.web.security.sessions import (
+    LOCK_REASON_ATTEMPTS,
+    LOCK_REASON_RATE,
     LOCKED_PATH,
     LOGIN_PATH,
     LOGOUT_PATH,
@@ -45,6 +48,26 @@ router = APIRouter()
 
 #: Зависимость «живая сессия + обязательный CSRF-токен» (матрица §8.8: мутация без токена → `403`).
 CsrfPrincipal = Annotated[Principal, Depends(require_csrf)]
+
+
+def require_mutation_rate_limit(principal: CsrfPrincipal, store: StoreDep) -> Principal:
+    """Мутация пользователя учтена счётчиком частоты (§8.3: 60 запросов/мин/пользователь).
+
+    Ключ — `id` пользователя, а не сессии и не адреса: §8.3 держит предел «на пользователя»,
+    и тогда перебор одного пользователя с нескольких сессий лимит не размывает, а несколько
+    пользователей за провайдерским NAT не мешают друг другу (`ADR-007`).
+
+    Порядок обязан быть «сначала токен, потом счётчик»: отказ CSRF не должен стоить обращений в
+    базу и двигать счётчик (`ADR-008`), иначе подделка запроса ещё и расходует лимит жертвы.
+    Проверка покрытия — контрактная: каждая мутация либо зависит от этой зависимости, либо
+    поименована с обоснованием, как и в матрице CSRF.
+    """
+    enforce_scope(store, MUTATION_USER_SCOPE, str(principal.session.user_id))
+    return principal
+
+
+#: Мутация «живая сессия + токен + счётчик частоты».
+RateLimitedMutation = Annotated[Principal, Depends(require_mutation_rate_limit)]
 
 #: Объяснения по закрытому набору причин. Формулировки адресованы человеку (TZ §9: состояния должны
 #: быть внятными), а не оператору: коды и числовые границы в текст не выносятся — страница,
@@ -69,12 +92,13 @@ GENERIC_EXPLANATION: Final = "Сеанс завершён. Войдите зан
 #: Объяснения заблокированного входа (`docs/tz/09-web-ui-and-design.md` §9: `/locked`).
 #: Набор закрыт и не совпадает с набором причин сеанса: блокировка входа и завершение сеанса —
 #: разные состояния, и путать их в тексте нельзя (у первого нет «войти заново» прямо сейчас).
-#: Код `rate` появляется вместе со срезом `R3d` (предел частоты по адресу); он включён сюда
-#: заранее, потому что страница обязана объяснять причину, а не отказывать в объяснении.
+#: Код `rate` ставит срез `R3d` (`docs/adr/ADR-007`): предел частоты по адресу и бан окна
+#: перебора §8.2. Он был включён сюда заранее, потому что страница обязана объяснять причину,
+#: а не отказывать в объяснении.
 LOCK_EXPLANATIONS: Final[dict[str, str]] = {
-    "attempts": "Вход в эту учётную запись временно заблокирован после нескольких неверных "
+    LOCK_REASON_ATTEMPTS: "Вход в эту учётную запись временно заблокирован после нескольких неверных "
     "попыток ввести пароль. Блокировка снимается сама — попробуйте позже, менять ничего не нужно.",
-    "rate": "С этого адреса было слишком много попыток входа за короткое время. Предел держится "
+    LOCK_REASON_RATE: "С этого адреса было слишком много попыток входа за короткое время. Предел держится "
     "на адресе, а не на учётной записи: повторите позже.",
 }
 
@@ -131,7 +155,7 @@ def login_locked(
 
 @router.post(LOGOUT_PATH, response_class=Response)
 def logout(
-    principal: CsrfPrincipal,
+    principal: RateLimitedMutation,
     store: StoreDep,
 ) -> Response:
     """Выйти: отозвать текущую сессию и стереть куку (§8.3).
