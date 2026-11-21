@@ -43,6 +43,7 @@ from apps.web.security.sessions import SESSION_COOKIE_NAME, Principal
 from apps.web.store import USER_AGENT_MAX_LEN
 from packages.common.clock import utc_now
 from packages.common.config import Settings
+from packages.common.db import sqlalchemy_url
 from packages.identity.sessions import (
     ABSOLUTE_TIMEOUT,
     IDLE_TIMEOUT,
@@ -69,8 +70,13 @@ _LOGIN_PREFIX = "t102r3a"
 
 @pytest.fixture(scope="module")
 def engine() -> Iterator[Engine]:
-    """Движок тестового чтения: отдельный от приложения, чтобы видеть зафиксированное."""
-    created = create_engine(_DB_URL, pool_pre_ping=True)
+    """Движок тестового чтения: отдельный от приложения, чтобы видеть зафиксированное.
+
+    Адрес берём из `TBOT_DB_URL` и обязательно прогоняем через `sqlalchemy_url`: в job'е
+    `migrations` эта переменная стоит в прямой форме `postgresql://…`, а SQLAlchemy 2.0 на такой
+    схеме ищет `psycopg2` (в проекте драйвер один — psycopg3, `packages/common/db.py`).
+    """
+    created = create_engine(sqlalchemy_url(_DB_URL), pool_pre_ping=True)
     yield created
     created.dispose()
 

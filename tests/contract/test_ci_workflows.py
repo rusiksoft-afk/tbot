@@ -21,6 +21,7 @@ import yaml
 from tests.paths import COMPOSE_PROD, load_compose_yaml
 
 ROOT = Path(__file__).resolve().parents[2]
+_LIVE_DIR = Path(__file__).resolve().parents[1] / "integration"
 CI_FILE = ROOT / ".github" / "workflows" / "ci.yml"
 IMAGE_FILE = ROOT / ".github" / "workflows" / "image.yml"
 PROD_ENV_FILE = ROOT / "deploy" / "tbot.prod.env"
@@ -388,3 +389,25 @@ def test_caddyfile_валидируется_образом_из_env_файла_�
     assert (
         "--config /etc/caddy/Caddyfile" in script
     ), "валидировать надо тот путь, на котором Caddyfile стоит в контейнере площадки"
+
+
+def test_каждая_живая_проверка_базы_имеет_свой_шаг_в_ci() -> None:
+    """Ни один файл живых проверок базы не должен остаться без шага.
+
+    Причина не в аккуратности: живой файл, который никто не вызывает, выглядит как покрытие.
+    Локально на Windows он пропускается (`TBOT_DB_URL` нет), поэтому «проверка есть» без шага в
+    job'е `migrations` не значит ничего. Шаг обязан вызывать pytest с `-rs`: группа, которая молча
+    пропускается, неотличима от группы, которая прошла.
+    """
+    runs = [str(step.get("run", "")) for step in _load(CI_FILE)["jobs"]["migrations"]["steps"]]
+    live = sorted(path.name for path in _LIVE_DIR.glob("*_db.py"))
+    assert live, "каталог с живыми проверками пуст — проверка потеряла смысл"
+    unregistered = [name for name in live if not any(name in run for run in runs)]
+    assert (
+        not unregistered
+    ), f"эти живые файлы не исполняются ни одним шагом job'а `migrations`: {unregistered}"
+    silent = [name for name in live if not any(name in run and "-rs" in run for run in runs)]
+    assert not silent, (
+        f"шаг, исполняющий {silent}, не показывает пропуски (нет -rs): молча пропущенная группа "
+        "неотличима от прошедшей"
+    )

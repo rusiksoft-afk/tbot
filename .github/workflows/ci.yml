@@ -140,6 +140,14 @@ jobs:
       # `tests/contract/test_rate_limits_schema.py`.
       - name: счётчик частоты запросов на живой базе (TZ §8.3, ADR-007)
         run: python -m pytest tests/integration/test_rate_buckets_db.py -q -rs
+      # Слой входа поверх живой схемы (TZ §8.3, срез R3a): сессия появляется в таблице и находится
+      # по `token_hash` (поиска по значению куки нет), `CHECK token_hash_format` отклоняет запись
+      # значения куки вместо хэша, адрес из правого элемента `X-Forwarded-For` ложится в `INET`
+      # канонически (v4 и v6), продление idle и отзыв видны следующему обращению, `RESTRICT` не
+      # даёт удалить учётку с сессиями. Офлайн-половинка — `tests/integration/
+      # test_web_session_cookie.py` и `test_web_csrf.py` (они исполняются в job `тесты и покрытие`).
+      - name: слой входа на живой базе (TZ §8.3, R3a)
+        run: python -m pytest tests/integration/test_web_identity_db.py -q -rs
 
   secret-scan:
     name: поиск секретов (gitleaks)
