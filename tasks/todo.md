@@ -310,6 +310,34 @@
     `apps/web` (области, инкремент, `429`), фоновая чистка окон, `X-Forwarded-For`, CSRF/куки.
     Отдельно: `argon2-cffi` из `T-101` меняет образ —
     digest'ы переснимаются перед деплоем, этого среза на площадке нет.
+  - Статус 2026-11-21 (срез `R3a`+`R3b`, `apps/web`): **слой входа поднят**. `apps/web/store.py`
+    (фабрика движка из `db_url` через `sqlalchemy_url`, узкий протокол `Store`, `LoginTiming` для
+    одинаковой стоимости веток «логина нет»/«пароль не тот»), `apps/web/security/{clients,sessions,
+    csrf}.py`, `apps/web/forms.py` (разбор `x-www-form-urlencoded` своим кодом: `python-multipart`
+    не добавлялся — TZ §15, оформление в `ADR-009`), маршруты `GET/POST /login`, `POST /logout`,
+    `GET /session-expired` и шаблоны `base`/`login`/`session_expired` (`autoescape`,
+    `StrictUndefined`). Кука `tbot_session`: `HttpOnly`, `Secure`, `SameSite=Lax`, путь `/`, без
+    `Max-Age`/`Expires`; поиск только по SHA-256 значения; `revoked_at` проверяется на каждом
+    запросе; шаг `'password'` полного доступа не даёт (§8.2), до `T-103` охраняемый маршрут ведёт
+    на `/login`, а не на несуществующий `/totp`. Клиентский адрес — правый валидный элемент
+    `X-Forwarded-For` в каноническом виде (иначе `2001:db8::1` и `2001:db8:0:0:0:0:0:1` дали бы два
+    счётчика). Проверки: `tests/integration/test_web_session_cookie.py` (26),
+    `tests/integration/test_web_csrf.py` (20, обязательная `test_csrf_required` из §8.8),
+    `tests/contract/test_web_security_contract.py` (16, покрытие всех мутационных маршрутов +
+    метки ТЗ/ADR + отсутствие `multipart`), `tests/integration/test_web_identity_db.py` (13, только
+    job `migrations`: сессия в таблице и поиск по `token_hash`, `CHECK token_hash_format` против
+    записи значения куки вместо хэша, адрес в `INET` канонически v4/v6, продление и отзыв видны
+    следующему обращению, `RESTRICT` на удалении учётки с сессиями). Границы среза — ответы
+    заказчика (ask `c53daa01`): минимальный `/login` входит в `T-102` (`/totp` и шаг `'full'` —
+    `T-103`), запись в `audit_log` на отказ перенесена в `T-109` (осознанное отклонение от
+    буквальной формулировки `ADR-007`, компенсирующие контроля перечислены), срок бана IP выводится
+    из `window_start + window_seconds + IP_BAN_DURATION` без колонки и без ревизии `0004`.
+    Разбор — `docs/HANDOFF.md §1.30`. Задача **не закрыта**: остались `R3c` (CSP/HSTS/nosniff/
+    `Referrer-Policy`/`Permissions-Policy`, страница `/locked`), `R3d` (области, инкремент окна,
+    `429` + `Retry-After` + запись в журнал, `IP_BAN_DURATION` в маршрутах входа, чистка окон в
+    `jobs` раз в час, окна старше 24 ч), `R3e` (список сессий, отзыв по одной/всех) и
+    интеграционный вариант строки §8.8 «смена пароля отзывает сессии» — он появляется вместе с
+    маршрутом смены пароля.
 - [ ] **T-103** TOTP 2FA: привязка (QR+секрет, подтверждение 2 кода), вход с обязательным кодом, окно ±1, одноразовость кода
   - Приёмка: `REQ-identity-*` TZ §8.2; все маршруты требуют `auth_step='full'`
   - Проверка: `test_totp_flow`, `test_route_requires_full_auth` (параметризовано по всем маршрутам)

@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ru">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}{{ page_title }} — консоль tbot{% endblock %}</title>
+    {# Значение — base64url без «=» (ADR-008), поэтому экранирование Jinja2 его не портит и
+       локальное отключение экранирования не требуется: §8.3 запрещает его, и шаблоны этого слоя
+       не используют его вовсе. Мета нужна HTMX: `hx-headers='{"X-CSRF-Token": …}'`. Пустое
+       значение означает «сессии ещё нет» — форма входа токена не имеет (ADR-009). #}
+    <meta name="csrf-token" content="{{ csrf_token }}">
+  </head>
+  <body>
+    <main>
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>
