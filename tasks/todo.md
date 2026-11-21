@@ -287,6 +287,17 @@
     («одним комплектом»), но при следующем деплое обязателен `run --rm migrate` из-за `0003`.
     Открытым остался один вопрос: кто держит временный бан IP из §8.2 (окно 300 секунд) — приложение,
     `fail2ban` по логам или оба слоя; без ответа CHECK `window_seconds` остаётся `= 60`.
+  - Статус 2026-11-21 (вторая половина): **схема счётчика готова** — ревизия `0003_rate_counters`
+    (`rate_buckets`: PK `(scope, bucket_key, window_start)`, четыре области из §8.3 в CHECK,
+    `window_seconds = 60` с серверным default, `attempts >= 0`, индекс `window_start` под чистку,
+    внешних ключей нет намеренно; + `ck_sessions_token_hash_format`) и модель `RateBucket`.
+    Ревизия на живую ВМ не применялась (деплой отложен), при постановке обязателен
+    `run --rm migrate`. Проверки: `tests/contract/test_rate_limits_schema.py` (9),
+    `tests/integration/test_rate_buckets_db.py` (8, новый шаг CI в job `migrations`), обновлённый
+    `tests/contract/test_identity_schema.py` (16; цепочка ревизий — head `0003`, разбор офлайн-SQL
+    учитывает `ALTER TABLE … ADD CONSTRAINT`, появился перечень обоснованных таблиц вне §4.1 —
+    `_OPERATIONAL_TABLES`). Разбор — `docs/HANDOFF.md §1.27`. Не сделано: сам механизм лимитов в
+    `apps/web` (области, инкремент, `429`), фоновая чистка окон, `X-Forwarded-For`, CSRF/куки.
     Отдельно: `argon2-cffi` из `T-101` меняет образ —
     digest'ы переснимаются перед деплоем, этого среза на площадке нет.
 - [ ] **T-103** TOTP 2FA: привязка (QR+секрет, подтверждение 2 кода), вход с обязательным кодом, окно ±1, одноразовость кода
