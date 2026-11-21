@@ -64,13 +64,13 @@ GRANT tbot_app TO CURRENT_USER                     -- чтобы провери�
 `REVOKE` по несуществующей таблице падает.
 
 ```bash
-cd /opt/tbot
-COMPOSE="sudo docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml \
-  --env-file deploy/tbot.prod.env"
+# Пути — абсолютные и под sudo: /opt/tbot имеет режим 750 root:root, и под rusiksoft в него
+# нельзя войти (замер на площадке: `cd /opt/tbot` → Permission denied, а перенаправление
+# `< /opt/tbot/deploy/postgres/roles.sql` в шелле не-root отвечает Permission denied ещё до
+# обращения к базе — его тоже надо выполнять внутри `sudo sh -c`).
+COMPOSE="sudo docker compose -f /opt/tbot/deploy/compose.yaml   -f /opt/tbot/deploy/compose.prod.yaml --env-file /opt/tbot/deploy/tbot.prod.env"
 $COMPOSE run --rm migrate                        # alembic upgrade head
-sudo docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml --env-file deploy/tbot.prod.env \
-  exec -T postgres psql -X -v ON_ERROR_STOP=1 -U tbot -d tbot -f - \
-  < deploy/postgres/roles.sql
+sudo sh -c 'docker exec -i tbot-postgres-1 psql -U tbot -d tbot -v ON_ERROR_STOP=1 -q -f -   < /opt/tbot/deploy/postgres/roles.sql'
 ```
 
 Файл идемпотентен, его повторяют после каждой ревизии, которая добавляет таблицу
@@ -106,66 +106,87 @@ SQL
 
 ## 5. Переключение приложения на `tbot_app`
 
-Без этого шага `REQ-identity-04` на площадке не выполняется: приложение ходит владельцем.
-Шаг меняет пользователя в секрете `db_url`, поэтому согласуется с заказчиком (значение
+**Прежде чем делать этот шаг — прочитать §5.1: в текущем составе он ломает миграции.** Шага нет
+в плане приёмки `T-009` именно по этой причине; права роли при этом созданы и проверены (§3, §4).
+
+Без шага `REQ-identity-04` на площадке не выполняется: приложение ходит ролью-владельцем. Шаг
+меняет пользователя в секрете `db_url`, поэтому согласуется с заказчиком (значение
 машинно-генерируемое, режим 2 ADR-004 — его пересобирает сам скрипт, агент его не видит).
 
 ```bash
-# 1) Пароль тот же, что в `db_password`: значение берётся из смонтированного секрета внутри
-#    контейнера и не попадает в argv (в `ps` видно только текст команды, не значение).
-sudo docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml \
-  --env-file deploy/tbot.prod.env exec -T postgres sh -c \
-  'printf "ALTER ROLE tbot_app PASSWORD %L; ALTER ROLE tbot_app LOGIN;\n" \
-     "$(cat /run/secrets/db_password)" | psql -q -X -v ON_ERROR_STOP=1 -U tbot -d tbot'
+# 1) Роль обязана получить пароль и LOGIN до перезапуска сервисов, иначе приложение отвалится с
+#    `password authentication failed for user "tbot_app"`. Значение берётся из смонтированного
+#    секрета внутри контейнера и не попадает в argv (в `ps` видно только текст команды).
+$COMPOSE exec -T postgres sh -c   'printf "ALTER ROLE tbot_app PASSWORD %L; ALTER ROLE tbot_app LOGIN;
+"      "$(cat /run/secrets/db_password)" | psql -q -X -v ON_ERROR_STOP=1 -U tbot -d tbot'
 
-# 2) Пересобрать `db_url` с новым пользователем (значение не показывается): скрипт собирает DSN
-#    сам из db_password и параметров состава.
-sudo TBOT_DB_USER=tbot_app /opt/tbot/deploy/vps/secrets-setup.sh db_password db_url
+# 2) Пересобрать `db_url` с новым пользователем (значение не показывается). Форма запуска —
+#    `--only`, а НЕ позиционные имена: замер на площадке 2026-11-21 01:08 UTC,
+#    `secrets-setup.sh db_password db_url` отвечает `неизвестный аргумент: db_password` и не
+#    делает ничего. `--force` обязателен: под sudo без терминала скрипт файлы не пишет.
+#    `db_password` в список не включать — DSN собирается из уже лежащего значения, скрипт
+#    читает файл сам; лишний перезапуск пароля владельца не нужен (значение фиксируется в томе
+#    `pgdata` при `initdb`).
+sudo TBOT_DB_USER=tbot_app bash /opt/tbot/deploy/vps/secrets-setup.sh --only db_url --force
 
-# 3) Перезапуск сервисов приложения (списком сервисов, не всего состава) и проверка.
+# 3) Форма значений.
+sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --check
+
+# 4) Перезапуск сервисов приложения (списком сервисов, не всего состава) и проверка, под кем ходит процесс.
 $COMPOSE up -d web engine jobs
-$COMPOSE exec -T web python -c "from packages.common.config import load_settings; \
-from packages.common.db import engine_from_settings; import sqlalchemy as sa; \
-e = engine_from_settings(load_settings()); \
-print(e.connect().execute(sa.text('select current_user')).scalar())"
+$COMPOSE exec -T web python -c "from packages.common.config import load_settings; from packages.common.db import engine_from_settings; import sqlalchemy as sa; e = engine_from_settings(load_settings()); print(e.connect().execute(sa.text('select current_user')).scalar())"
 ```
 
 Ожидаемое в последней строке — `tbot_app`, а не `tbot`. Дальше проверка §4 должна дать тот же
 набор прав уже «в бою», а `web` — отвечать 200 через Caddy.
 
-Гигиена переключения: в приведённых командах пароль `tbot_app` совпадает со значением
-`db_password` (оно же — пароль роли `tbot`, который фиксируется в томе `pgdata` при `initdb`).
-Работать будет, но два входа с одним значением — это лишний путь: зная DSN приложения, получают
-доступ владельца схемы. Правильный вариант — отдельный секрет `db_app_password` (режим 2 ADR-004:
-значение генерирует скрипт), тогда `db_url` собирается с ним, а `db_password` остаётся паролем
-владельца. Это меняет перечень секретов: файлы `/etc/tbot/secrets/*`, список `MOUNTED_NAMES` и
-проверки `scripts/deploy_check.py`, ожидания `tests/unit/test_deploy_check_secrets.py`,
-секреты состава в `deploy/compose.yaml` и `deploy/compose.prod.yaml`, и ADR-005 (права
-файла-секрета, монтируемого составом). Решение — за заказчиком (`docs/HANDOFF.md §4`); пока
-перечень секретов не менялся, переключение делается общим паролем.
+Репетиция команды п. 2 безопасна и проверяется до переключения: замер 2026-11-21 01:08 UTC —
+`TBOT_DB_USER=tbot … --only db_url --force` (пользователь по умолчанию) даёт побайтово тот же
+файл (93 байта, изменился только `mtime`), `--check` зелёный, `run --rm migrate` — `rc=0`.
+То есть команду можно прогнать до шага переключения и убедиться, что она ничего не ломает.
 
-Грабли шага:
+Гигиена переключения: в п. 1 пароль `tbot_app` совпадает со значением `db_password` (оно же —
+пароль роли `tbot`, зафиксированный в томе `pgdata` при `initdb`). Работать будет, но два входа
+с одним значением — лишний путь: зная DSN приложения, получают доступ владельца схемы. Правильный
+вариант — отдельный секрет `db_app_password` (режим 2 ADR-004: значение генерирует скрипт), тогда
+`db_url` собирается с ним, а `db_password` остаётся паролем владельца. Это меняет перечень
+секретов: файлы `/etc/tbot/secrets/*`, `SECRET_NAMES`/`MOUNTED_NAMES` в
+`deploy/vps/secrets-setup.sh`, проверки `scripts/deploy_check.py`, ожидания
+`tests/unit/test_deploy_check_secrets.py`, секреты состава в `deploy/compose.yaml` и
+`deploy/compose.prod.yaml`, и ADR-005. Решение — за заказчиком (`docs/HANDOFF.md §4`).
 
-- Порядок «сначала секрет, потом база» (§1.20) здесь не работает наоборот: роль обязана
-  получить пароль и `LOGIN` до перезапуска сервисов, иначе приложение отвалится с
-  `password authentication failed for user "tbot_app"`.
-- `secrets-setup.sh` собирает DSN из `TBOT_DB_USER`/`TBOT_DB_HOST`/`TBOT_DB_PORT`/
-  `TBOT_DB_NAME` (значения по умолчанию — параметры состава). Без `TBOT_DB_USER=tbot_app`
-  в `db_url` вернётся пользователь `tbot`, и переключение незаметно откатится.
-- `scripts/deploy_check.py --check` проверяет форму `db_url` (не содержимое): после
-  переключения он обязан остаться зелёным, длина файла изменится на 4 символа
-  (`tbot` → `tbot_app`).
-- Роль `tbot` остаётся владельцем схемы и суперпользователем кластера (её создаёт образ
-  postgres).
-  Отзыв прав у собственного superuser'а не работает — это отдельная задача по ужесточению
-  кластера, не часть `T-009`.
+### 5.1 Препятствие: `migrate` монтирует тот же секрет `db_url`
+
+Замер на площадке 2026-11-21 01:00 UTC (`SET ROLE tbot_app` после применения `roles.sql`):
+
+```
+CREATE TABLE под ролью приложения: отказ SQLSTATE=42501 (permission denied for schema public)
+ALTER TABLE audit_log:              отказ SQLSTATE=42501
+```
+
+В базовом составе секрет `db_url` смонтирован четырём сервисам — `web`, `engine`, `jobs` и
+`migrate`, у которого `command: ["alembic", "upgrade", "head"]` (`deploy/compose.yaml`). Значит
+замена `db_url` на роль приложения переводит на неё и миграции, а у роли приложения права `CREATE`
+на схему нет — следующая ревизия (`T-101…T-106` в вехе M1 создают таблицы) упадёт на первой же
+`CREATE TABLE`. Это не теория: код `42501` получен на самой площадке.
+
+Варианты, их цена и то, что при каждом перестаёт держаться:
+
+| Вариант | Суть | Что придётся править | Что при этом теряется |
+| --- | --- | --- | --- |
+| **A. два DSN-секрета** | `db_url` — приложение, новый `db_url_owner` — только `migrate` | перечень секретов: `deploy/vps/secrets-setup.sh` (`SECRET_NAMES`, `MOUNTED_NAMES`), `scripts/deploy_check.py` и `tests/unit/test_deploy_check_secrets.py`, `deploy/compose.yaml`/`compose.prod.yaml`, `docs/runbook/secrets-on-host.md`, ADR-005; нужно решение заказчика по TZ §14.9 | не теряется ничего; но при общем пароле ролей всё равно остаётся путь «мой DSN = пароль владельца» |
+| **B. дать роли приложения `CREATE` на `public`** | одна строка в `roles.sql` | `deploy/postgres/roles.sql`, `tests/contract/test_db_roles.py`, `tests/integration/test_postgres_roles.py` (проверка «приложение не имеет прав DDL»), `docs/runbook/postgres-roles.md §2` | приложение получает право создавать объекты в схеме и становится владельцем новых таблиц: отзыв прав на следующую append-only таблицу перестанет работать, пока её владение не передано отдельно; `ALTER TABLE audit_log` под приложением останется невозможным (замер выше) |
+| **C. не переключать до M1** | роли и права созданы, приложение остаётся на `tbot` | ничего | `REQ-identity-04` на площадке не действует, пока не появился код идентичности; приёмка фиксируется как частичная (`docs/acceptance/t-009-identity-schema.md §4`) |
+
+При любом из вариантов общий пароль `tbot_app` и `tbot` оставляет жёсткую границу незакрытой:
+процесс, знающий свой DSN, знает и пароль роли-владельца. Жёсткая граница — разные пароли и
+два DSN-секрета (то есть вариант A плюс отдельный `db_app_password`).
 
 ## 6. Откат шага 5
 
 ```bash
-sudo docker compose ... exec -T postgres psql -X -v ON_ERROR_STOP=1 -U tbot -d tbot \
-  -c 'ALTER ROLE tbot_app NOLOGIN'
-sudo /opt/tbot/deploy/vps/secrets-setup.sh db_url      # TBOT_DB_USER по умолчанию = tbot
+$COMPOSE exec -T postgres psql -X -v ON_ERROR_STOP=1 -U tbot -d tbot   -c 'ALTER ROLE tbot_app NOLOGIN'
+sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --only db_url --force   # TBOT_DB_USER по умолчанию = tbot
 $COMPOSE up -d web engine jobs
 ```
 
