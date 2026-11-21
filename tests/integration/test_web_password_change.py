@@ -428,11 +428,21 @@ def test_блокировка_мешает_сменить_пароль_и_пар
         )
         assert wrong.status_code == 401
 
+    накопленные = _учётка(store, record)
+    assert (
+        накопленные.failed_attempts == 4
+    ), f"неудачи не накапливаются: {накопленные.failed_attempts}"
+
     fifth = _смена(
         client, secret, record, current="заведомо-не-тот", new=NEW_PASSWORD, repeat=NEW_PASSWORD
     )
     assert fifth.status_code == 429, fifth.text
     assert "Retry-After" in fifth.headers, "ADR-007: срок ожидания — часть ответа"
+    assert account.locked_until is not None, "блокировка наступила этой попыткой (T-101)"
+    assert account.failed_attempts == 0, (
+        "наступление блокировки обнуляет счётчик намеренно: иначе после истечения срока ровно "
+        "одна неудачная попытка закрыла бы вход снова"
+    )
     assert "заблокирован" in fifth.text, "отказ обязан объяснять состояние, а не молчать (§9)"
     assert "/locked?reason=attempts" in fifth.text, "ссылка на страницу состояния (§9)"
 
