@@ -13,7 +13,10 @@
   не-Argon2id хэш пароля, сессия с просрочком в прошлом (§8.1–8.2, `REQ-identity-04`);
 * `ON DELETE RESTRICT` не даёт удалить пользователя, у которого есть сессии (§4 «общие
   правила»), а «удалить» по-прежнему можно состоянием `state='archived'`;
-* `audit_log.id` выдаётся базой (identity-эквивалент `bigserial` из §4.1) без явного значения.
+* `audit_log.id` выдаётся базой (identity-эквивалент `bigserial` из §4.1) без явного значения;
+* `last_used_step` (ревизия `0004`): база держает `NULL` и диапазон, но НЕ держит монотонность —
+  ровно наполовину выполнено §8.2 «коды принимаются один раз», вторую половину держит форма
+  запроса приложения (`ADR-013` п. 4, `docs/HANDOFF.md §1.38`).
 
 Права роли приложения (append-only на `audit_log`) проверяются не здесь, а в
 `test_audit_append_only_role` — после `deploy/postgres/roles.sql`, следующего шага T-009.
@@ -332,6 +335,97 @@ def test_одна_активная_привязка_totp_на_пользоват
         )
     )
     assert active == 1, f"активных привязок должно быть одна, получено {active}"
+
+
+def test_последний_принятый_шаг_база_держит_диапазон_а_монотонность_нет(
+    connection: psycopg.Connection[tuple[Any, ...]],
+) -> None:
+    """Граница ответственности схемы по `last_used_step` (ревизия `0004`, §8.2, ADR-013 п. 4).
+
+    Проверяется ровно то, что база по правилу «коды принимаются один раз» делает и чего она сделать
+    не может:
+
+    * `NULL` = «ни один код ещё не принят»: строка привязки появляется без значения
+      (`server_default` намеренно нет — `0` означал бы, что окно 1970 года уже израсходовано);
+    * `CHECK` отклоняет отрицательный шаг: `-1` как «sentinel» выглядел бы как «значение есть» и
+      стёр различие с `NULL`, на котором держится вся одноразовость;
+    * `BIGINT` подтверждается значением за пределами `int4`;
+    * монотонности в базе нет: безусловный `UPDATE` откатывает шаг назад без ошибки. Сравнение со
+      значением этой же строки декларативным ограничением не выражается, а триггер здесь
+      противоречил бы решению «append-only держат права, а не триггеры» (ревизия `0002` п. 3) и
+      кусался бы при любой правке строки. Поэтому страж — форма запроса среза `R4c`, и она же
+      проверяется ниже: `rowcount = 0` означает «этот код уже израсходован».
+    """
+    user_id = _insert_user(connection, "totp.step")
+    enrollment_id = uuid.uuid4()
+    connection.execute(
+        "INSERT INTO totp_enrollments (id, user_id, secret_enc, issuer) VALUES (%s, %s, %s, 'tbot')",
+        (enrollment_id, user_id, b"\x10\x11\x12"),
+    )
+    fresh = connection.execute(
+        "SELECT last_used_step IS NULL FROM totp_enrollments WHERE id = %s", (enrollment_id,)
+    ).fetchone()
+    assert fresh is not None, "запрос состояния шага не вернул ни строки"
+    assert fresh[0] is True, "у новой привязки last_used_step обязан быть NULL"
+
+    # Ограничение обязано существовать в каталоге: офлайн-генерация DDL не проверяет, что
+    # PostgreSQL принял выражение CHECK (тот же раздел, что и с частичным индексом).
+    constraints = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT conname FROM pg_constraint WHERE conrelid = 'totp_enrollments'::regclass"
+        )
+    }
+    assert (
+        "ck_totp_enrollments_last_used_step_not_negative" in constraints
+    ), "в каталоге нет CHECK диапазона шага, добавленного ревизией 0004"
+
+    # Шаг за пределами int4 сохраняется числом: форма BIGINT выбрана заказчиком (ADR-013 п. 4), и
+    # она же переживает 2038 год (RFC 6238 §4.2 требует держать T шире 32 бит).
+    connection.execute(
+        "UPDATE totp_enrollments SET last_used_step = %s WHERE id = %s",
+        (4_000_000_000, enrollment_id),
+    )
+    stored = int(
+        _scalar(
+            connection,
+            "SELECT last_used_step FROM totp_enrollments WHERE id = %s",
+            (enrollment_id,),
+        )
+    )
+    assert stored == 4_000_000_000, f"шаг за пределами int4 не сохранился: {stored}"
+
+    with pytest.raises(psycopg.errors.CheckViolation), connection.transaction():
+        connection.execute(
+            "UPDATE totp_enrollments SET last_used_step = %s WHERE id = %s", (-1, enrollment_id)
+        )
+
+    # Монотонности база не держит — это граница, а не дефект: шаг уехал назад без единой ошибки.
+    connection.execute(
+        "UPDATE totp_enrollments SET last_used_step = %s WHERE id = %s", (10_000, enrollment_id)
+    )
+    rewound = int(
+        _scalar(
+            connection,
+            "SELECT last_used_step FROM totp_enrollments WHERE id = %s",
+            (enrollment_id,),
+        )
+    )
+    assert rewound == 10_000, f"безусловный UPDATE не откатил шаг ({rewound}) — проверка устарела"
+
+    # Форма запроса, которую обязан использовать срез `R4c`: меньше ранее принятого — не записывается.
+    guard = (
+        "UPDATE totp_enrollments SET last_used_step = %s WHERE id = %s "
+        "AND (last_used_step IS NULL OR last_used_step < %s)"
+    )
+    behind = connection.execute(guard, (9_999, enrollment_id, 9_999))
+    assert behind.rowcount == 0, f"шаг меньше ранее принятого записан ({behind.rowcount} строк)"
+    repeat = connection.execute(guard, (10_000, enrollment_id, 10_000))
+    assert (
+        repeat.rowcount == 0
+    ), f"повтор кода того же шага записан ({repeat.rowcount} строк) — §8.2 нарушен и базой, и формой"
+    forward = connection.execute(guard, (10_001, enrollment_id, 10_001))
+    assert forward.rowcount == 1, f"шаг вперёд не записан ({forward.rowcount} строк)"
 
 
 def test_fk_restrict_не_даёт_удалить_пользователя_со_сессией(

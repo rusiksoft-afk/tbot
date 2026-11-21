@@ -12,7 +12,11 @@ Postgres нет), но почти все ошибки схемы видно и �
   приёмка T-009 требует обратимости);
 * в схеме нет вещественных типов и «наивного» времени (§4 «общие правила», `REQ-storage-02`);
 * у каждой ревизии есть непустой `downgrade` — пустой `downgrade` не ловит ни одна другая
-  проверка, он просто молча делает вид, что откатился.
+  проверка, он просто молча делает вид, что откатился;
+* имя файла ревизии совпадает с её `revision`, а `0004` идёт прямо за `0003` — слот цепи
+  (кто следующий в линейной истории) зафиксирован решениями заказчика и больше ничем не держится;
+* каждая колонка, которую ревизия добавляет к уже созданной таблице, обоснована ADR: таблица из
+  §4.1 не оправдание для колонки, которой в модели данных ТЗ нет.
 
 Ограничение метода: офлайн-SQL не проверяет, что PostgreSQL примет DDL (например, опечатку в
 выражении частичного индекса поймает только CI). Это осознанный раздел: быстрые структурные
@@ -72,6 +76,17 @@ _OPERATIONAL_TABLES: Final[dict[str, str]] = {
     "rate_buckets": "docs/adr/ADR-007-rate-limit-counter-table.md",  # TZ §8.3, ask `fe0b025e`
 }
 
+# Колонки, добавленные ревизиями к уже существующей таблице: «таблица.колонка» → файл обоснования.
+# Аналог `_OPERATIONAL_TABLES`, но для колонок: таблица из §4.1 не оправдание для колонки, которой в
+# модели данных ТЗ нет (проверка ниже читает этот перечень вместе с офлайн-DDL).
+_COLUMN_EXTENSIONS: Final[dict[str, str]] = {
+    # TZ §8.2 «коды принимаются один раз», ADR-013 п. 4 (ask `865f677f-46b6-4acd-ae9c-40c522ab9b1d`);
+    # слот цепи `0004` — ask `a4f68e3c-9dfb-4941-ad2d-34575db67415`.
+    "totp_enrollments.last_used_step": (
+        "docs/adr/ADR-013-totp-own-implementation-and-replay-guard.md"
+    ),
+}
+
 # Всё, что создаёт история миграций кроме служебных таблиц: перечни §4.1 плюс обоснованные
 # добавления. Сверки «модели ↔ ревизия» идут по этому множеству, а сверки «схема ↔ §4.1» —
 # строго по `IDENTITY_TABLES`: иначе «лишняя» таблица прикрывала бы отсутствие таблиц из ТЗ.
@@ -88,6 +103,10 @@ _CONSTRAINT_RE = re.compile(r"^CONSTRAINT (?P<name>\w+) ")
 # `sessions.token_hash`): в офлайн-SQL это отдельная строка `ALTER TABLE … ADD CONSTRAINT …`,
 # внутри блока `CREATE TABLE` её нет.
 _ALTER_ADD_CONSTRAINT_RE = re.compile(r"^ALTER TABLE (\w+) ADD CONSTRAINT (\w+) ", re.M)
+# Колонка, добавленная более поздней ревизией к уже созданной таблице (ревизия `0004` так добавляет
+# `totp_enrollments.last_used_step`). Без этого разбора офлайн-DDL видит только `CREATE TABLE`, и
+# сверка «модели ↔ ревизия» расходится в одну сторону: в модели колонка есть, в тексте DDL её нет.
+_ALTER_ADD_COLUMN_RE = re.compile(r"^ALTER TABLE (\w+) ADD COLUMN (\w+)", re.M)
 _INDEX_RE = re.compile(r"^CREATE (?:UNIQUE )?INDEX (?P<name>\w+) ON (?P<table>\w+) ", re.M)
 _FORBIDDEN_TYPES: tuple[str, ...] = (
     "DOUBLE PRECISION",
@@ -156,6 +175,9 @@ def _parse_tables(sql: str) -> dict[str, dict[str, list[str]]]:
     for table_name, constraint_name in _ALTER_ADD_CONSTRAINT_RE.findall(sql):
         entry = tables.setdefault(table_name, {"columns": [], "constraints": []})
         entry["constraints"].append(constraint_name)
+    for table_name, column_name in _ALTER_ADD_COLUMN_RE.findall(sql):
+        entry = tables.setdefault(table_name, {"columns": [], "constraints": []})
+        entry["columns"].append(column_name)
     return tables
 
 
@@ -200,9 +222,61 @@ def test_цепочка_ревизий_линейна_и_без_развилок
     """
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
     heads = script.get_heads()
-    assert heads == ["0003"], f"ожидалась одна линия истории, получено: {heads}"
+    assert heads == ["0004"], f"ожидалась одна линия истории, получено: {heads}"
     walked = [rev.revision for rev in script.walk_revisions()]
-    assert set(walked) == {"0001", "0002", "0003"}, f"состав ревизий изменился: {walked}"
+    assert set(walked) == {"0001", "0002", "0003", "0004"}, f"состав ревизий изменился: {walked}"
+
+    # Имя файла и id ревизии обязан сходиться: слот цепи — договорённость, зафиксированная в ADR
+    # (`0004` занят `T-103`, `0005` отдаётся `T-116`), а Alembic читает id из содержимого файла.
+    # Расхождение «файл `0005_…`, а внутри revision = "0004"» не ловит больше ничего.
+    parents: dict[str, object] = {}
+    for path in sorted((ROOT / "migrations" / "versions").glob("*.py")):
+        values = _revision_ids(path)
+        assert values["revision"] == path.name.split("_", 1)[0], (
+            f"{path.name}: id {values['revision']!r} не совпадает с префиксом имени файла — "
+            "слот цепи и имя обязаны сходиться"
+        )
+        parents[str(values["revision"])] = values["down_revision"]
+    assert parents["0004"] == "0003", (
+        f"ревизия 0004 обязана следовать прямо за 0003 (слот занят `T-103`, ask "
+        "`a4f68e3c-9dfb-4941-ad2d-34575db67415`), получено: "
+        f"down_revision = {parents['0004']!r}"
+    )
+
+
+def _revision_ids(path: Path) -> dict[str, object]:
+    """`revision` и `down_revision` из файла ревизии (без импорта модуля миграций)."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    found: dict[str, object] = {}
+    for node in tree.body:
+        item = _literal_assignment(node)
+        if item is None:
+            continue
+        name, literal = item
+        if name in {"revision", "down_revision"}:
+            found[name] = literal
+    assert "revision" in found, f"{path.name}: у ревизии нет литерала revision"
+    return found
+
+
+def _literal_assignment(node: ast.stmt) -> tuple[str, object] | None:
+    """Присваивание `имя = <литерал>` (с аннотацией или без) → (имя, значение).
+
+    Разбор без импорта модулей миграций: нужно прочитать id, а не исполнять чужой код.
+    """
+    target: ast.expr
+    value: ast.expr
+    if isinstance(node, ast.AnnAssign):
+        if node.value is None:  # аннотация `x: int` без значения — присваивания нет
+            return None
+        target, value = node.target, node.value
+    elif isinstance(node, ast.Assign) and len(node.targets) == 1:
+        target, value = node.targets[0], node.value
+    else:
+        return None
+    if not isinstance(target, ast.Name) or not isinstance(value, ast.Constant):
+        return None
+    return target.id, value.value
 
 
 def test_каждая_ревизия_умеет_откатываться_не_пустышкой() -> None:
@@ -238,6 +312,39 @@ def test_схема_идентичности_соответствует_пере
         assert (
             f"`{table}`" in text or table in text
         ), f"{adr} не упоминает {table}: обоснование должно объяснять именно эту таблицу"
+
+
+def test_колонки_добавленные_ревизиями_к_готовым_таблицам_обоснованы(upgrade_sql: str) -> None:
+    """Колонка, добавленная ревизией к уже существующей таблице, обязана иметь обоснование.
+
+    Таблица из перечня §4.1 не оправдание для колонки, которой в модели данных ТЗ нет: именно так
+    схема и разъезжается с техзаданием — по одному «незначительному» добавлению за срез. Поэтому
+    каждая такая колонка перечислена в `_COLUMN_EXTENSIONS` с файлом обоснования, файл обязан
+    существовать и упоминать колонку, а сама колонка — быть в моделях (перечень не обязан
+    переживать собственную отмену).
+    """
+    added = {(table, column) for table, column in _ALTER_ADD_COLUMN_RE.findall(upgrade_sql)}
+    modelled = {
+        f"{table}.{column.name}"
+        for table in sorted(_SCHEMA_TABLES)
+        for column in Base.metadata.tables[table].columns
+    }
+    for table, column in sorted(added):
+        key = f"{table}.{column}"
+        assert key in _COLUMN_EXTENSIONS, (
+            f"{key}: колонка добавлена ревизией к существующей таблице без обоснования — "
+            "добавьте её в `_COLUMN_EXTENSIONS` с файлом ADR или решения заказчика"
+        )
+        adr = _COLUMN_EXTENSIONS[key]
+        assert (ROOT / adr).exists(), f"{key}: обоснование {adr} не найдено"
+        assert f"`{column}`" in (ROOT / adr).read_text(
+            encoding="utf-8"
+        ), f"{adr} не упоминает {column}: обоснование должно объяснять именно эту колонку"
+    for key in sorted(_COLUMN_EXTENSIONS):
+        assert key in modelled, (
+            f"{key}: числится как добавленная ревизией, но в моделях её нет — перечень устарел "
+            "(колонку убрали или переименовали, не сняв обоснование)"
+        )
 
 
 def test_модели_и_ревизия_создают_одни_те_же_таблицы(upgrade_sql: str) -> None:
@@ -308,6 +415,16 @@ def test_обратная_миграция_снимает_всё_созданн�
     assert (
         "ALTER TABLE sessions DROP CONSTRAINT ck_sessions_token_hash_format;" in downgrade_sql
     ), "downgrade не снимает CHECK формата sessions.token_hash, добавленный ревизией 0003"
+    # Колонка и CHECK к ней, добавленные ревизией 0004 к уже существующей таблице: их снятие видно
+    # только в обратном DDL (в `DROP TABLE` оно не «само бы образовалось» — таблица снимается
+    # ревизией 0002, а откатиться на 0003 надо уметь отдельно).
+    assert (
+        "ALTER TABLE totp_enrollments DROP CONSTRAINT "
+        "ck_totp_enrollments_last_used_step_not_negative;" in downgrade_sql
+    ), "downgrade не снимает CHECK диапазона шага, добавленный ревизией 0004"
+    assert (
+        "ALTER TABLE totp_enrollments DROP COLUMN last_used_step;" in downgrade_sql
+    ), "downgrade не снимает колонку last_used_step, добавленную ревизией 0004"
     # Порядок: таблицы снимаются до расширения (колонки citext блокируют DROP EXTENSION).
     assert downgrade_sql.index("DROP TABLE users;") < downgrade_sql.index(
         "DROP EXTENSION IF EXISTS citext;"

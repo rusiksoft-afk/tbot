@@ -230,6 +230,12 @@ class TotpEnrollment(Base):
     Секрет — шифртекст AES-256-GCM (§8.4, KEK вне базы): открытого секрета в колонке быть не
     может, а `issuer` нужен для сборки URI `otpauth://` при выдаче QR-кода.
 
+    `last_used_step` — «какой шаг уже израсходован» (§8.2, ADR-013 п. 4): без него правило
+    «коды принимаются один раз» живёт только внутри одного запроса. Колонка добавлена ревизией
+    `0004`, а пишет её срез `R4c` — форма запроса (`… AND (last_used_step IS NULL OR
+    last_used_step < шаг)`, где `rowcount = 0` означает «код уже израсходован») зафиксирована в
+    `migrations/versions/0004_totp_last_used_step.py` и в живой проверке схемы.
+
     Незавершённая привязка (`confirmed_at IS NULL`) — не «действующий второй фактор», а ожидание
     подтверждения двумя кодами (§8.2). Не активировать учётную запись в таком состоянии —
     правило приложения, база держит только различие «подтверждено/нет» и одну активную
@@ -244,6 +250,10 @@ class TotpEnrollment(Base):
         ),
         CheckConstraint("confirmed_at >= enrolled_at", name="confirmed_after_enrolled"),
         CheckConstraint("revoked_at >= enrolled_at", name="revoked_after_enrolled"),
+        # Шаг — секунды с эпохи 1970, делённые на 30: отрицательного шага не бывает, а `-1` —
+        # типичный «sentinel», который выглядит как «значение есть» и стирает различие с NULL.
+        # На различии «NULL = кода ещё не принимали» держит §8.2 (ревизия 0004, ADR-013 п. 4).
+        CheckConstraint("last_used_step >= 0", name="last_used_step_not_negative"),
         # Одна действующая привязка на пользователя (см. docstring модуля).
         Index(
             "ix_totp_enrollments_user_active",
@@ -278,6 +288,15 @@ class TotpEnrollment(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ)
     verify_window: Mapped[int] = mapped_column(
         Integer(), nullable=False, server_default=text(str(TOTP_WINDOW_DEFAULT))
+    )
+    last_used_step: Mapped[int | None] = mapped_column(
+        BigInteger(),
+        nullable=True,
+        comment=(
+            "Номер шага (unix_time // 30) последнего принятого кода; NULL — ни один код ещё "
+            "не принят (TZ §8.2 «коды принимаются один раз», ADR-013 п. 4). Монотонность "
+            "держит приложение условным UPDATE, база — только диапазон"
+        ),
     )
 
     @validates("secret_enc")
