@@ -37,6 +37,7 @@ from starlette.templating import Jinja2Templates
 
 from apps.web.forms import FormBodyTooLarge
 from apps.web.routes import login as login_routes
+from apps.web.routes import profile as profile_routes
 from apps.web.routes import sessions as session_routes
 from apps.web.security.csrf import CsrfRejected
 from apps.web.security.headers import apply_security_headers
@@ -130,6 +131,7 @@ def create_app(settings: Settings) -> FastAPI:
 
     app.include_router(login_routes.router)
     app.include_router(session_routes.router)
+    app.include_router(profile_routes.router)
 
     @app.middleware("http")
     async def _trace_middleware(request: Any, call_next: Any) -> Any:

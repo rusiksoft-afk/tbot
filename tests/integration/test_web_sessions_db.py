@@ -36,14 +36,22 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from httpx import Response
 from pydantic import SecretStr
 from sqlalchemy import Engine, create_engine, delete, event, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from apps.web.main import create_app
+from apps.web.routes.profile import (
+    FIELD_CURRENT_PHRASE,
+    FIELD_NEW_PHRASE,
+    FIELD_REPEAT_PHRASE,
+)
 from apps.web.security.csrf import CSRF_FORM_FIELD, expected_token
 from apps.web.security.sessions import (
+    SECURITY_PATH,
     SESSION_COOKIE_NAME,
+    SESSION_EXPIRED_PATH,
     SESSIONS_PATH,
     SESSIONS_REVOKE_ALL_PATH,
     Principal,
@@ -51,6 +59,7 @@ from apps.web.security.sessions import (
 from packages.common.clock import utc_now
 from packages.common.config import Settings
 from packages.common.db import sqlalchemy_url
+from packages.identity.passwords import verify_password
 from packages.identity.sessions import IDLE_TIMEOUT, create_session, token_hash_of
 from packages.identity.users import new_user
 from packages.storage.models import User, UserSession
@@ -573,3 +582,317 @@ def test_отзыв_всех_не_трогает_чужие_сессии(
     assert still_alive.revoked_at is None
     mine = next(row for row in _сессии(db, seeded.id) if row.id == stale.id)
     assert mine.revoked_at is None, "завершившуюся по сроку свою сессию тоже не помечают отзывом"
+
+
+# ─── смена пароля (§8.1 «после смены все сессии, кроме текущей, отзываются», §8.3, §8.8) ─────
+#
+# Офлайновая половинка этих же сценариев — `tests/integration/test_web_password_change.py`
+# (репозиторий в памяти). Здесь проверяется ровно то, чего память не знает: что
+# `revoked_at` и новый `password_hash` **зафиксированы в таблице** и их видит другое соединение,
+# что поиск учётной записи уходит в SQL по `id` (имя из формы в запросе не участвует), что в
+# связанных значениях запросов нет ни значения куки, ни нового пароля, и что новая строка сеанса
+# получает адрес как значение колонки `INET`.
+
+#: Новый пароль смены. Проходит §8.1 и обязан отличаться от пароля фикстуры: иначе проверка
+#: «старый пароль в строке больше не подходит» была бы пустой.
+NEW_PASSWORD = "Новый-рабочий-пароль-2026A"
+
+#: Заведомо короткий пароль (§8.1: минимум 12 символов) — для проверки «отказ ничего не пишет».
+SHORT_PASSWORD = "коротко-9"
+
+#: Адрес входа смены: проверяется и как значение колонки `INET`, и как канонический текст на
+#: странице списка сеансов после пересоздания (тот же сюжет, что у `ADR-009` в списке).
+V6_ENTRY = "2001:db8::2"
+
+
+def _смена_пароля(
+    client: TestClient, secret: str, row: UserSession, *, current: str, new: str, repeat: str
+) -> Response:
+    """POST формы смены пароля: токен выводится из предъявленной куки и `id` сеанса (ADR-008)."""
+    ответ: Response = client.post(
+        SECURITY_PATH,
+        data={
+            CSRF_FORM_FIELD: _токен(secret, row),
+            FIELD_CURRENT_PHRASE: current,
+            FIELD_NEW_PHRASE: new,
+            FIELD_REPEAT_PHRASE: repeat,
+        },
+        headers={"Origin": "https://testserver"},
+        follow_redirects=False,
+    )
+    return ответ
+
+
+def _учётка_из_таблицы(db: Session, user_id: uuid.UUID) -> User:
+    """Перечитать строку `users` другим соединением: хэш и счётчик обязаны быть в таблице."""
+    db.expire_all()
+    row = db.execute(select(User).where(User.id == user_id)).scalar_one()
+    db.expunge(row)
+    return row
+
+
+def test_смена_пароля_отзывает_остальные_сессии_в_таблице(
+    client: TestClient, db: Session, seeded: User, login_name: str
+) -> None:
+    """Строка матрицы §8.8 «смена пароля отзывает сессии» — интеграционный уровень.
+
+    Память показывает тот же набор кандидатов и то же поведение слоя, но не показывает главное:
+    что `revoked_at` зафиксирован в таблице и что новому соединению видно «входа больше нет».
+    Поэтому здесь всё перечитывается заново, а не по объектам текущего запроса.
+    """
+    secret = _войти(client, login_name)
+    current = _полная_сессия(db, seeded.id)
+    other = _выпустить(db, seeded.id, device=DEVICE_OTHER)
+    foreign = _учётка(db, suffix=f"p{uuid.uuid4().hex[:8]}")
+    foreign_live = _выпустить(db, foreign.id, device=DEVICE_FOREIGN)
+    hash_before = seeded.password_hash
+
+    response = _смена_пароля(
+        client, secret, current, current=TEST_PASSWORD, new=NEW_PASSWORD, repeat=NEW_PASSWORD
+    )
+    assert response.status_code == 302, response.text
+    assert response.headers["location"] == SESSIONS_PATH, "результат — на списке сеансов (§8.3)"
+
+    rows = {row.id: row for row in _сессии(db, seeded.id)}
+    assert rows[current.id].revoked_at is not None, "прежняя запись отзывается пересозданием (§8.3)"
+    assert rows[other.id].revoked_at is not None, "прочие живые сеансы отозваны (§8.1)"
+    чужие = {row.id: row.revoked_at for row in _сессии(db, foreign.id)}
+    assert чужие.get(foreign_live.id) is None, "чужая учётная запись не затронута (§8.8)"
+
+    живые = [row for row in _сессии(db, seeded.id) if row.revoked_at is None]
+    assert len(живые) == 1, f"живой сеанс обязан остаться ровно один: {len(живые)}"
+
+    account = _учётка_из_таблицы(db, seeded.id)
+    assert account.password_hash != hash_before, "хэш в строке обязан измениться (§8.1)"
+    assert verify_password(password=NEW_PASSWORD, stored_hash=account.password_hash)
+    assert not verify_password(password=TEST_PASSWORD, stored_hash=account.password_hash)
+    assert account.password_updated_at is not None, "момент смены фиксируется в строке (§8.1)"
+
+
+def test_новая_строка_сеанса_живая_с_шагом_full_и_адресом_INET(
+    client: TestClient, db: Session, seeded: User, login_name: str
+) -> None:
+    """Пересоздание (§8.3) обязано дать в таблице живую строку, а не только новую куку.
+
+    Адрес проверяется дважды: как значение колонки `INET` (psycopg3 читает её объектом `ipaddress`)
+    и как канонический текст на странице списка — иначе список устройств показал бы адрес в форме,
+    которая не является значением колонки и не совпадает с ключом счётчика лимитов (`ADR-009`).
+    """
+    secret = _войти(client, login_name, xff=V6_ENTRY)
+    current = _полная_сессия(db, seeded.id)
+    response = _смена_пароля(
+        client, secret, current, current=TEST_PASSWORD, new=NEW_PASSWORD, repeat=NEW_PASSWORD
+    )
+    assert response.status_code == 302, response.text
+
+    новая_кука = session_cookie(client)
+    assert новая_кука != secret, "значение куки обязано смениться (§8.3)"
+    rows = {row.token_hash: row for row in _сессии(db, seeded.id)}
+    новая = rows[token_hash_of(новая_кука)]
+    assert новая.revoked_at is None
+    assert новая.auth_step == "full", "шаг входа сохраняется: критичное действие подтверждено"
+    assert новая.expires_at > utc_now()
+    assert str(новая.ip) == V6_ENTRY, f"колонка INET вернула {новая.ip!r}"
+
+    page = client.get(SESSIONS_PATH)
+    assert page.status_code == 200
+    assert V6_ENTRY in page.text, "страница печатает канонический текст колонки адреса"
+
+
+def test_старое_значение_куки_не_находит_живой_строки(
+    client: TestClient, db: Session, seeded: User, login_name: str
+) -> None:
+    """§8.3: прежнее значение не должно пережить смену пароля — проверка охраной маршрута на базе.
+
+    Щуп `probe-full` идёт через тот же слой входа, что и боевые маршруты консоли: направление
+    отказа задаёт общий механизм, а не обработчик смены пароля.
+    """
+    secret = _войти(client, login_name)
+    current = _полная_сессия(db, seeded.id)
+    _смена_пароля(
+        client, secret, current, current=TEST_PASSWORD, new=NEW_PASSWORD, repeat=NEW_PASSWORD
+    )
+
+    client.cookies.set(SESSION_COOKIE_NAME, secret)
+    guard = client.get("/probe-full", follow_redirects=False)
+    assert guard.status_code == 302
+    assert SESSION_EXPIRED_PATH in guard.headers["location"]
+    assert "reason=revoked" in guard.headers["location"], "причина — отзыв, а не срок (§8.3)"
+
+
+def test_учётка_ищётся_по_id_а_значений_куки_и_пароля_в_запросах_нет(
+    client: TestClient,
+    db: Session,
+    seeded: User,
+    login_name: str,
+    captured_sql: list[str],
+    captured_params: list[str],
+) -> None:
+    """§8.8 и §8.4: смена относится к учётке живой сессии, а материал сеанса в SQL не уходит.
+
+    Форма смены пароля имени учётной записи не содержит вовсе, поэтому «подставить чужое имя»
+    нечем — и это видно по тексту запроса: условие поиска строится по `users.id`, а `users.login`
+    в `WHERE` не встречается. Отдельно держится §8.4: ни значение куки, ни новый пароль, ни имя
+    учётной записи не попадают ни в текст запроса, ни в связанные значения (второй аргумент
+    слушателя `before_cursor_execute`).
+
+    Список очищается после входа: вход ищет учётку по `login` — это другой маршрут, и его запрос
+    здесь только мешал бы.
+    """
+    secret = _войти(client, login_name)
+    current = _полная_сессия(db, seeded.id)
+    captured_sql.clear()
+    captured_params.clear()
+
+    response = _смена_пароля(
+        client, secret, current, current=TEST_PASSWORD, new=NEW_PASSWORD, repeat=NEW_PASSWORD
+    )
+    assert response.status_code == 302, response.text
+
+    выборки = [sql for sql in captured_sql if "FROM users" in sql]
+    assert выборки, "учётка не читалась из таблицы `users`"
+    обновлении = [sql for sql in captured_sql if "UPDATE users" in sql]
+    assert обновлении, "новый хэш не зафиксирован `UPDATE`-ом строки учётки"
+    for sql in выборки + обновлении:
+        условие = sql.split("WHERE", 1)[1] if "WHERE" in sql else ""
+        assert "users.id" in условие, f"в условии запроса нет `id` строки: {sql}"
+        assert "users.login" not in условие, f"запрос ищет учётку по имени: {sql}"
+
+    for значение in (secret, NEW_PASSWORD, login_name):
+        assert значение not in "".join(captured_sql), "значение попало в текст запроса"
+        assert значение not in "".join(captured_params), "значение попало в связанные значения"
+
+
+def test_неверный_текущий_пароль_фиксирует_неудачу_в_таблице(
+    client: TestClient, db: Session, seeded: User, login_name: str
+) -> None:
+    """§8.1 и `T-101` на материале базы: подбор текущего пароля ограничен так же, как вход.
+
+    Счётчик неудач обязан быть в строке, а не только в объекте запроса: иначе он живёт до конца
+    обработчика, а форма остаётся не ограниченным нигде способом подбора текущего пароля. Хэш при
+    отказе не меняется, сеансы не отзываются.
+    """
+    secret = _войти(client, login_name)
+    current = _полная_сессия(db, seeded.id)
+    hash_before = seeded.password_hash
+    updated_before = seeded.password_updated_at
+
+    отказ = _смена_пароля(
+        client,
+        secret,
+        current,
+        current="заведомо-не-этот-пароль",
+        new=NEW_PASSWORD,
+        repeat=NEW_PASSWORD,
+    )
+    assert отказ.status_code == 401, отказ.text
+
+    account = _учётка_из_таблицы(db, seeded.id)
+    assert account.failed_attempts == 1, f"неудача не зафиксирована: {account.failed_attempts}"
+    assert account.locked_until is None
+    assert account.password_hash == hash_before, "отказ не имеет права менять хэш"
+    assert next(r for r in _сессии(db, seeded.id) if r.user_agent == DEVICE_OWN).revoked_at is None
+    assert (
+        account.password_updated_at == updated_before
+    ), "момент смены пароля фиксируется только при успехе (§8.1)"
+
+
+def test_блокировка_закрывает_и_смену_пароля_а_верный_пароль_не_спасает(
+    client: TestClient, db: Session, seeded: User, login_name: str
+) -> None:
+    """`T-101` на материале смены пароля: при активной блокировке сравнения нет вообще.
+
+    Порядок держится тот же, что на входе: `ensure_login_allowed` до сравнения. Проверка обязана
+    увидеть состояние в таблице (`locked_until` — состояние учётки, а не запроса) и то, что попытка
+    с **верным** текущим паролем в закрытое окно тоже `429`: иначе блокировка оставляла бы канал
+    для проверки угаданных паролей.
+    """
+    secret = _войти(client, login_name)
+    current = _полная_сессия(db, seeded.id)
+
+    for попытка in range(4):
+        ответ = _смена_пароля(
+            client,
+            secret,
+            current,
+            current="заведомо-не-тот",
+            new=NEW_PASSWORD,
+            repeat=NEW_PASSWORD,
+        )
+        assert ответ.status_code == 401, f"запирается раньше: попытка {попытка + 1}"
+
+    пятая = _смена_пароля(
+        client,
+        secret,
+        current,
+        current="заведомо-не-тот",
+        new=NEW_PASSWORD,
+        repeat=NEW_PASSWORD,
+    )
+    assert пятая.status_code == 429, пятая.text
+    assert "Retry-After" in пятая.headers, "ADR-007: срок ожидания — часть ответа"
+
+    account = _учётка_из_таблицы(db, seeded.id)
+    assert account.failed_attempts == 5, f"счётчик в таблице: {account.failed_attempts}"
+    assert account.locked_until is not None, "блокировка не зафиксирована в строке"
+    hash_before = account.password_hash
+
+    верная = _смена_пароля(
+        client, secret, current, current=TEST_PASSWORD, new=NEW_PASSWORD, repeat=NEW_PASSWORD
+    )
+    assert верная.status_code == 429, "пока блокировка активна, смена недоступна"
+    assert _учётка_из_таблицы(db, seeded.id).password_hash == hash_before, "хэш не изменился"
+
+
+def test_отказ_политики_не_меняет_строку_учётки_и_сеансы(
+    client: TestClient, db: Session, seeded: User, login_name: str
+) -> None:
+    """§8.1: отказ политики нового пароля — отказ без побочных эффектов.
+
+    Сверяются поля учётки (`password_hash`, `password_updated_at`, `failed_attempts`) и `revoked_at`
+    строк сеанса: форма не имеет права ничего записать, даже «предварительно» подняв счётчик
+    перебора или прикрыв чужой вход.
+    """
+    secret = _войти(client, login_name)
+    current = _полная_сессия(db, seeded.id)
+    other = _выпустить(db, seeded.id, device=DEVICE_OTHER)
+    account = _учётка_из_таблицы(db, seeded.id)
+    hash_before = account.password_hash
+    attempts_before = account.failed_attempts
+
+    response = _смена_пароля(
+        client, secret, current, current=TEST_PASSWORD, new=SHORT_PASSWORD, repeat=SHORT_PASSWORD
+    )
+    assert response.status_code == 400, response.text
+
+    после = _учётка_из_таблицы(db, seeded.id)
+    assert после.password_hash == hash_before
+    assert после.failed_attempts == attempts_before, "отказ политики не двигает счётчик перебора"
+    assert после.password_updated_at == account.password_updated_at
+    отзыв = {row.id: row.revoked_at for row in _сессии(db, seeded.id)}
+    assert отзыв.get(other.id) is None, "отказ политики не отзывает сеансы"
+
+
+def test_смена_пароля_не_обнуляет_счётчик_неудач_в_таблице(
+    client: TestClient, db: Session, seeded: User, login_name: str
+) -> None:
+    """`T-101`: блокировка перебора не снимается сменой пароля.
+
+    Неудачи выставляются `UPDATE`-ом по строке: маршрута ручного сброса нет, а окно блокировки
+    снимать нельзя (иначе маршрут ответил бы `429`, и проверять было бы нечего). Счётчик после
+    успешной смены обязан остаться прежним: «разблокировался сменой пароля» означало бы, что перебор
+    можно чередовать со сменой пароля.
+    """
+    db.execute(update(User).where(User.id == seeded.id).values(failed_attempts=2))
+    db.commit()
+
+    secret = _войти(client, login_name)
+    current = _полная_сессия(db, seeded.id)
+    response = _смена_пароля(
+        client, secret, current, current=TEST_PASSWORD, new=NEW_PASSWORD, repeat=NEW_PASSWORD
+    )
+    assert response.status_code == 302, response.text
+
+    account = _учётка_из_таблицы(db, seeded.id)
+    assert account.failed_attempts == 2, f"счётчик неудач обнулили: {account.failed_attempts}"
+    assert account.password_hash != seeded.password_hash

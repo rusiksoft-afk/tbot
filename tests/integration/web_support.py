@@ -123,6 +123,16 @@ class MemoryStore:
                 return record
         return None
 
+    def user_of_id(self, user_id: UUID) -> User | None:
+        """Зеркало `SqlStore.user_of_id`: учётка по `id`, логин в поиске не участвует (§8.1).
+
+        Здесь проверяется только доступ по `id`. Что поиск идёт по первичному ключу и что чужое
+        имя, подставленное в форму, к чужой учётке не приводит — держит живой файл
+        `tests/integration/test_web_sessions_db.py` (job `миграции`): там проверяется текст
+        запроса, а не поведение слоя.
+        """
+        return next((user for user in self._users.values() if user.id == user_id), None)
+
     def add(self, obj: User | UserSession) -> None:
         if isinstance(obj, UserSession):
             self._sessions[obj.token_hash] = obj

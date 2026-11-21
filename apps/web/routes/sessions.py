@@ -59,6 +59,7 @@ from apps.web.security.sessions import (
     LOGIN_PATH,
     LOGOUT_PATH,
     REASON_QUERY,
+    SECURITY_PATH,
     SESSION_EXPIRED_PATH,
     SESSION_REVOKE_PATH,
     SESSIONS_PATH,
@@ -415,6 +416,7 @@ def _render_sessions(
         "current_label": CURRENT_SESSION_LABEL,
         "sessions_url": SESSIONS_PATH,
         "revoke_all_url": SESSIONS_REVOKE_ALL_PATH,
+        "security_url": SECURITY_PATH,
         "confirm_all": confirm_all,
         "warning": REVOKE_ALL_WARNING if confirm_all else "",
     } | csrf_context(principal)

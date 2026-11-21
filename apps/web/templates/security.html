@@ -1,0 +1,41 @@
+{% extends "base.html" %}
+{% block content %}
+{# Профиль и безопасность (§9.3 п. 5): пока это та половина страницы, для которой готов домен, —
+   смена пароля. Статус 2FA, привязка и резервные коды появятся в `T-103`/`T-104`, поля профиля
+   (имя, роль, e-mail, последний вход) — в `T-111`, привязка Telegram — в `T-409`.
+
+   Значения подставляются готовыми строками из обработчика; даты и адреса здесь не форматируются и
+   материал сеанса не печатается (§8.4). Экранирование включено окружением рендеринга, фильтр,
+   снимающий экранирование, в шаблонах этого слоя не появляется (§8.8). #}
+<h1>{{ page_title }}</h1>
+<p>{{ note }}</p>
+{% if detail %}
+<p role="alert">{{ detail }}</p>
+{% endif %}
+{% if locked_url %}
+{# Ссылка на объяснение появляется только там, где вход действительно закрыт на срок (§9):
+   «пароль не подошёл» и «вход заблокирован» — разные состояния, и показывать ссылку на
+   блокировку при неверном пароле значит подставлять человеку неверный диагноз. #}
+<p><a href="{{ locked_url }}">Почему вход временно заблокирован</a></p>
+{% endif %}
+<form method="post" action="{{ security_url }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p>
+    <label for="current_password">Текущий пароль</label>
+    <input id="current_password" name="current_password" type="password"
+           autocomplete="current-password" required>
+  </p>
+  <p>
+    <label for="new_password">Новый пароль</label>
+    <input id="new_password" name="new_password" type="password"
+           autocomplete="new-password" required>
+  </p>
+  <p>
+    <label for="repeat_password">Повтор нового пароля</label>
+    <input id="repeat_password" name="repeat_password" type="password"
+           autocomplete="new-password" required>
+  </p>
+  <p><button type="submit">Сменить пароль</button></p>
+</form>
+<p><a href="{{ sessions_url }}">Сеансы этой учётной записи</a></p>
+{% endblock %}

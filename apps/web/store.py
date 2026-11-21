@@ -125,6 +125,16 @@ class Store(Protocol):
         вела бы на строку, которую страница отзыва отказывается видеть.
         """
 
+    def user_of_id(self, user_id: UUID) -> User | None:
+        """Учётная запись по `id` — по тому, что хранит запись сессии (срез `R3f`, §8.1).
+
+        Логин в поиске не участвует принципиально: смена пароля обязана относиться к той
+        учётной записи, у которой живая сессия, а не к той, чьё имя продиктовала форма. Если бы
+        поиск шёл по логину из формы, подстановка чужого имени превращалась бы в попытку менять
+        чужую учётную запись; здесь такой запрос просто ничего не находит (§8.8: «чужие данные →
+        403/404 без утечки»). Ключ — `id` первичный, поэтому отдельного индекса не требуется.
+        """
+
     def add(self, obj: User | UserSession) -> None:
         """Поставить объект в транзакцию текущего запроса.
 
@@ -225,6 +235,9 @@ class SqlStore:
             UserSession.expires_at > not_expired_before,
         )
         return self._session.execute(statement).scalar_one_or_none()
+
+    def user_of_id(self, user_id: UUID) -> User | None:
+        return self._session.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
 
     def add(self, obj: User | UserSession) -> None:
         self._session.add(obj)
