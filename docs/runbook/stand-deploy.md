@@ -14,6 +14,7 @@
 | 1 | Площадка подготовлена (пакеты, время, диск, swap, сертификаты НУЦ) | `python3 scripts/prod_bootstrap_check.py` — `docs/acceptance/prod-bootstrap.md` |
 | 2 | `ufw` = deny incoming + `22/tcp`, `80/tcp`, `443/tcp`, `443/udp` | `sudo ufw status verbose` — `docs/acceptance/prod-firewall.md` |
 | 3 | Секреты лежат, права правильные | `sudo bash deploy/vps/secrets-setup.sh --check` — `docs/runbook/secrets-on-host.md §3` |
+| 3.1 | Файл ключей TOTP лежит, права и владелец правильные (нужен для `R4c`, запуск не блокирует) | `sudo python3 deploy/vps/keys_setup.py --check` — `docs/runbook/kek-keys.md §3` |
 | 4 | Digest'ы в `deploy/tbot.prod.env` соответствуют последнему зелёному `Image` | `docs/runbook/ghcr-pull.md §2` |
 | 5 | Разбор состава зелёный на **этой** машине (compose тут `2.40.3`, в CI `v5.1.3`) | шаги 3 и 4 ниже |
 | 6 | Репозиторий разобран CI: `prod-config`, `compose-smoke`, `tests`, `quality` | `gh run list --repo rusiksoft-afk/tbot --branch main` |
@@ -186,6 +187,21 @@ sudo docker images --digests | grep -E 'tbot|postgres|caddy'
 sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --remed
 sudo bash /opt/tbot/deploy/vps/secrets-setup.sh --check
 ```
+
+**Файл ключей TOTP (`/etc/tbot/keys/kek.json`).** Состав монтирует его в `web` (`secrets: kek_file`).
+Отсутствующий файл запуску не мешает: compose площадки (`2.40.3`) не требует, чтобы
+файловые секреты существовали, — в отличие от compose CI-раннёра (`v5.1.3`, §3), где шаг создания
+секретов стоит обязательным. Пока привязки TOTP нет в интерфейсе (`R4c`), приложение ключ не читает,
+и деплой не падает. Оставлять площадку без файла всё равно нельзя: «панель не создаёт привязку»
+появится в момент, когда `R4c` заработает, а значение ключа задним числом уже не создать — привязки,
+зашифрованные первым значением, читаются только им.
+
+```bash
+sudo python3 /opt/tbot/deploy/vps/keys_setup.py --check    # зелёный вердикт = файл готов
+```
+
+Красный по правам — `--remed` (значения не трогаются). Файла нет — создание описано в
+`docs/runbook/kek-keys.md §3`; перезапись существующего означает потерю уже зашифрованных привязок.
 
 ```bash
 cd /opt/tbot
