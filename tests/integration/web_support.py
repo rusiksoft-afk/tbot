@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from typing import Annotated, Final, cast
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, FastAPI
 from fastapi.testclient import TestClient
@@ -83,6 +84,44 @@ class MemoryStore:
     def session_by_token_hash(self, token_hash: str) -> UserSession | None:
         self.hash_lookups.append(token_hash)
         return self._sessions.get(token_hash)
+
+    def user_sessions(
+        self, user_id: UUID, *, not_expired_before: datetime
+    ) -> tuple[UserSession, ...]:
+        """Зеркало запроса `SqlStore.user_sessions` (срез `R3e`).
+
+        Предикат скопирован побайтово (`user_id`, `revoked_at IS NULL`, `expires_at >` границы) —
+        иначе офлайновая половина и живая проверяли бы разные наборы. При этом память не доказывает
+        ничего из того, что делает запрос на базе: что ограничение `user_id` действительно уходит в
+        SQL (а не отфильтровано потом), что колонка `INET` читается канонически и что предикат
+        опирается на `ix_sessions_expires_at`, а не вычитывает все строки пользователя, — это
+        держит живой файл `tests/integration/test_web_sessions_db.py` (job `миграции`).
+        """
+        return tuple(
+            record
+            for record in self._sessions.values()
+            if record.user_id == user_id
+            and record.revoked_at is None
+            and record.expires_at > not_expired_before
+        )
+
+    def session_of_user(
+        self, *, session_id: UUID, user_id: UUID, not_expired_before: datetime
+    ) -> UserSession | None:
+        """Зеркало `SqlStore.session_of_user`: поиск ограничен учётной записью (§8.8).
+
+        Та же граница честности, что у `user_sessions`: на живой базе ограничение `user_id` стоит
+        в самом запросе, и что оно там стоит — проверяет живой файл, а не память.
+        """
+        for record in self._sessions.values():
+            if (
+                record.id == session_id
+                and record.user_id == user_id
+                and record.revoked_at is None
+                and record.expires_at > not_expired_before
+            ):
+                return record
+        return None
 
     def add(self, obj: User | UserSession) -> None:
         if isinstance(obj, UserSession):

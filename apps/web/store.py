@@ -44,6 +44,7 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Protocol
+from uuid import UUID
 
 from fastapi import Request
 from sqlalchemy import create_engine, select
@@ -91,6 +92,37 @@ class Store(Protocol):
 
         Вызывающий обязан передать **уже** вычисленный канонический хэш: значение куки в базу не
         передаётся ни при каких условиях.
+        """
+
+    def user_sessions(
+        self, user_id: UUID, *, not_expired_before: datetime
+    ) -> tuple[UserSession, ...]:
+        """Все сессии пользователя, которые ещё могут быть живыми (срез `R3e`, §8.3).
+
+        Граница `not_expired_before` обязана быть в запросе, а не «отфильтровано потом»: набор
+        живых сессий мал, а набор строк `sessions` за всё время работы площадки — нет. Без
+        ограничения список устройств читал бы все строки пользователя, включая отозванные и
+        завершившиеся по сроку, и превращался бы в самую дорогую страницу консоли. Граничащий
+        предикат совпадает с индексом `ix_sessions_expires_at` (ревизия `0001`).
+
+        Отозванные строки исключаются запросом, а не проверкой: список §9.3 п. 4 держит активные
+        сессии, а историю входов ведёт `audit_log` (`T-109`), а не эта страница.
+
+        Отобранные строки — только **кандидаты**: окончательное решение о живости принимает
+        доменный слой (`packages/identity.sessions.session_is_active`), который знает про шаг
+        входа, отзыв и сессии «из будущего».
+        """
+
+    def session_of_user(
+        self, *, session_id: UUID, user_id: UUID, not_expired_before: datetime
+    ) -> UserSession | None:
+        """Найти сессию по `id`, ограничив её учётной записью пользователя (срез `R3e`).
+
+        Ограничение `user_id` живёт в самом запросе, а не в проверке «нашёл — сверил»: тогда
+        обращение к чужой сессии физически не может ничего найти и ничего изменить (§8.8: «доступ
+        к чужим данным → 403/404 без утечки»). Предикат тот же, что у `user_sessions`: страница
+        отзыва и список обязаны описывать один и тот же набор строк, иначе ссылка со страницы
+        вела бы на строку, которую страница отзыва отказывается видеть.
         """
 
     def add(self, obj: User | UserSession) -> None:
@@ -168,6 +200,31 @@ class SqlStore:
         return self._session.execute(
             select(UserSession).where(UserSession.token_hash == token_hash)
         ).scalar_one_or_none()
+
+    def user_sessions(
+        self, user_id: UUID, *, not_expired_before: datetime
+    ) -> tuple[UserSession, ...]:
+        statement = (
+            select(UserSession)
+            .where(
+                UserSession.user_id == user_id,
+                UserSession.revoked_at.is_(None),
+                UserSession.expires_at > not_expired_before,
+            )
+            .order_by(UserSession.last_seen_at.desc())
+        )
+        return tuple(self._session.execute(statement).scalars())
+
+    def session_of_user(
+        self, *, session_id: UUID, user_id: UUID, not_expired_before: datetime
+    ) -> UserSession | None:
+        statement = select(UserSession).where(
+            UserSession.id == session_id,
+            UserSession.user_id == user_id,
+            UserSession.revoked_at.is_(None),
+            UserSession.expires_at > not_expired_before,
+        )
+        return self._session.execute(statement).scalar_one_or_none()
 
     def add(self, obj: User | UserSession) -> None:
         self._session.add(obj)

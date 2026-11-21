@@ -1,4 +1,4 @@
-"""Выход, страница состояния сессии и (в срезе `R3e`) список устройств (TZ §8.3, §9; `T-102`).
+"""Выход, страница состояния сессии, список устройств и отзыв (TZ §8.3, §9; `T-102`, срезы `R3a`…`R3e`).
 
 Границы файла:
 
@@ -8,8 +8,30 @@
 * `/session-expired` — объясняющая страница (§9). Она не охраняется сессией: показывать её нужно
     ровно тогда, когда живой сессии нет, и охрана страницы состояния редиректом на саму себя
     дала бы петлю;
-* списка устройств и отзывов по одной/всех здесь ещё нет — это срез `R3e` этой же задачи, файл
-  будет расширен, а не переписан.
+* `/profile/sessions` (срез `R3e`) — список живых сессий учётной записи, `/profile/sessions/{id}/revoke`
+    и `/profile/sessions/revoke-all` — подтверждение и сам отзыв (§8.3 «сессии видны пользователю,
+    список устройств, отзыв по одной/всех»).
+
+Что решил срез `R3e` (в ТЗ этих решений нет, они оформлены `docs/adr/ADR-010-session-list-and-revocation.md`):
+
+* **адрес — подпуть профиля, а не корневой `/sessions`** (карта §9.3 п. 4 держит список сессий
+  внутри `/profile`, а подпуть `/profile/security` уже стоит в карте п. 5); страница появляется
+  сейчас, не подменяя будущую страницу профиля целиком;
+* **список охраняется шагом `'full'`, и отзывы — тоже** (§8.2). Ошибка была бы двоякая: пустить
+  шаг `'password'` — значит дать тому, кто знает только пароль, способ выгнать все живые входы
+  владельца (отказ в обслуживании), а не пустить — лишить страницу смысла;
+* **«отозвать все» включает текущую сессию.** «Все», которое экономит одну строку, пока украденный
+  вход мог остаться живым, — не «все». Пользователь уходит со всех устройств, в том числе с этого,
+  и попадает на `/session-expired?reason=revoked` (объяснение, а не форма входа: он просил отозвать
+  все сеансы, а не выйти из одного);
+* **подтверждение — серверная страница, а не JS-модалка.** §9.1 требует подтверждения с указанием
+  объекта; `script-src 'self'` без `'unsafe-inline'` запрещает инлайновый скрипт, а слоя статики
+  (`web/static/*`, §9.2) в репозитории ещё нет. `GET` подтверждения ничего не меняет — отзыв
+  делает только `POST`;
+* **чужой, кривой и уже завершившийся `id` отвечают одним и тем же `404`** (§8.8: «чужие данные →
+    403/404 без утечки»). Различие «есть, но не твоё» и «уже завершилось» ответом не выдаётся.
+
+
 
 Почему страница объясняет причину кодом из закрытого набора: §9 требует внятных состояний, а набор
 причин замкнут (`packages/identity/sessions.SESSION_REASON_CODES` плюс `unknown` уровня HTTP).
@@ -20,10 +42,13 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime
 from typing import Annotated, Final
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from apps.web.security.csrf import csrf_context, require_csrf
 from apps.web.security.rate_limit import MUTATION_USER_SCOPE, enforce_scope
@@ -35,14 +60,30 @@ from apps.web.security.sessions import (
     LOGOUT_PATH,
     REASON_QUERY,
     SESSION_EXPIRED_PATH,
+    SESSION_REVOKE_PATH,
+    SESSIONS_PATH,
+    SESSIONS_REVOKE_ALL_PATH,
     UNKNOWN_SESSION_REASON,
     Principal,
+    SessionRedirect,
     StoreDep,
     clear_session_cookie,
     display_reason_codes,
+    require_full_session,
 )
-from packages.common.clock import utc_now
-from packages.identity.sessions import revoke_session
+from apps.web.store import Store
+from packages.common.clock import to_msk, utc_now
+from packages.identity.sessions import (
+    SessionDescriptor,
+    SessionRevokedError,
+    SessionStepError,
+    describe_session,
+    describe_sessions,
+    ensure_full_auth,
+    revoke_session,
+    revoke_sessions,
+)
+from packages.storage.models import UserSession
 
 router = APIRouter()
 
@@ -68,6 +109,37 @@ def require_mutation_rate_limit(principal: CsrfPrincipal, store: StoreDep) -> Pr
 
 #: Мутация «живая сессия + токен + счётчик частоты».
 RateLimitedMutation = Annotated[Principal, Depends(require_mutation_rate_limit)]
+
+#: Маршрут требует полного входа (§8.2: `'password'` даёт доступ только к странице кода и к `/logout`).
+FullSession = Annotated[Principal, Depends(require_full_session)]
+
+
+def require_full_mutation(principal: RateLimitedMutation) -> Principal:
+    """Мутация полного входа: токен (§8.8), счётчик частоты (§8.3) и шаг `'full'` (§8.2).
+
+    Порядок закреплён за §8.2 и §8.3 и он не «как получилось»: шаг проверяется **после** токена и
+    счётчика, потому что порядок задаёт цепочка зависимостей (`require_csrf` →
+    `require_mutation_rate_limit` → здесь). Следствие осознанное: попытка мутации с шага
+    `'password'` тоже стоит обращения счётчику, и это верно — §8.3 считает запросы пользователя, а
+    не удачные запросы.
+
+    Зачем нужна именно отдельная зависимость, а не `require_full_session` рядом с
+    `RateLimitedMutation`: иначе сессия проверялась бы дважды (два обращения в базу на один запрос),
+    и два обращения могли бы увидеть разные состояния сессии.
+
+    Смысл правила: тот, кто знает только пароль (без кода 2FA), не получает возможность отзывать чужие
+    входы — иначе §8.2 («на шаге `'password'` доступны только страница кода и `/logout`») стал бы
+    способом устроить владельцу отказ в обслуживании.
+    """
+    try:
+        ensure_full_auth(principal.session, now=utc_now())
+    except SessionStepError as exc:
+        raise SessionRedirect(LOGIN_PATH) from exc
+    return principal
+
+
+#: Мутация списка устройств: токен + счётчик + полный вход.
+FullMutation = Annotated[Principal, Depends(require_full_mutation)]
 
 #: Объяснения по закрытому набору причин. Формулировки адресованы человеку (TZ §9: состояния должны
 #: быть внятными), а не оператору: коды и числовые границы в текст не выносятся — страница,
@@ -176,3 +248,349 @@ def logout(
     response = RedirectResponse(LOGIN_PATH, status_code=302)
     clear_session_cookie(response)
     return response
+
+
+# ─── список устройств и отзыв (§8.3, карта страниц §9.3 п. 4; срез `R3e`) ────────────────────
+
+#: Пояснение над списком. Граница честности: страница не обещает «историю входов» — журнал аудита
+#: (§8.7) делает `T-109`, и обещать в UI то, чего в консоли ещё нет, нельзя.
+SESSIONS_NOTE: Final = (
+    "Здесь показаны живые сеансы этой учётной записи: тот, с которого вы смотрите, и остальные "
+    "устройства. Завершённые по сроку и уже отозванные не перечисляются — отозвать их нечем."
+)
+
+#: Подпись над перечнем на странице подтверждения «отзыв всех». Отличается от подписи списка:
+#: здесь перечень обязывает — показаны ровно те объекты, которые уйдут, включая скрытые в списке.
+REVOKE_ALL_NOTE: Final = (
+    "Ниже перечислены сеансы, которые будут отозваны этим подтверждением. В список «Сеансы» "
+    "попадает меньше: строку, которую система уже считает завершившейся, там не видно, но отзыв "
+    "снимет и её."
+)
+
+#: Для сессии без `user_agent`: значение присылает браузер, и его может не быть (`curl`, ссылка
+#: включения Telegram из `T-117`). Пустая ячейка читается как «строка потерялась в шаблоне».
+UNKNOWN_DEVICE_LABEL: Final = "устройство не определено"
+
+#: Для сессии без адреса: `sessions.ip` заполняется из `X-Forwarded-For`, а обращения к `web`
+#: внутри сети состава идут без заголовка (`ADR-009`), и приложение адрес не выдумывает.
+UNKNOWN_ADDRESS_LABEL: Final = "адрес не определён"
+
+#: Пометка своей сессии: без неё список неотличим от перечня чужих входов, а §8.3 требует, чтобы
+#: пользователь видел, где он сейчас и находится.
+CURRENT_SESSION_LABEL: Final = "текущий сеанс"
+
+#: Что подтверждается на странице отзыва. Текст обязан называть объект (§9.1: «модальное
+#: подтверждение с указанием объекта») и обязан называть последствие для того, кто подтверждает.
+REVOKE_OTHER_WARNING: Final = (
+    "Сеанс будет отозван немедленно: с перечисленного устройства вход придётся выполнять заново. "
+    "Отменить отзыв задним числом нельзя."
+)
+REVOKE_CURRENT_WARNING: Final = (
+    "Это тот же сеанс, с которого вы подтверждаете отзыв. Страница откроется уже без входа, и "
+    "вход придётся выполнить заново — на этом устройстве тоже."
+)
+REVOKE_ALL_WARNING: Final = (
+    "Будут отозваны все живые сеансы учётной записи, включая текущий: вход потеряют все "
+    "устройства, в том числе то, с которого вы подтверждаете. Отменить задним числом нельзя."
+)
+
+#: Один ответ на «такого `id` нет», `id` чужой, `id` кривой и «сеанс уже завершился» (§8.8:
+#: «чужие данные → 403/404 без утечки»). Различие этих случаев ответом не выдаётся намеренно:
+#: иначе страница отзыва стала бы способом проверять, чьи идентификаторы существуют.
+GONE_DETAIL: Final = "живого сеанса с таким идентификатором нет"
+
+
+@dataclass(frozen=True)
+class SessionRow:
+    """Строка списка в том виде, как её печатает шаблон: готовые подписи, без логики в разметке.
+
+    Значения полей уже строки, а не объекты: шаблон не должен ни форматовать даты, ни разбирать
+    колонку `INET` (§8.3: вывод — автоэкранирование, а не конкатенация; `docs/adr/ADR-009` про
+    чтение `INET`). Материала сессии — значения куки и `token_hash` — здесь нет и быть не может:
+    страница печатает устройство и сроки, а не билет.
+    """
+
+    device: str
+    address: str
+    started: str
+    last_seen: str
+    expires_at: str
+    is_current: bool
+    revoke_url: str
+
+
+def _human_moment(moment: datetime) -> str:
+    """Мгновение для человека: `ДД.ММ.ГГГГ ЧЧ:ММ` и подпись часового пояса (§9.1).
+
+    Подпись обязательна: `docs/HANDOFF.md` фиксирует, что часы площадки — UTC, а §9.1 требует
+    времени по Москве с явной подписью. Момент, показанный без подписи, читается как местный и
+    расходится с журналом, который ведёт площадка.
+    """
+    return f"{to_msk(moment):%d.%m.%Y %H:%M} МСК"
+
+
+def _to_row(descriptor: SessionDescriptor) -> SessionRow:
+    """Описание сессии из доменного слоя → строка списка.
+
+    `user_agent` печатается как обычная строка: значение контролирует клиент (и оно обрезано до
+    `USER_AGENT_MAX_LEN` в `apps/web/store.py`), экранирование включено, `|safe` запрещён — проверка
+    «XSS в полях не исполняется» (§8.8) держит и это поле.
+
+    Адрес берётся из `str(...)`: живой PostgreSQL читает колонку `INET` объектом `ipaddress`
+    (`ADR-009`), а наружу обязан уходить канонический текст — ровно та форма, которая является
+    значением колонки и ключом счётчика лимитов.
+    """
+    return SessionRow(
+        device=descriptor.user_agent or UNKNOWN_DEVICE_LABEL,
+        address=str(descriptor.ip) if descriptor.ip is not None else UNKNOWN_ADDRESS_LABEL,
+        started=_human_moment(descriptor.created_at),
+        last_seen=_human_moment(descriptor.last_seen_at),
+        expires_at=_human_moment(descriptor.expires_at),
+        is_current=descriptor.is_current,
+        revoke_url=f"{SESSIONS_PATH}/{descriptor.id}/revoke",
+    )
+
+
+def _live_rows(
+    store: Store, principal: Principal, moment: datetime
+) -> tuple[SessionDescriptor, ...]:
+    """Живые сессии пользователя: кандидатов берёт запрос, живость решает домен.
+
+    Разделение обязано быть именно таким: репозиторий отсекает строки, которые заведомо не могут
+    быть живыми (отозванные и с просрочком в прошлом), а `describe_sessions(only_active=True)`
+    применяет правила §8.3 — отзыв, idle, абсолютный срок и «сессия из будущего». Если оставить
+    только доменную половину, страница читала бы все строки пользователя когда-либо; если оставить
+    только запрос — страница показывала бы сеансы, которые отозваны, но ещё не успели устареть.
+    """
+    return describe_sessions(
+        store.user_sessions(principal.session.user_id, not_expired_before=moment),
+        current_id=principal.session.id,
+        now=moment,
+        only_active=True,
+    )
+
+
+def _revocation_rows(
+    store: Store, principal: Principal, moment: datetime
+) -> tuple[SessionDescriptor, ...]:
+    """Объекты отзыва: тот же запрос, что у списка, но без доменной фильтрации по живости.
+
+    Разница с `_live_rows` ровно та, которую держит `ADR-010`: набор, который будет отозван, шире
+    списка. В него входят строки, которые домен признал завершившимися (например, `expires_at` в
+    будущем из-за сдвига часов на выпустившем устройстве), но которые запрос ещё считает
+    пригодными для отзыва. Обратная ошибка опаснее: пропущенная строка означала бы «я отозвал все
+    устройства», под которой осталась живая сессия.
+
+    Поэтому страница подтверждения перечисляет именно этот набор, а не отображаемый список: §9.1
+    требует подтверждения с указанием объекта, и «показали одно, а отозвали другое» этому
+    требованию не отвечает.
+    """
+    return describe_sessions(
+        store.user_sessions(principal.session.user_id, not_expired_before=moment),
+        current_id=principal.session.id,
+        now=moment,
+        only_active=False,
+    )
+
+
+def _render_sessions(
+    request: Request,
+    principal: Principal,
+    rows: tuple[SessionDescriptor, ...],
+    *,
+    confirm_all: bool,
+    note: str,
+) -> HTMLResponse:
+    """Одна разметка на список и на подтверждение «отозвать все».
+
+    Второй таблицы в репозитории не будет: список и подтверждение отличаются предупреждением,
+    наличием формы `POST` и подписью над перечнем. Перечень на подтверждении выводит тот же метод
+    строк, что и список: иначе страница подтверждения рисовала бы «свой» набор, и показанное
+    перестало бы совпадать с отзываемым (§9.1).
+    """
+    context = {
+        "page_title": "Отзыв всех сеансов" if confirm_all else "Сеансы",
+        "note": note,
+        "rows": [_to_row(row) for row in rows],
+        "current_label": CURRENT_SESSION_LABEL,
+        "sessions_url": SESSIONS_PATH,
+        "revoke_all_url": SESSIONS_REVOKE_ALL_PATH,
+        "confirm_all": confirm_all,
+        "warning": REVOKE_ALL_WARNING if confirm_all else "",
+    } | csrf_context(principal)
+    response: HTMLResponse = request.app.state.templates.TemplateResponse(
+        request, "sessions.html", context
+    )
+    return response
+
+
+@router.get(SESSIONS_PATH, response_class=HTMLResponse)
+def sessions_page(request: Request, principal: FullSession, store: StoreDep) -> HTMLResponse:
+    """Список сессий пользователя (§8.3: «сессии видны пользователю»).
+
+    `GET` счётчика частоты не имеет: §8.3 ограничивает мутации, а лимит на просмотр страницы дал бы
+    способ устроить отказ человеку, который просто открыл страницу (`ADR-007`, та же логика, что у
+    `GET /login`).
+
+    Пустого состояния здесь не бывает по построению: список охраняется живой сессией, а она сама
+    входит в перечень. Просить шаблон «объяснить пустоту» значило бы держать ветку, в которую нет
+    пути.
+    """
+    moment = utc_now()
+    return _render_sessions(
+        request,
+        principal,
+        _live_rows(store, principal, moment),
+        confirm_all=False,
+        note=SESSIONS_NOTE,
+    )
+
+
+@router.get(SESSIONS_REVOKE_ALL_PATH, response_class=HTMLResponse)
+def revoke_all_confirm(request: Request, principal: FullSession, store: StoreDep) -> HTMLResponse:
+    """Подтверждение «отозвать все»: показывает, что именно будет отозвано (§9.1).
+
+    Метод `GET` ничего не меняет. Это не формальность: ссылка подтверждения может быть открыта
+    повторно, по истории браузера или ботом, и безопасный метод обязан уметь открывать страницу
+    отзыва без последствия. Отзыв делает `POST` с CSRF-токеном.
+
+    Перечисляется набор отзыва (`_revocation_rows`), а не отображаемый список: показанное обязано
+    совпадать с отзываемым, включая строки, которые страница «Сеансы» скрывает как завершившиеся
+    (`ADR-010`).
+    """
+    moment = utc_now()
+    return _render_sessions(
+        request,
+        principal,
+        _revocation_rows(store, principal, moment),
+        confirm_all=True,
+        note=REVOKE_ALL_NOTE,
+    )
+
+
+def _owned_live_session(store: Store, principal: Principal, raw_id: str) -> UserSession | None:
+    """Найти отзываемую сессию так, чтобы чужая строка не нашлась никогда.
+
+    Разбор `id` — ручной, а не через тип параметра маршрута: FastAPI на неразбираемом значении
+    отвечает `422` с перечнем полей, и тогда «ввели мусор в адрес» отличался бы от «сессии нет»,
+    а страница отзыва начала бы рассказывать про внутренности схемы параметров. Нужен один ответ на
+    все четыре случая (§8.8).
+    """
+    try:
+        target = UUID(raw_id)
+    except ValueError:
+        return None
+    return store.session_of_user(
+        session_id=target, user_id=principal.session.user_id, not_expired_before=utc_now()
+    )
+
+
+def _session_gone() -> JSONResponse:
+    """`404` без подробностей: тот же ответ для чужого, кривого и завершившегося идентификатора."""
+    return JSONResponse({"status": "not_found", "detail": GONE_DETAIL}, status_code=404)
+
+
+def _revoke_finished(*, current_ended: bool) -> Response:
+    """Ответ после отзыва: обратно к списку, либо на страницу состояния, если ушёл текущий сеанс.
+
+    Направление выбрано не для красоты: оно совпадает с тем, что сама охрана маршрута сделала бы с
+    отозванной кукой (`SessionRedirect(SESSION_EXPIRED_PATH, reason='revoked')`). Поэтому здесь тот
+    же адрес и та же причина, а не «страница входа, потому что это выход»:
+
+    * `/logout` — человек сам вышел, и следующее, что ему нужно, — форма входа;
+    * отзыв — сеанс завершён как решение безопасности, и человек обязан увидеть состояние
+      «отозван», иначе «отозвать все» выглядит как сбой, а не как его собственное действие.
+
+    Кука стирается всегда, когда ушла текущая сессия: оставлять в браузере билет, который база уже
+    считает мёртвым, §8.3 запрещает.
+    """
+    if current_ended:
+        location = f"{SESSION_EXPIRED_PATH}?{REASON_QUERY}={SessionRevokedError.code}"
+        response = RedirectResponse(location, status_code=302)
+        clear_session_cookie(response)
+        return response
+    return RedirectResponse(SESSIONS_PATH, status_code=302)
+
+
+@router.get(SESSION_REVOKE_PATH, response_class=HTMLResponse)
+def revoke_confirm(
+    request: Request, session_id: str, principal: FullSession, store: StoreDep
+) -> Response:
+    """Страница подтверждения отзыва одной сессии (§9.1: подтверждение с указанием объекта).
+
+    Серверная страница вместо JS-модалки — следствие того же ТЗ: `script-src 'self'` без
+    `'unsafe-inline'` запрещает инлайновый скрипт (§8.3), а слоя статики консоли (`web/static/`,
+    §9.2) в репозитории ещё нет. Пока модалки нет, подтверждение обязано быть серверным: «кнопка и
+    надежда на аккуратность» для отзыва чужого входа — не подтверждение.
+
+    Тип возврата — `Response`, а не `HTMLResponse`: ветка «идентификатор не подходит» отвечает
+    `404` телом (`_session_gone`), и это тот же ответ, что дают отказные ветки мутаций.
+    """
+    record = _owned_live_session(store, principal, session_id)
+    if record is None:
+        return _session_gone()
+    moment = utc_now()
+    descriptor = describe_session(record, current_id=principal.session.id, now=moment)
+    context = {
+        "page_title": "Отзыв сеанса",
+        "warning": REVOKE_CURRENT_WARNING if descriptor.is_current else REVOKE_OTHER_WARNING,
+        "row": _to_row(descriptor),
+        "current_label": CURRENT_SESSION_LABEL,
+        "sessions_url": SESSIONS_PATH,
+        "revoke_url": f"{SESSIONS_PATH}/{descriptor.id}/revoke",
+    } | csrf_context(principal)
+    response: HTMLResponse = request.app.state.templates.TemplateResponse(
+        request, "session_revoke.html", context
+    )
+    return response
+
+
+@router.post(SESSION_REVOKE_PATH, response_class=Response)
+def revoke_one(session_id: str, principal: FullMutation, store: StoreDep) -> Response:
+    """Отозвать одну сессию (§8.3: «отзыв по одной»).
+
+    Порядок: токен (`require_csrf`) → счётчик частоты → шаг `'full'` → поиск с ограничением по
+    учётной записи → отзыв → `commit()` → ответ. Ограничение `user_id` в самом запросе — то, что
+    делает отзыв чужой сессии невозможным, а не «нашли и сверили»: одна ошибка в сверке оставила бы
+    дыру, а запрос её не оставит (§8.8).
+
+    Повторный отзыв (страница подтверждения открыта дважды, нажаты две вкладки) вторично ничего не
+    меняет: `revoked_at` уже заполнен, строка больше не попадает в перечень живых — ответ будет
+    `404`, а момент первого отзыва не перетрётся.
+
+    Запись `audit_log` о отзыве (§8.7) здесь не пишется: имена событий и цепочка хэшей — `T-109`,
+    перенос зафиксирован `ADR-009`.
+    """
+    record = _owned_live_session(store, principal, session_id)
+    if record is None:
+        return _session_gone()
+    revoke_session(record, now=utc_now())
+    store.commit()
+    return _revoke_finished(current_ended=record.id == principal.session.id)
+
+
+@router.post(SESSIONS_REVOKE_ALL_PATH, response_class=Response)
+def revoke_all(principal: FullMutation, store: StoreDep) -> Response:
+    """Отозвать все живые сессии учётной записи, включая текущую (§8.3: «отзыв по одной/всех»).
+
+    «Все» включает текущую сессию осознанно: отзыв, который бережёт ровно тот вход, с которого его
+    делают, не является ответом на подозрение в компрометации — украденный вход мог быть ровно тем
+    самым. Следствие приняло и направление редиректа: пользователь уходит и с этого устройства, и
+    попадает на объяснение «сеанс отозван», а не на форму входа.
+
+    Набор — кандидаты отзыва (тот же, что перечисляет страница подтверждения), а не «все строки
+    таблицы когда-либо» и не отображаемый список: отзывать строки, у которых срок уже истёк, нечем,
+    и такая правка только заполнила бы `revoked_at` у записей, которые и так не используются
+    (`ADR-010`, `T-109` читает это поле как признак отзыва). При этом набор сознательно шире списка:
+    строку, которую домен признал завершившейся, но которую запрос ещё считает отзываемой, снимают
+    вместе с остальными — поэтому страница подтверждения перечисляет кандидатов, а не список.
+
+    Текущая сессия входит в набор по построению: охрана маршрута только что продлила её. Проверка
+    `any(...)` держит это как факт кода, а не как догадку: если набор окажется без текущей сессии,
+    пользователь должен остаться внутри, а не получить редирект «вы отозваны».
+    """
+    moment = utc_now()
+    candidates = store.user_sessions(principal.session.user_id, not_expired_before=moment)
+    revoked = revoke_sessions(candidates, now=moment)
+    store.commit()
+    return _revoke_finished(current_ended=any(row.id == principal.session.id for row in revoked))

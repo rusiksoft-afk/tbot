@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+{% block content %}
+{# Подтверждение отзыва одной сессии (§9.1: разрушающее действие — подтверждение с указанием
+   объекта). Объект называется полностью: устройство, адрес, начало сеанса и последняя активность.
+   Значения готовит обработчик (`SessionRow`), разметка ничего не форматирует и не печатает
+   материал сеанса (§8.4). #}
+<h1>{{ page_title }}</h1>
+<p role="alert">{{ warning }}</p>
+<table>
+  <caption>Сеанс, который будет отозван</caption>
+  <tbody>
+    <tr>
+      <th scope="row">Устройство</th>
+      <td>{{ row.device }}</td>
+    </tr>
+    <tr>
+      <th scope="row">Адрес входа</th>
+      <td>{{ row.address }}</td>
+    </tr>
+    <tr>
+      <th scope="row">Начало сеанса</th>
+      <td>{{ row.started }}</td>
+    </tr>
+    <tr>
+      <th scope="row">Последняя активность</th>
+      <td>{{ row.last_seen }}</td>
+    </tr>
+    <tr>
+      <th scope="row">Завершится</th>
+      <td>{{ row.expires_at }}</td>
+    </tr>
+    {% if row.is_current %}
+    <tr>
+      <th scope="row">Отношение к вам</th>
+      <td>{{ current_label }}</td>
+    </tr>
+    {% endif %}
+  </tbody>
+</table>
+{# Отзыв делает только `POST` с CSRF-токеном (§8.8, ADR-008): страница подтверждения открывается
+   методом `GET` и сама по себе не меняет состояние. #}
+<form method="post" action="{{ revoke_url }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p><button type="submit">Отозвать этот сеанс</button></p>
+</form>
+<p><a href="{{ sessions_url }}">Отменить и вернуться к списку</a></p>
+{% endblock %}
