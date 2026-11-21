@@ -294,20 +294,29 @@ def test_счётчик_не_уходит_в_отрицательные_знач
 def test_длина_ключа_субъекта_в_пределах_и_не_больше(
     connection: psycopg.Connection[tuple[Any, ...]],
 ) -> None:
-    """IPv6 (45 символов) проходит, произвольный длинный текст — нет: ключ обязан быть адресом."""
-    ipv6 = "2001:0db8:0000:0000:0000:0000:0000:0001"
-    connection.execute(
+    """Потолок длины ключа (64) держит база: полный IPv6 проходит, 65 символов и пустая строка — нет."""
+    insert = (
         "INSERT INTO rate_buckets (scope, bucket_key, window_start, attempts) "
-        "VALUES (%s, %s, %s, %s)",
-        ("totp_ip", ipv6, _WINDOW_START, 1),
+        "VALUES (%s, %s, %s, %s)"
+    )
+    # Полный текст IPv6 — 39 символов, с запасом до потолка 64; границу проверяем парой значений
+    # «64 проходит / 65 нет», иначе потолок можно случайно сдвинуть в любую сторону.
+    ipv6 = "2001:0db8:0000:0000:0000:0000:0000:0001"
+    connection.execute(insert, ("totp_ip", ipv6, _WINDOW_START, 1))
+    connection.execute(insert, ("mutation_user", "u" * 64, _WINDOW_START, 1))
+    _rejected(
+        connection,
+        insert,
+        f"ключ субъекта длиной {len('u' * 65)} символов",
+        _CHECK_VIOLATION,
+        ("mutation_user", "u" * 65, _WINDOW_START, 1),
     )
     _rejected(
         connection,
-        "INSERT INTO rate_buckets (scope, bucket_key, window_start, attempts) "
-        "VALUES (%s, %s, %s, %s)",
-        f"ключ субъекта длиной {len(ipv6) + 20} символов",
+        insert,
+        "пустой ключ субъекта",
         _CHECK_VIOLATION,
-        ("totp_ip", ipv6 + "x" * 20, _WINDOW_START, 1),
+        ("mutation_user", "", _WINDOW_START, 1),
     )
 
 
