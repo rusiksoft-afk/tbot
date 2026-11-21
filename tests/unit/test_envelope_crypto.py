@@ -539,8 +539,17 @@ def test_aad_каноничен_и_алфавит_kind_закрыт() -> None:
 # ─── 3. файл KEK (§8.4: путь, права, формат) ──────────────────────────────────────────────────
 
 
-def _write_key_file(directory: Path, payload: str | bytes, *, mode: int | None = 0o600) -> Path:
-    path = directory / "kek.json"
+def _write_key_file(
+    directory: Path,
+    payload: str | bytes,
+    *,
+    mode: int | None = 0o600,
+    name: str = "kek.json",
+) -> Path:
+    # Имя параметризовано: второй `_write_key_file` в том же каталоге обязан создавать новый файл,
+    # иначе на POSIX он пытается перезаписать файл, которому только что выставили 0400, и падает
+    # с PermissionError вместо проверки политики прав.
+    path = directory / name
     if isinstance(payload, bytes):
         path.write_bytes(payload)
     else:
@@ -605,11 +614,11 @@ def test_файл_ключей_с_правами_группы_или_мира_н
     Такой файл уже означает скомпрометированный ключ: §8.4 требует 0400 (или 640 root:gid процесса
     по ADR-005), и поднимать приложение с ним нельзя — отказ, а не предупреждение в лог.
     """
-    loose = _write_key_file(tmp_path, _document(), mode=0o644)
+    loose = _write_key_file(tmp_path, _document(), mode=0o644, name="kek-loose.json")
     with pytest.raises(KeyRingUnusableError, match="за пределами"):
         load_key_ring(loose)
     for mode in (0o400, 0o600, 0o640):
-        ok = _write_key_file(tmp_path, _document(), mode=mode)
+        ok = _write_key_file(tmp_path, _document(), mode=mode, name=f"kek-{oct(mode)[2:]}.json")
         assert load_key_ring(ok).active.version == 2
 
 

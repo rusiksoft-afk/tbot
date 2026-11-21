@@ -29,7 +29,13 @@ from typing import Any, Final, Protocol
 import psycopg
 import pytest
 
-from packages.common.crypto import DecryptionError, EnvelopeError, KeyRing, parse_key_ring_document
+from packages.common.crypto import (
+    OFFSET_WRAPPED_DEK,
+    DecryptionError,
+    EnvelopeError,
+    KeyRing,
+    parse_key_ring_document,
+)
 from packages.common.db import psycopg_dsn
 from packages.identity.totp import decode_totp_secret, new_totp_secret
 from packages.identity.totp_secret import open_totp_secret, protect_totp_secret
@@ -164,8 +170,11 @@ def test_шифртекст_привязки_проходит_через_bytea_�
     `SELECT` → `open_totp_secret`. Потеря одного байта на переносе дала бы отказ тега на части
     строк — самый неудобный из дефектов: работает везде, кроме площадки.
     """
-    user_id = _make_user(connection, "totp.cipher.roundtrip")
+    # Отдельная учётка на каждую привязку: частичный уникальный индекс
+    # `ix_totp_enrollments_user_active` держит «одна действующая привязка на пользователя» (§8.2),
+    # и проверка, которая вставляет несколько привязок подряд, обязана это учитывать.
     for index in range(5):
+        user_id = _make_user(connection, f"totp.cipher.roundtrip.{index}")
         enrollment_id = uuid.uuid4()
         text = new_totp_secret()
         expected = decode_totp_secret(text)
@@ -246,28 +255,30 @@ def test_база_форму_шифртекста_не_проверяет_a_пр
     проходит, а `open_totp_secret` на нём отказывает. Значит защита обязана жить на стороне
     приложения и не «протечёт» из-за правки строки в обход ORM.
     """
-    user_id = _make_user(connection, "totp.cipher.rawwrite")
-
     # (1) открытое значение в bytea проходит: ограничением на форме база не прикроется.
+    user_open = _make_user(connection, "totp.cipher.rawwrite-open")
     open_id = uuid.uuid4()
     open_value = base64.b32encode(bytes(range(1, 21))).decode("ascii").rstrip("=").encode("ascii")
-    _save_enrollment(connection, user_id=user_id, enrollment_id=open_id, secret_enc=open_value)
+    _save_enrollment(connection, user_id=user_open, enrollment_id=open_id, secret_enc=open_value)
     stored_open = _load_secret_enc(connection, open_id)
     assert stored_open == open_value, "база обязана принять значение: CHECK на форму в bytea нет"
     with pytest.raises(EnvelopeError, match="меньше минимума"):
-        open_totp_secret(stored_open, enrollment_id=open_id, user_id=user_id, ring=_RING)
+        open_totp_secret(stored_open, enrollment_id=open_id, user_id=user_open, ring=_RING)
 
-    # (2) корректный конверт, изменённый в полезной нагрузке: тег на месте, содержимое — нет.
+    # (2) корректный конверт с изменённым байтом в обёртке DEK: структура на месте, содержимое —
+    # нет. Смещение берётся из констант формата, чтобы подделка была привязана к полю, а не к «последним байтам значения» (последние 16 байт — тег, их правка тоже отказывает, но проверяет другое).
+    # Своя учётка: двух действующих привязок на одного пользователя не даёт уникальный индекс.
+    user_real = _make_user(connection, "totp.cipher.rawwrite-real")
     real_id = uuid.uuid4()
     envelope = protect_totp_secret(
-        new_totp_secret(), enrollment_id=real_id, user_id=user_id, ring=_RING
+        new_totp_secret(), enrollment_id=real_id, user_id=user_real, ring=_RING
     )
-    _save_enrollment(connection, user_id=user_id, enrollment_id=real_id, secret_enc=envelope)
+    _save_enrollment(connection, user_id=user_real, enrollment_id=real_id, secret_enc=envelope)
     stored = _load_secret_enc(connection, real_id)
     assert stored == envelope
     tampered = bytearray(stored)
-    tampered[-8] ^= 0xFF
+    tampered[OFFSET_WRAPPED_DEK + 5] ^= 0xFF
     assert bytes(tampered) != stored
     assert len(bytes(tampered)) == len(stored)
     with pytest.raises(DecryptionError):
-        open_totp_secret(bytes(tampered), enrollment_id=real_id, user_id=user_id, ring=_RING)
+        open_totp_secret(bytes(tampered), enrollment_id=real_id, user_id=user_real, ring=_RING)
