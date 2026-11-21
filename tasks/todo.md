@@ -285,14 +285,17 @@
     `rate_buckets` + CHECK формата `sessions.token_hash`), CSRF-токен — HMAC, выводимый из
     (значение куки, id сессии), в базу не пишется (`ADR-008`); деплой этого среза на площадку отложен
     («одним комплектом»), но при следующем деплое обязателен `run --rm migrate` из-за `0003`.
-    Открытым остался один вопрос: кто держит временный бан IP из §8.2 (окно 300 секунд) — приложение,
-    `fail2ban` по логам или оба слоя; без ответа CHECK `window_seconds` остаётся `= 60`.
+    Решено заказчиком 2026-11-21 (ask `abb0151c`): временный бан IP из §8.2 держит приложение —
+    в схеме добавлены область `ip_ban` и набор окон `60`/`300`; адрес клиента — из `X-Forwarded-For`
+    (Caddy); протёкшие окна чистит процесс `jobs` раз в час, окна старше 24 часов. Разбор —
+    `docs/HANDOFF.md §1.28`. Открытым остался срок самого бана (ТЗ его не задаёт; предложено
+    15 минут — как `LOCK_DURATION` из `T-101` и блокировка после 5 кодов TOTP из §8.2).
   - Статус 2026-11-21 (вторая половина): **схема счётчика готова** — ревизия `0003_rate_counters`
     (`rate_buckets`: PK `(scope, bucket_key, window_start)`, четыре области из §8.3 в CHECK,
     `window_seconds = 60` с серверным default, `attempts >= 0`, индекс `window_start` под чистку,
     внешних ключей нет намеренно; + `ck_sessions_token_hash_format`) и модель `RateBucket`.
     Ревизия на живую ВМ не применялась (деплой отложен), при постановке обязателен
-    `run --rm migrate`. Проверки: `tests/contract/test_rate_limits_schema.py` (9),
+    `run --rm migrate`. Проверки: `tests/contract/test_rate_limits_schema.py` (10),
     `tests/integration/test_rate_buckets_db.py` (8, новый шаг CI в job `migrations`), обновлённый
     `tests/contract/test_identity_schema.py` (16; цепочка ревизий — head `0003`, разбор офлайн-SQL
     учитывает `ALTER TABLE … ADD CONSTRAINT`, появился перечень обоснованных таблиц вне §4.1 —
