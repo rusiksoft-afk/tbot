@@ -133,7 +133,11 @@ async def login_submit(request: Request, store: StoreDep) -> Response:
     login, password = login_pair(fields)
     moment = utc_now()
 
-    if login == "" or password == "":
+    # Проверка на пустоту через истинностное значение, а не сравнением с пустой строкой:
+    # `login_pair` уже обрезает значения, а сравнение поля с именем `password` с литералом
+    # читается статическим анализатором как «жёстко заданный пароль» (B105) и маскирует
+    # настоящий смысл проверки — «пользователь ничего не ввёл».
+    if not login or not password:
         return _render_login(request, detail=EMPTY_FORM_DETAIL, status_code=400)
 
     user = store.user_by_login(login)
