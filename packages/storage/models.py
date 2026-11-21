@@ -46,8 +46,9 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import CITEXT, INET, JSONB
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, validates
 
+from packages.common.crypto import ensure_envelope
 from packages.common.ids import uuid7
 from packages.storage.base import Base
 
@@ -278,6 +279,21 @@ class TotpEnrollment(Base):
     verify_window: Mapped[int] = mapped_column(
         Integer(), nullable=False, server_default=text(str(TOTP_WINDOW_DEFAULT))
     )
+
+    @validates("secret_enc")
+    def _только_шифртекст(self, key: str, value: bytes) -> bytes:
+        """Не дать открытому секрету лечь в `secret_enc` (§8.4, `ADR-014` п. 6).
+
+        База такую колонку не проверяет: `bytea` принимает любые байты, а «похоже на случайные
+        байты» — не признак шифрования. Проверка держится на уровне схемы как единственная точка,
+        через которую проходит запись привязки: значение обязано быть конвертом формата `TBE1`
+        (метка, версия формата, версия ключа, обёртка DEK, nonce и тело). Открытый base32-секрет,
+        обрезанное значение и шифртекст чужого формата отсекаются до запроса к базе.
+
+        Прямым `INSERT`/`UPDATE` в обход ORM это не держится — колонка-то без `CHECK`; для SQL-
+        правок путь один: сначала собрать конверт (`protect_totp_secret`), потом писать.
+        """
+        return ensure_envelope(value, column=f"{self.__tablename__}.{key}")
 
 
 class BackupCode(Base):

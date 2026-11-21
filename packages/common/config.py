@@ -179,6 +179,11 @@ class Settings(BaseSettings):
     confirm_production: bool = False
     instance_name: str = "dev"
     secrets_dir: Path = Path("/etc/tbot/secrets")
+    # Файл ключей KEK (TZ §8.4, ADR-014 п. 5): отдельный от secrets_dir — у него другие права
+    # (§8.4: 0400; для монтируемого в контейнер файла — 640 root:gid процесса по ADR-005) и другой
+    # жизненный цикл: он переживает пересоздание состава и живёт до ротации. Здесь только путь:
+    # значений ключей в настройках, в YAML и в compose нет и быть не должно (§8.4 «не в БД и не в образе»).
+    kek_file: Path = Path("/etc/tbot/keys/kek.json")
 
     limits: RiskLimits = Field(default_factory=RiskLimits)
     retention: Retention = Field(default_factory=Retention)
