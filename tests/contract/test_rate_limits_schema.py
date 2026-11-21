@@ -43,6 +43,7 @@ TZ_SECURITY: Final = ROOT / "docs" / "tz" / "08-security-auth-2fa.md"
 ADR_RATE: Final = ROOT / "docs" / "adr" / "ADR-007-rate-limit-counter-table.md"
 ADR_CSRF: Final = ROOT / "docs" / "adr" / "ADR-008-csrf-token-derived-from-session.md"
 MIGRATION: Final = ROOT / "migrations" / "versions" / "0003_rate_counters.py"
+HANDOFF: Final = ROOT / "docs" / "HANDOFF.md"
 ROLES_SQL: Final = ROOT / "deploy" / "postgres" / "roles.sql"
 
 # Фиктивная база: офлайн-генерация (`--sql`) соединения не открывает, но `migrations/env.py`
@@ -278,6 +279,35 @@ def test_формат_хэша_значения_куки_в_базе_и_в_пр�
     assert (
         _TOKEN_HASH_CONSTRAINT in names
     ), f"в модели sessions нет ограничения {_TOKEN_HASH_CONSTRAINT}: модель и ревизия разошлись"
+
+
+def test_политика_отказа_зафиксирована_решением_заказчика_а_не_ходом_реализации() -> None:
+    """Срок бана, зона отказа и форма ответа решены заказчиком (ask `ba6a9076`).
+
+    Кода лимитов ещё нет, поэтому проверка держит решение: 15 минут, только `/login` и `/totp`,
+    `429` с `Retry-After` и запись в журнал, срок — константа кода, отдельная от `LOCK_DURATION`
+    блокировки учётной записи. Иначе по ходу реализации «проще» сделать бан на весь `web`,
+    молча уронить `403` вместо `429` или взять один срок на два разных правила.
+    """
+    adr = ADR_RATE.read_text(encoding="utf-8")
+    for marker in (
+        "ba6a9076",
+        "15 минут",
+        "только слой входа",
+        "IP_BAN_DURATION",
+        "LOCK_DURATION",
+        "429",
+        "Retry-After",
+        "audit_log",
+        "а не настройкой",
+    ):
+        assert marker in adr, f"в ADR-007 не осталось маркера политики отказа {marker!r}"
+
+    handoff = HANDOFF.read_text(encoding="utf-8")
+    assert "ba6a9076" in handoff, (
+        "в docs/HANDOFF.md §4 не осталось ответа заказчика про срок и зону бана: "
+        "следующая сессия прочитает этот раздел как открытый вопрос"
+    )
 
 
 def test_счётчик_не_журнал_и_отдельных_прав_из_roles_sql_не_требует() -> None:
