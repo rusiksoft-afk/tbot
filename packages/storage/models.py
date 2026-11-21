@@ -346,6 +346,11 @@ class UserSession(Base):
 
     `revoked_at` проверяется на каждом запросе (§8.3: «отзыв отражается немедленно»), поэтому
     частичный индекс по активным сессиям не нужен: активных строк мало, а смотрим по PK.
+
+    `expires_at` — скользящая граница idle (30 минут от последней активности), но не позже
+    абсолютного срока (12 часов от создания). `last_seen_at` имеет `onupdate=now()`: если
+    прикладной слой продлевает сессию и хочет зафиксировать свой момент (например, время запроса,
+    а не время коммита), он обязан выставить значение явно — иначе подставится `now()` базы.
     """
 
     __tablename__ = "sessions"
@@ -353,7 +358,10 @@ class UserSession(Base):
         UniqueConstraint("token_hash", name="uq_sessions_token_hash"),
         CheckConstraint("auth_step IN ('password', 'totp', 'full')", name="auth_step"),
         # Сессия с просрочком в прошлом не может быть живой, а `expires_at <= created_at` —
-        # ошибка приложения (idle 30 мин / abs 12 ч из §8.3 считаются от создания).
+        # ошибка приложения. Правила сроков при этом разные (TZ §8.3): idle 30 минут отсчитывается
+        # от последней активности и сдвигается, абсолютные 12 часов — от создания и не сдвигаются.
+        # Значение колонки считает `packages/identity/sessions.py` как
+        # `min(сейчас + idle, created_at + abs)`, здесь ограничение только про порядок моментов.
         CheckConstraint("expires_at > created_at", name="expires_after_created"),
         CheckConstraint("last_seen_at >= created_at", name="last_seen_not_before_created"),
         Index("ix_sessions_user_id", "user_id"),

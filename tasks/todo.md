@@ -264,6 +264,21 @@
   - Приёмка: TZ §8.3 (куки, CSRF, CSP, HSTS)
   - Проверка: `test_session_matrix`, `test_csrf_required`, `test_session_revoke`
   - Файлы: `apps/web/security/{sessions,csrf,csp}.py`, шаблоны
+  - Статус 2026-11-21: первый срез (домен) выполнен, задача **не закрыта**. `packages/identity/
+    sessions.py` — срок 30 минут idle и 12 часов абсолютных (`expires_at = min(сейчас + idle,
+    созданная + abs)`), значение куки 256 бит (base64url, 43 символа) и только SHA-256 в базе,
+    шаг входа только вперёд, пересоздание по закрытому перечню причин §8.3, отзыв одной/всех с
+    немедленной видимостью, смена пароля по §8.1+§8.3 (текущая пересоздаётся, остальные
+    отзываются), коды причин `revoked`/`idle`/`absolute`/`not_yet`. Проверки:
+    `tests/unit/test_session_matrix.py` (29), `tests/unit/test_session_revoke.py` (12),
+    `tests/contract/test_sessions_contract.py` (9). Разбор — `docs/HANDOFF.md §1.26`.
+    Остаток среза — `apps/web` (атрибуты куки, `test_csrf_required`, CSP/HSTS/nosniff/
+    Referrer-Policy/Permissions-Policy, autoescape, `/session-expired` и `/locked`, список сессий,
+    счётчик частоты запросов) плюс интеграционная проверка живого поиска по `token_hash` и
+    интеграционный вариант строки §8.8 «смена пароля отзывает сессии». Два вопроса заказчику —
+    `docs/HANDOFF.md §4`: где жить счётчику частоты (в §4.1 хранилища нет) и как выводиться
+    CSRF-токену, чтобы не обесценить `HttpOnly`. Отдельно: `argon2-cffi` из `T-101` меняет образ —
+    digest'ы переснимаются перед деплоем, этого среза на площадке нет.
 - [ ] **T-103** TOTP 2FA: привязка (QR+секрет, подтверждение 2 кода), вход с обязательным кодом, окно ±1, одноразовость кода
   - Приёмка: `REQ-identity-*` TZ §8.2; все маршруты требуют `auth_step='full'`
   - Проверка: `test_totp_flow`, `test_route_requires_full_auth` (параметризовано по всем маршрутам)

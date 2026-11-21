@@ -37,6 +37,15 @@ def to_utc(moment: datetime) -> datetime:
     return moment.astimezone(UTC)
 
 
+def ensure_aware(moment: datetime | None = None) -> datetime:
+    """Переданный момент (приведённый к UTC) или «сейчас».
+
+    Нужен доменным функциям, которые принимают `now` для проверяемости тестов: наивное значение
+    отсекается здесь же, а не тогда, когда объект уже изменён (§2.7).
+    """
+    return utc_now() if moment is None else to_utc(moment)
+
+
 def to_msk(moment: datetime) -> datetime:
     """Представление для интерфейса/дайджестов (не для вычислений)."""
     return to_utc(moment).astimezone(MSK_TZ)

@@ -32,7 +32,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Final
 
-from packages.common.clock import to_utc, utc_now
+from packages.common.clock import ensure_aware
 from packages.identity.passwords import check_password_policy, hash_password
 from packages.storage.models import User
 
@@ -63,7 +63,7 @@ class LoginLockedError(RuntimeError):
 
 def _moment(now: datetime | None) -> datetime:
     """«Сейчас» или переданное время — всегда осознанный UTC (§2.7)."""
-    return utc_now() if now is None else to_utc(now)
+    return ensure_aware(now)
 
 
 def new_user(
