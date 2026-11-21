@@ -898,6 +898,12 @@ def test_смена_пароля_не_обнуляет_счётчик_неуда
     db.execute(update(User).where(User.id == seeded.id).values(failed_attempts=2))
     db.commit()
 
+    # Хэш снимается до смены и именно значением: `seeded` — объект из identity map того же
+    # `Session`, и сравнение «`account.password_hash != seeded.password_hash`» после `expire_all`
+    # сравнивало бы строку саму с собой (оба объекта перечитаны одним запросом) и проходило бы
+    # молча даже при unchanged-значении.
+    hash_before = _учётка_из_таблицы(db, seeded.id).password_hash
+
     current = _полная_сессия(db, seeded.id)
     response = _смена_пароля(
         client, secret, current, current=TEST_PASSWORD, new=NEW_PASSWORD, repeat=NEW_PASSWORD
@@ -906,4 +912,4 @@ def test_смена_пароля_не_обнуляет_счётчик_неуда
 
     account = _учётка_из_таблицы(db, seeded.id)
     assert account.failed_attempts == 2, f"счётчик неудач обнулили: {account.failed_attempts}"
-    assert account.password_hash != seeded.password_hash
+    assert account.password_hash != hash_before, "смена пароля обязана отразиться в строке"
