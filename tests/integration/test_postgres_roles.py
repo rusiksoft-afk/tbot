@@ -16,7 +16,13 @@
   `USAGE ON SEQUENCE` — различие закреплено поведенчески, потому что прав на последовательности
   файлом прав не выдаётся);
 * отзыв точечный: на `users` роль приложения по-прежнему делает `INSERT`/`UPDATE`/`DELETE`;
-* у роли приложения нет прав уровня кластера, и она не создаёт объектов схемы (DDL — у владельца);
+* у роли приложения нет прав уровня кластера; право `CREATE` на схему `public` у него **есть** —
+  оно нужно `alembic`, который в этом составе идёт ролью приложения (решение заказчика от
+  2026-11-21, ask `8d2be9bb`, вариант Б), и при этом `ALTER TABLE`/`DROP TABLE`/`CREATE INDEX` по
+  чужим объектам остаются отказом `42501`;
+* таблица журнала принадлежит роли-владельцу, а не приложению, и возвращается ей после того, как
+  журнал временно переходил приложению: у владельца отзыв прав не действует, поэтому право
+  `CREATE` на схеме не должно приводить к владению журналом;
 * таблицы будущих ревизий получают DML автоматически (`ALTER DEFAULT PRIVILEGES`), иначе следующая
   миграция «забудет» выдать права, и приложение упадёт на площадке;
 * файл прав можно запускать повторно.
@@ -248,13 +254,41 @@ def test_роль_приложения_без_привилегий_класте�
     assert not granted, f"у роли приложения появились права кластера: {granted}"
 
 
-def test_приложение_не_создаёт_объектов_схемы(
+def test_приложение_создаёт_таблицы_для_миграций(
     app_session: psycopg.Connection[tuple[Any, ...]],
 ) -> None:
-    """DDL остаётся у владельца: иначе ревизия Alembic прямо из приложения стала бы нормой."""
-    _denied(app_session, "CREATE TABLE roles_probe_ddl (id integer)", "CREATE TABLE")
+    """Вариант Б: право `CREATE` на схему выдано, иначе `alembic` не делает следующую ревизию.
+
+    Замер на площадке 2026-11-21 без этого права: `42501 permission denied for schema public`.
+    Проверка идёт в транзакте, который fixture сворачивает: таблица остаётся только внутри
+    проверки.
+    """
+    app_session.execute("CREATE TABLE roles_probe_ddl (id integer)")
+    owned = app_session.execute(
+        "SELECT tableowner FROM pg_tables WHERE tablename = 'roles_probe_ddl'"
+    ).fetchone()
+    assert owned is not None, "таблица не создалась"
+    assert owned[0] == _APP_ROLE, (
+        f"таблицу создала роль {owned[0]!r}, ожидалась {_APP_ROLE!r}: миграции идут ролью "
+        "приложения, и владение новыми таблицами остаётся за ней"
+    )
+    app_session.execute("ALTER TABLE roles_probe_ddl ADD COLUMN note text")
+    app_session.execute("DROP TABLE roles_probe_ddl")
+
+
+def test_приложение_не_правит_чужие_объекты(
+    app_session: psycopg.Connection[tuple[Any, ...]],
+) -> None:
+    """Право создавать объекты в схеме не делает приложение хозяином чужих объектов.
+
+    Это и есть цена варианта Б: граница держится на владении объектами, а не на запрете DDL
+    вообще. Код отказа принципиален — `42501`, а не «нет такой таблицы» или «нет такого
+    столбца»: иначе проверка зелёная, ничего не проверяя.
+    """
     _denied(app_session, "ALTER TABLE audit_log ADD COLUMN probe text", "ALTER TABLE audit_log")
     _denied(app_session, "CREATE INDEX ix_audit_log_probe ON audit_log (action)", "CREATE INDEX")
+    _denied(app_session, "DROP TABLE audit_log", "DROP TABLE audit_log")
+    _denied(app_session, "ALTER TABLE audit_log OWNER TO tbot_app", "смена владельца журнала")
 
 
 def test_таблицы_будущих_ревизий_получают_права_автоматически(
@@ -312,6 +346,53 @@ def test_владелец_журнала_не_роль_приложения(
         f"журнал принадлежит роли {owner[0]}: приложение стало владельцем таблицы, "
         "и append-only перестал быть правом базы"
     )
+
+
+def test_журнал_возвращается_владельцу_схемы(
+    admin_connection: psycopg.Connection[tuple[Any, ...]],
+) -> None:
+    """Право `CREATE` на схеме не должно приводить к владению журналом.
+
+    Моделируем ситуацию следующей ревизии: приложение создаёт таблицу журнала и становится её
+    владельцем (замер: таблицы, созданные ролью приложения, принадлежат ей). У владельца отзыв
+    прав не действует, поэтому `deploy/postgres/roles.sql` возвращает таблицы реестра
+    append-only текущему владельцу — проверка это и фиксирует.
+    """
+    admin_connection.execute(f"ALTER TABLE audit_log OWNER TO {_APP_ROLE}")
+    handed = admin_connection.execute(
+        "SELECT tableowner FROM pg_tables WHERE tablename = 'audit_log'"
+    ).fetchone()
+    assert handed is not None, "в базе нет таблицы audit_log"
+    assert handed[0] == _APP_ROLE, (
+        f"владение журналом не перешло приложению (владелец {handed[0]}): проверка ничего "
+        "не моделирует"
+    )
+    assert _has_table_privilege(admin_connection, "audit_log", "update"), (
+        "у владельца журнала права не отзовёшь — именно поэтому файл прав обязан вернуть "
+        "владение владельцу схемы"
+    )
+
+    admin_connection.execute(_ROLES_SQL)
+
+    back = admin_connection.execute(
+        "SELECT tableowner FROM pg_tables WHERE tablename = 'audit_log'"
+    ).fetchone()
+    assert back is not None, "в базе нет таблицы audit_log"
+    assert back[0] != _APP_ROLE, (
+        f"журнал остался в руках приложения (владелец {back[0]}): append-only снова стал "
+        "текстом, а не правом базы"
+    )
+    open_privileges = [
+        privilege
+        for privilege in ("update", "delete", "truncate", "references", "trigger")
+        if _has_table_privilege(admin_connection, "audit_log", privilege)
+    ]
+    assert not open_privileges, f"после возврата владения не отозваны права {open_privileges}"
+    for privilege in ("select", "insert"):
+        assert _has_table_privilege(admin_connection, "audit_log", privilege), (
+            f"после возврата владения у приложения пропало право {privilege.upper()}: "
+            "журнал обязан читаться и дописываться"
+        )
 
 
 def _has_table_privilege(
