@@ -25,11 +25,13 @@ from packages.identity.sessions import (
     SessionAbsoluteExpiredError,
     SessionIdleExpiredError,
     SessionInvalidError,
+    SessionNotValidYetError,
     SessionRevokedError,
     SessionStepError,
     advance_auth_step,
     change_password,
     create_session,
+    describe_session,
     ensure_full_auth,
     ensure_session_active,
     register_session_activity,
@@ -264,6 +266,31 @@ def test_наивное_время_отвергается_до_создания_
 
 
 # ─── пересоздание после критичных действий ───────────────────────────────────────────────────
+
+
+def test_незаполненная_граница_сессии_называет_забытое_поле() -> None:
+    """Схема объявляет границы NOT NULL, но объект мог быть собран вручную и без них.
+
+    Молча сложить `None + timedelta` нельзя: ошибка обязана говорить, какое поле забыли
+    выставить, иначе отладка middleware сводится к чтению трейсбека арифметики.
+    """
+    без_создания = UserSession(
+        user_id=USER_ID, token_hash=token_hash_of(token_secret()), auth_step="password"
+    )
+    with pytest.raises(SessionNotValidYetError, match="created_at"):
+        ensure_session_active(без_создания, now=NOW)
+
+    без_просрочка = UserSession(
+        user_id=USER_ID,
+        token_hash=token_hash_of(token_secret()),
+        auth_step="password",
+        created_at=NOW,
+        last_seen_at=NOW,
+    )
+    with pytest.raises(SessionNotValidYetError, match="expires_at"):
+        ensure_session_active(без_просрочка, now=NOW)
+    with pytest.raises(SessionNotValidYetError, match="expires_at"):
+        describe_session(без_просрочка, now=NOW)
 
 
 def test_пересоздание_требует_причину_из_перечня_8_3() -> None:

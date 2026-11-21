@@ -1051,8 +1051,21 @@ digest'ы обязаны быть пересняты (`runbook stand-deploy §2`
 с CHECK `ck_sessions_auth_step`, перечень критичных действий — со скобками §8.3, в `sessions`
 нет колонок материала сессии, `token_hash` NOT NULL + уникален, коды причин закрыты и уникальны,
 домен не импортирует HTTP/шаблонизатор/`sqlalchemy`, сроки не являются настройкой).
-Гейты: ruff format/check чисто, `mypy .` — 76 файлов без замечаний,
+Гейты на dev-машине: ruff format/check чисто, `mypy .` — 76 файлов без замечаний,
 `pytest -m "not live_api and not e2e"` — 499 passed / 26 skipped, подавления — 14.
+
+CI первого же прогона после `8de0d8c` (run CI `44873411803`, run Image `44873411797`, оба
+success без повторов): pytest — 505 passed / 20 skipped, покрытие 96,49 % (порог 80 %),
+`packages/identity/sessions.py` — 100 % (167 утверждений, 34 перехода); `mypy --strict` — 76
+файлов без замечаний; `ruff format --check` — 74 файла, `ruff check` — чисто; `pip-audit` —
+«No known vulnerabilities found». Job `migrations` отработал полный цикл на живой PostgreSQL 16.4:
+`Running upgrade -> 0001`, `Running upgrade 0001 -> 0002`, `Running downgrade 0002 -> 0001`,
+`Running downgrade 0001 -> `, затем повторный `upgrade head`; живые проверки схемы — 9 passed,
+права роли приложения — 10 passed (в основном pytest-прогоне эти 9 skipped: там нет `TBOT_DB_URL`).
+
+После прогона закрыт оставшийся непокрытый участок: добавлена проверка, что у сессии, собранной
+вручную без `created_at` или без `expires_at`, ошибка называет забытое поле, а не падает
+арифметика (`tests/unit/test_session_matrix.py`, теперь 30 тестов).
 
 Чем этот срез **не** закрывает `T-102` (остаток — второй срез в `apps/web`):
 атрибуты куки (`HttpOnly`, `Secure`, `SameSite=Lax`, путь `/`), CSRF-токен и проверка origin
@@ -1300,6 +1313,17 @@ Permissions-Policy, `autoescape`, страницы `/session-expired` и `/locke
   `docs/runbook/yandex-sg.md`.
 
 ## 5. Инфраструктурные факты (экономят часы повторной разведки)
+
+- **Доказательства CI — только идентификаторы прогонов этого репозитория, полученные из `gh`.**
+  Потоковые уведомления pi-web о прогонами CI/`Image` приходят с id вида `4495…`, которых в
+  `rusiksoft-afk/tbot` нет: `GET /repos/rusiksoft-afk/tbot/actions/runs/4495…` отвечает 404, а
+  `gh run list` показывает другую нумерацию (`4487…`) и `run_number` — например run 70 =
+  CI `44873411803` + Image `44873411797` на `8de0d8c`). Порядок проверки перед тем, как записать в
+  документ «прогон зелёный» или «упал, вот лог»: (1) `git status -sb` — был ли вообще push;
+  (2) `gh run list --json databaseId,headSha,name,status,conclusion` — id и вывод по хэшу коммита;
+  (3) `gh run view <id> --log` и поиск по `passed`, `coverage:`, `Running upgrade` — что именно
+  выполнилось. Один раз из-за непроверенных id в документ могли попасть несуществующие прогоны и
+  несуществующее имя теста; повторять эту ошибку незачем.
 
 - Прод: Yandex Cloud `153.51.172.30` (инстанс `fv48ibn5ff3ff5gd0e3v`), 2 vCPU / ~3.8 ГиБ / 72 ГБ SSD,
   домен `tbot.rusiksoft.ru`. Решение **OQ-11: без расширения**. Отсюда: Postgres `shared_buffers ≤512 МБ`,

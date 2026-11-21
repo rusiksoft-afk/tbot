@@ -271,7 +271,10 @@
     немедленной видимостью, смена пароля по §8.1+§8.3 (текущая пересоздаётся, остальные
     отзываются), коды причин `revoked`/`idle`/`absolute`/`not_yet`. Проверки:
     `tests/unit/test_session_matrix.py` (29), `tests/unit/test_session_revoke.py` (12),
-    `tests/contract/test_sessions_contract.py` (9). Разбор — `docs/HANDOFF.md §1.26`.
+    `tests/contract/test_sessions_contract.py` (9), `tests/unit/test_session_matrix.py` доведён до
+    30 тестов. CI: run CI `44873411803` и run Image `44873411797` — success с первого прогона,
+    505 passed / 20 skipped, покрытие 96,49 %, `packages/identity/sessions.py` — 100 %, полный
+    цикл `upgrade → downgrade → upgrade` в job `migrations`. Разбор — `docs/HANDOFF.md §1.26`.
     Остаток среза — `apps/web` (атрибуты куки, `test_csrf_required`, CSP/HSTS/nosniff/
     Referrer-Policy/Permissions-Policy, autoescape, `/session-expired` и `/locked`, список сессий,
     счётчик частоты запросов) плюс интеграционная проверка живого поиска по `token_hash` и
