@@ -135,8 +135,12 @@ class User(Base):
         comment="Argon2id (m=64 MiB, t=3, p=4), TZ §8.1; открытый пароль запрещён",
     )
     password_updated_at: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ)
+    # `default=0` на стороне Python — не дубль `server_default` ради красоты: без него у только что
+    # созданного (ещё не сохранённого) объекта поле `None`, и арифметика счётчика неудач в
+    # `packages/identity/users.py` падает на `NoneType + int`. В DDL это не меняет ничего:
+    # ограничение `users_failed_attempts_nonneg_check` и `DEFAULT 0` остаются как есть.
     failed_attempts: Mapped[int] = mapped_column(
-        Integer(), nullable=False, server_default=text("0")
+        Integer(), nullable=False, default=0, server_default=text("0")
     )
     locked_until: Mapped[datetime | None] = mapped_column(TIMESTAMPTZ)
     created_at: Mapped[datetime] = mapped_column(

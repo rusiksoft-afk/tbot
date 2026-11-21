@@ -6,10 +6,9 @@
 поля объектов и проверяет правила. Импорт разрешён только «вниз» по Capability Map
 (контракт `tests/contract/test_repo_layout.py`).
 
-Границы по срезам (см. `tasks/todo.md`): первый срез `T-101` — политика паролей и Argon2id;
-следующий срез той же задачи — блокировка перебора входа. Сессии (`T-102`), TOTP и резервные
-коды (`T-103`, `T-104`), приглашения (`T-105`) и роли (`T-106`) добавляются здесь же отдельными
-срезами.
+Границы по срезам (см. `tasks/todo.md`): этот пакет пока закрывает `T-101` — политику паролей,
+Argon2id и блокировку после 5 неудач. Сессии (`T-102`), TOTP и резервные коды (`T-103`, `T-104`),
+приглашения (`T-105`) и роли (`T-106`) добавляются здесь же отдельными срезами.
 """
 
 from __future__ import annotations
@@ -29,6 +28,18 @@ from packages.identity.passwords import (
     policy_violations,
     verify_password,
 )
+from packages.identity.users import (
+    LOCK_DURATION,
+    MAX_FAILED_ATTEMPTS,
+    LoginLockedError,
+    active_lock_until,
+    apply_new_password,
+    clear_login_lock,
+    ensure_login_allowed,
+    new_user,
+    register_login_failure,
+    register_login_success,
+)
 
 __all__ = (
     "ARGON2_HASH_LEN",
@@ -37,11 +48,21 @@ __all__ = (
     "ARGON2_PARALLELISM",
     "ARGON2_SALT_LEN",
     "ARGON2_TIME_COST",
+    "LOCK_DURATION",
+    "MAX_FAILED_ATTEMPTS",
     "MIN_PASSWORD_LENGTH",
+    "LoginLockedError",
     "MalformedPasswordHashError",
     "PasswordPolicyError",
+    "active_lock_until",
+    "apply_new_password",
     "check_password_policy",
+    "clear_login_lock",
+    "ensure_login_allowed",
     "hash_password",
+    "new_user",
     "policy_violations",
+    "register_login_failure",
+    "register_login_success",
     "verify_password",
 )
