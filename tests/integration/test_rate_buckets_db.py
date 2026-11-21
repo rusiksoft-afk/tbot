@@ -5,8 +5,8 @@
 
 * `PRIMARY KEY (scope, bucket_key, window_start)` действительно не даёт второй строки на то же
   окно — иначе лимит «10 запросов/мин/IP» превращается в «сколько процессов успели вставить»;
-* проверки `CHECK` кусаются: неизвестная область, окно 300 секунд (его вводит не решение
-  заказчика — `docs/HANDOFF.md §4`), отрицательный счётчик, слишком длинный ключ субъекта;
+* проверки `CHECK` кусаются: неизвестная область, окно вне пары 60/300 (пару решал заказчик —
+  `docs/HANDOFF.md §4`), отрицательный счётчик, слишком длинный ключ субъекта;
 * серверные `DEFAULT` (окно 60, счётчик 0) работают на вставке из чистого SQL — это путь
   восстановления из дампа и ручных правок, где приложения нет;
 * CHECK формата `sessions.token_hash`, добавленный ревизией `0003` к уже существующей таблице,
@@ -224,7 +224,7 @@ def test_вторая_строка_на_то_же_окно_отвергаетс�
 
 
 def test_неизвестная_область_отвергается(connection: psycopg.Connection[tuple[Any, ...]]) -> None:
-    """Закрытый перечень областей §8.3 держит база, а не только кортеж в моделях."""
+    """Закрытый перечень областей (четыре лимита §8.3 + окно перебора §8.2) держит база."""
     for scope in ("login_session", "mutation_ip", "", "LOGIN_IP"):
         _rejected(
             connection,
@@ -234,23 +234,42 @@ def test_неизвестная_область_отвергается(connection
             _CHECK_VIOLATION,
             (scope, "203.0.113.7", _WINDOW_START, 1),
         )
-    for scope in ("login_ip", "totp_session", "totp_ip", "mutation_user"):
+    for scope in ("login_ip", "totp_session", "totp_ip", "mutation_user", "ip_ban"):
         _insert_bucket(connection, scope=scope)
 
 
-def test_окно_вне_минутного_отвергается_в_том_числе_пятиминутное(
+def test_окно_допустимо_только_минутное_или_пятиминутное(
     connection: psycopg.Connection[tuple[Any, ...]],
 ) -> None:
-    """`window_seconds = 60` закреплено базой: пятиминутное окно из §8.2 в схему не заходило."""
-    for window in (300, 30, 600):
+    """База держит ровно пару окон: 60 с (лимиты §8.3) и 300 с (перебор §8.2).
+
+    Значения проверяются парой на каждую границу набора: `60` и `300` проходят, `59`/`61` и
+    `299`/`301` — нет. Иначе набор окон можно случайно сдвинуть и остаться зелёным.
+    """
+    insert = (
+        "INSERT INTO rate_buckets (scope, bucket_key, window_start, window_seconds, attempts) "
+        "VALUES (%s, %s, %s, %s, %s)"
+    )
+    for window in (59, 61, 299, 301, 30, 120, 600, 0):
         _rejected(
             connection,
-            "INSERT INTO rate_buckets (scope, bucket_key, window_start, window_seconds, attempts) "
-            "VALUES (%s, %s, %s, %s, %s)",
+            insert,
             f"окно {window} секунд",
             _CHECK_VIOLATION,
             ("login_ip", "203.0.113.7", _WINDOW_START, window, 1),
         )
+    connection.execute(insert, ("login_ip", "203.0.113.4", _WINDOW_START, 60, 1))
+    connection.execute(insert, ("ip_ban", "203.0.113.4", _WINDOW_START, 300, 1))
+    for scope, expected in (("login_ip", "60"), ("ip_ban", "300")):
+        assert (
+            _scalar(
+                connection,
+                "select window_seconds::text from rate_buckets "
+                "where scope = %s and bucket_key = '203.0.113.4'",
+                (scope,),
+            )
+            == expected
+        ), f"область {scope}: окно {expected} секунд не прошло"
     connection.execute(
         "INSERT INTO rate_buckets (scope, bucket_key, window_start, attempts) "
         "VALUES (%s, %s, %s, %s)",

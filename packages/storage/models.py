@@ -71,21 +71,25 @@ SESSION_AUTH_STEPS: Final[tuple[str, ...]] = ("password", "totp", "full")
 INVITATION_STATES: Final[tuple[str, ...]] = ("pending", "used", "revoked")
 
 # §8.2: «допуск ±1 шаг (по умолчанию ±1, максимум ±2)».
-# Области прикладного счётчика частоты запросов (TZ §8.3, docs/adr/ADR-007). Перечень закрытый и
-# ровно из четырёх значений: §8.3 перечисляет `/login` 10 запросов/мин/IP, `/totp` 10/мин/сессия и
-# 5/мин/IP, все mutation-эндпоинты 60/мин/пользователь. Пятое значение — это всегда новая ревизия
-# и новый CHECK, а не «добавили строку в кортеж».
+# Области прикладного счётчика частоты запросов (docs/adr/ADR-007). Перечень закрытый: четыре
+# лимита §8.3 (`/login` 10 запросов/мин/IP, `/totp` 10/мин/сессия и 5/мин/IP, все
+# mutation-эндпоинты 60/мин/пользователь) плюс окно перебора §8.2 («3 неудачи с одного IP за
+# 5 минут → временный бан IP») — его держит приложение, решение заказчика ask `abb0151c`.
+# Шестое значение — это всегда новая ревизия и новый CHECK, а не «добавили строку в кортеж».
 RATE_SCOPES: Final[tuple[str, ...]] = (
     "login_ip",  # /login — 10 запросов/мин/IP (§8.3)
     "totp_session",  # /totp — 10 запросов/мин/сессия (§8.3)
     "totp_ip",  # /totp — 5 запросов/мин/IP (§8.3)
     "mutation_user",  # все mutation-эндпоинты — 60 запросов/мин/пользователь (§8.3)
+    "ip_ban",  # неудачи входа с одного IP за 5 минут (§8.2); бан держит приложение
 )
-# Длительность окна: §8.3 все лимиты задаёт «в минуту», поэтому окно ровно одно — 60 секунд.
-# Пятиминутное окно из §8.2 («3 неудачи с одного IP за 5 минут → временный бан IP») здесь
-# сознательно нет: кто держит этот бан, заказчиком не решено (docs/adr/ADR-007, HANDOFF §4),
-# и расширять CHECK «на будущее» незачем.
+# Длительность окна: §8.3 задаёт все лимиты «в минуту» — 60 секунд; §8.2 считает неудачи с IP
+# за 5 минут — 300 секунд. Третьего окна CHECK не допускает (окно живёт в строке, поэтому его
+# нельзя «перенастроить» молча). Окно — только интервал подсчёта: сколько длится сам бан,
+# решается константой прикладного слоя вместе с механизмом отказа (T-102, apps/web).
 RATE_WINDOW_SECONDS: Final = 60
+RATE_BAN_WINDOW_SECONDS: Final = 300
+RATE_WINDOWS: Final[tuple[int, ...]] = (RATE_WINDOW_SECONDS, RATE_BAN_WINDOW_SECONDS)
 
 TOTP_WINDOW_MIN: Final = 0
 TOTP_WINDOW_DEFAULT: Final = 1
@@ -549,30 +553,35 @@ class RateBucket(Base):
             "scope IN (" + ", ".join(f"'{scope}'" for scope in RATE_SCOPES) + ")",
             name="scope",
         ),
-        CheckConstraint(f"window_seconds = {RATE_WINDOW_SECONDS}", name="window_seconds"),
+        CheckConstraint(
+            "window_seconds IN (" + ", ".join(str(w) for w in RATE_WINDOWS) + ")",
+            name="window_seconds",
+        ),
         CheckConstraint("length(bucket_key) BETWEEN 1 AND 64", name="bucket_key_len"),
         CheckConstraint("attempts >= 0", name="attempts_not_negative"),
         Index("ix_rate_buckets_window_start", "window_start"),
         {
             "comment": (
-                "Прикладной счётчик частоты запросов (TZ §8.3, ADR-007): строка на "
-                "(область, субъект, начало минутного окна). subject — IP из X-Forwarded-For "
-                "либо строка UUID сессии/пользователя; чистка — по window_start."
+                "Прикладной счётчик частоты запросов (TZ §8.2, §8.3, ADR-007): строка на "
+                "(область, субъект, начало окна — 60 с для лимитов §8.3 и 300 с для окна "
+                "перебора §8.2). bucket_key — IP из X-Forwarded-For либо строка UUID "
+                "сессии/пользователя; чистка старых окон — по window_start, раз в час."
             )
         },
     )
 
     scope: Mapped[str] = mapped_column(Text(), primary_key=True)
-    # Субъект лимита: для `login_ip`/`totp_ip` — канонический текст адреса из `X-Forwarded-For`
-    # (до 45 символов для IPv6), для `totp_session`/`mutation_user` — строка UUID (36 символов).
+    # Субъект лимита: для `login_ip`/`totp_ip`/`ip_ban` — канонический текст адреса из
+    # `X-Forwarded-For` (до 45 символов для IPv6), для `totp_session`/`mutation_user` — строка
+    # UUID (36 символов).
     # Одним текстом, а не раздельными колонками: раздельные колонки не входят в первичный ключ
     # (ключевые колонки не бывают NULL), а проверка «заполнена ровно одна» раздула бы схему.
     bucket_key: Mapped[str] = mapped_column(
         Text(),
         primary_key=True,
         comment=(
-            "Субъект лимита: канонический текст адреса из X-Forwarded-For (login_ip, totp_ip) "
-            "или строка UUID сессии/пользователя (totp_session, mutation_user)"
+            "Субъект лимита: канонический текст адреса из X-Forwarded-For (login_ip, totp_ip, "
+            "ip_ban) или строка UUID сессии/пользователя (totp_session, mutation_user)"
         ),
     )
     # Начало окна обязано быть выровненным (`date_trunc`), иначе один и тот же интервал времени

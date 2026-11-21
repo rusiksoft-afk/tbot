@@ -18,9 +18,15 @@
 
 - **Пятиминутное окно** из §8.2 («3 неудачные попытки с одного IP за 5 минут → временный бан
   IP»). Механизм, названный в этой фразе ТЗ (`nginx/fail2ban`), в нашем стеке не работает: nginx
-  заменён на Caddy, `fail2ban` на ВМ относится к SSH. Пока заказчик не выбрал, кто держит бан
-  (приложение, логи + `fail2ban`, или оба слоя), `window_seconds` остаётся ограниченным значением
-  `60` — расширять CHECK «на будущее» незачем. Вопрос открыт в `docs/HANDOFF.md §4`.
+  заменён на Caddy, `fail2ban` на ВМ относится к SSH. Заказчик выбрал приложение (ask `abb0151c`,
+  2026-11-21), поэтому в таблице два окна: `60` для лимитов §8.3 и `300` для окна перебора §8.2;
+  область `ip_ban` считает неудачи входа с одного IP. Сколько длится сам бан — константа
+  прикладного слоя, она появляется вместе с механизмом отказа (T-102, `apps/web`).
+- **Почему это правка самой ревизии, а не новая ревизия.** Перечень областей и `CHECK window_seconds`
+  расширялись прямо в `0003`: ревизия к моменту решения не была применена ни на одной площадке
+  (боевая база стояла на `0002`, CI пересоздаёт схему с нуля), поэтому обратной совместимости
+  здесь держать не для кого. Правило прежнее: применённую ревизию не править — для `0003` окно
+  возможности закрылось вместе с первым `$COMPOSE run --rm migrate` на ВМ.
 - **Внешние ключи на `users`/`sessions`.** Общее правило §4 (`ON DELETE RESTRICT`) здесь не
   применяется намеренно: счётчики обязаны умирать по возрасту, а не удерживать удаление учётной
   записи. Исключение зафиксировано в ADR-007 и в `tests/contract/test_identity_schema.py`
@@ -53,10 +59,15 @@ depends_on: str | Sequence[str] | None = None
 # SHA-256 в нижнем регистре hex, ровно 64 символа.
 _SHA256_HEX = "^[0-9a-f]{64}$"
 
-# Области счётчика — закрытый перечень из четырёх лимитов TZ §8.3 (см. `RATE_SCOPES` в моделях).
-_RATE_SCOPE_CHECK = "scope IN ('login_ip', 'totp_session', 'totp_ip', 'mutation_user')"
-# §8.3 все лимиты заданы «в минуту»: окно ровно одно, и оно зафиксировано базой.
-_RATE_WINDOW_SECONDS = 60
+# Области счётчика — закрытый перечень: четыре лимита TZ §8.3 + окно перебора §8.2
+# (см. `RATE_SCOPES` в моделях; порядок значений обязан совпадать с моделью).
+_RATE_SCOPE_CHECK = (
+    "scope IN ('login_ip', 'totp_session', 'totp_ip', 'mutation_user', 'ip_ban')"
+)
+# §8.3 задаёт лимиты «в минуту» (60 с), §8.2 считает неудачи с IP за 5 минут (300 с).
+# Третьего окна CHECK не допускает; default — минутный, он же вставляется чистым SQL.
+_RATE_WINDOW_DEFAULT = 60
+_RATE_WINDOW_VALUES = (60, 300)
 
 
 def upgrade() -> None:
@@ -88,8 +99,8 @@ def _rate_buckets() -> None:
             sa.Text(),
             nullable=False,
             comment=(
-                "Субъект лимита: канонический текст адреса из X-Forwarded-For (login_ip, totp_ip) "
-                "или строка UUID сессии/пользователя (totp_session, mutation_user)"
+                "Субъект лимита: канонический текст адреса из X-Forwarded-For (login_ip, totp_ip, "
+                "ip_ban) или строка UUID сессии/пользователя (totp_session, mutation_user)"
             ),
         ),
         sa.Column("window_start", sa.DateTime(timezone=True), nullable=False),
@@ -97,7 +108,7 @@ def _rate_buckets() -> None:
             "window_seconds",
             sa.SmallInteger(),
             nullable=False,
-            server_default=sa.text(str(_RATE_WINDOW_SECONDS)),
+            server_default=sa.text(str(_RATE_WINDOW_DEFAULT)),
         ),
         sa.Column("attempts", sa.Integer(), nullable=False, server_default=sa.text("0")),
         sa.PrimaryKeyConstraint(
@@ -105,16 +116,18 @@ def _rate_buckets() -> None:
         ),
         sa.CheckConstraint(_RATE_SCOPE_CHECK, name=op.f("ck_rate_buckets_scope")),
         sa.CheckConstraint(
-            f"window_seconds = {_RATE_WINDOW_SECONDS}", name=op.f("ck_rate_buckets_window_seconds")
+            "window_seconds IN (" + ", ".join(str(w) for w in _RATE_WINDOW_VALUES) + ")",
+            name=op.f("ck_rate_buckets_window_seconds"),
         ),
         sa.CheckConstraint(
             "length(bucket_key) BETWEEN 1 AND 64", name=op.f("ck_rate_buckets_bucket_key_len")
         ),
         sa.CheckConstraint("attempts >= 0", name=op.f("ck_rate_buckets_attempts_not_negative")),
         comment=(
-            "Прикладной счётчик частоты запросов (TZ §8.3, ADR-007): строка на "
-            "(область, субъект, начало минутного окна). subject — IP из X-Forwarded-For "
-            "либо строка UUID сессии/пользователя; чистка — по window_start."
+            "Прикладной счётчик частоты запросов (TZ §8.2, §8.3, ADR-007): строка на "
+            "(область, субъект, начало окна — 60 с для лимитов §8.3 и 300 с для окна "
+            "перебора §8.2). bucket_key — IP из X-Forwarded-For либо строка UUID "
+            "сессии/пользователя; чистка старых окон — по window_start, раз в час."
         ),
     )
     op.create_index(

@@ -11,8 +11,9 @@
 * CHECK формата `sessions.token_hash` разъезжается с тем, что реально выдаёт `token_hash_of()`:
   база тогда кусается не на мусоре, а на корректных значениях.
 
-Отдельно держится граница «решение записано, но не реализовано молча»: пятиминутное окно из §8.2
-в DDL отсутствовать обязан (вопрос про него открыт в `docs/HANDOFF.md §4`).
+Отдельно держится граница «в схеме только то, что решено заказчиком»: набор окон счётчика —
+ровно пара 60 и 300 секунд (§8.3 и §8.2, решение ask `abb0151c`), и в таблице не появляется
+длительность самого бана — её в хранении держать нечего, это константа прикладного слоя.
 """
 
 from __future__ import annotations
@@ -30,7 +31,12 @@ import pytest
 
 from packages.identity.sessions import token_hash_of, token_secret
 from packages.storage.base import APPEND_ONLY_TABLES, Base
-from packages.storage.models import RATE_SCOPES, RATE_WINDOW_SECONDS
+from packages.storage.models import (
+    RATE_BAN_WINDOW_SECONDS,
+    RATE_SCOPES,
+    RATE_WINDOW_SECONDS,
+    RATE_WINDOWS,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 TZ_SECURITY: Final = ROOT / "docs" / "tz" / "08-security-auth-2fa.md"
@@ -97,16 +103,22 @@ def _table_block(sql: str) -> str:
     return match.group(0)
 
 
-def test_области_счётчика_совпадают_с_перечнем_лимитов_8_3(upgrade_sql: str) -> None:
-    """§8.3: `/login` 10/мин/IP, `/totp` 10/мин/сессия и 5/мин/IP, мутации 60/мин/пользователь."""
+def test_области_счётчика_совпадают_с_лимитами_8_3_и_окном_перебора_8_2(upgrade_sql: str) -> None:
+    """§8.3: `/login` 10/мин/IP, `/totp` 10/мин/сессия и 5/мин/IP, мутации 60/мин/пользователь.
+
+    Пятая область — `ip_ban`: §8.2 требует считать «3 неудачные попытки с одного IP за 5 минут»,
+    и с 2026-11-21 этот учёт держит приложение (ask `abb0151c`).
+    """
     tz = TZ_SECURITY.read_text(encoding="utf-8")
     line = re.search(r"Rate limit:(.*?)Счётчик обязателен", tz, re.S)
     assert line, "в §8.3 не найден абзац Rate limit — проверка теряет смысл"
     listed = re.findall(r"\d+\s*/?\s*(?:запросов/мин|мин/)", line.group(1))
     assert len(listed) == 4, f"в §8.3 ожидалось четыре лимита, найдено {len(listed)}: {listed}"
-    assert (
-        len(RATE_SCOPES) == 4
-    ), f"областей счётчика {len(RATE_SCOPES)} ({RATE_SCOPES}), а лимитов в §8.3 четыре"
+    assert re.search(
+        r"3 неудачные попытки с одного IP за 5 минут", tz
+    ), "в §8.2 не найдено правило перебора по IP — проверка теряет смысл"
+    assert len(RATE_SCOPES) == 5, f"областей счётчика {len(RATE_SCOPES)} ({RATE_SCOPES})"
+    assert "ip_ban" in RATE_SCOPES, f"в {RATE_SCOPES} нет области окна перебора ip_ban (§8.2)"
 
     ddl = _table_block(upgrade_sql)
     scope_check = re.search(r"CONSTRAINT ck_rate_buckets_scope CHECK \(scope IN \(([^)]*)\)\)", ddl)
@@ -117,14 +129,25 @@ def test_области_счётчика_совпадают_с_перечнем_
     ), f"CHECK разрешает области {sorted(allowed)}, модель знает {sorted(RATE_SCOPES)}"
 
 
-def test_окно_счётчика_зафиксировано_базой_а_не_приложением(upgrade_sql: str) -> None:
-    """Все лимиты §8.3 заданы «в минуту»: окно живёт в базе и равно `RATE_WINDOW_SECONDS`."""
+def test_окна_счётчика_зафиксированы_базой_а_не_приложением(upgrade_sql: str) -> None:
+    """§8.3 задаёт лимиты «в минуту» (60 с), §8.2 считает перебор «за 5 минут» (300 с).
+
+    Окно живёт в строке, а не в коде приложения: иначе сдвиг лимита («поднимем до 15 в минуту»)
+    превратился бы в правку одного числа без следа в схеме. Третьего окна база не допускает.
+    """
     assert RATE_WINDOW_SECONDS == 60, "§8.3 задаёт лимиты в минутах, окно обязано быть 60 секунд"
+    assert RATE_BAN_WINDOW_SECONDS == 300, "§8.2 считает перебор за 5 минут — окно 300 секунд"
+    assert RATE_WINDOWS == (60, 300), f"набор окон в моделях: {RATE_WINDOWS}"
+
     ddl = _table_block(upgrade_sql)
-    assert (
-        f"CONSTRAINT ck_rate_buckets_window_seconds CHECK (window_seconds = {RATE_WINDOW_SECONDS})"
-        in ddl
-    ), "длительность окна не закреплена базой: приложение сможет менять её молча"
+    window_check = re.search(
+        r"CONSTRAINT ck_rate_buckets_window_seconds CHECK \(window_seconds IN \(([^)]*)\)\)",
+        ddl,
+    )
+    assert window_check, f"в {TABLE} нет CHECK набора окон"
+    values = [int(value.strip()) for value in window_check.group(1).split(",")]
+    assert values == [60, 300], f"DDL допускает окна {values}, а решено (60, 300)"
+
     column = Base.metadata.tables[TABLE].c.window_seconds
     assert not column.nullable, f"{TABLE}.window_seconds обязана быть заполнена"
     assert column.server_default is not None, (
@@ -136,20 +159,49 @@ def test_окно_счётчика_зафиксировано_базой_а_не
     ), f"DDL {TABLE} не закрепляет default окна {RATE_WINDOW_SECONDS}"
 
 
-def test_окно_пяти_минут_из_8_2_в_схеме_не_появляется(upgrade_sql: str) -> None:
-    """§8.2 (3 неудачи с IP за 5 минут → бан IP) — вопрос открыт, поэтому 300 секунд в DDL нет.
+def test_окно_перебора_из_8_2_введено_решением_заказчика_а_не_молча(upgrade_sql: str) -> None:
+    """Цепочка «правило в ТЗ → решение заказчика → значение в DDL» обязана быть прослеживаемой.
 
-    Проверка держит границу «решение заказчиком не принято → в схему не заходит»: ADR обязан
-    обсуждать пятиминутное окно, а DDL — обязано его не содержать.
+    Держится и обратное: длительность бана в таблице не появляется. В хранении ей делать нечего —
+    окно отвечает за интервал подсчёта, а «сколько держать IP закрытым» решает прикладной слой
+    вместе с механизмом отказа (T-102, `apps/web`).
     """
     ddl = _table_block(upgrade_sql)
-    assert "300" not in ddl, (
-        f"в {TABLE} появилось пятиминутное окно: его вводит не решение заказчика "
-        "(docs/HANDOFF.md §4, docs/adr/ADR-007)"
-    )
+    assert "'ip_ban'" in ddl, f"в {TABLE} нет области ip_ban: перебору §8.2 негде считаться"
+
     adr = ADR_RATE.read_text(encoding="utf-8")
-    assert "300" in adr, "ADR-007 обязан описывать пятиминутное окно как открытый вопрос"
-    assert "X-Forwarded-For" in adr, "ADR-007 обязан фиксировать источник адреса клиента (§8.3)"
+    assert "abb0151c" in adr, "ADR-007 обязан ссылаться на решение заказчика о владельце бана IP"
+
+    columns = {column.name for column in Base.metadata.tables[TABLE].columns}
+    assert columns == {
+        "scope",
+        "bucket_key",
+        "window_start",
+        "window_seconds",
+        "attempts",
+    }, f"в {TABLE} появились лишние колонки {sorted(columns)}: срок бана — не колонка счётчика"
+
+
+def test_чистка_окон_и_источник_адреса_описаны_и_не_противоречат_техзаданию() -> None:
+    """«Временные» строки обязаны умирать: индекс по `window_start` заведён именно под чистку.
+
+    Сам механизм — следующий срез, поэтому проверка держит договорённость (ADR + требование ТЗ об
+    источнике адреса), а не код. Оставить таблицу без чистки или начать брать адрес из
+    соединения — значит нарушить §8.3: в боевом стенде за Caddy это адрес Caddy, и все лимиты
+    сливаются в один «IP».
+    """
+    adr = ADR_RATE.read_text(encoding="utf-8")
+    for marker in ("раз в час", "24 часов", "X-Forwarded-For", "Caddy", "jobs"):
+        assert marker in adr, f"в ADR-007 не осталось маркера чистки/адреса {marker!r}"
+
+    tz = TZ_SECURITY.read_text(encoding="utf-8")
+    assert "X-Forwarded-For" in tz, "§8.3 обязан требовать адрес клиента из X-Forwarded-For"
+
+    comment = Base.metadata.tables[TABLE].c.bucket_key.comment or ""
+    assert "X-Forwarded-For" in comment, (
+        f"пояснение bucket_key потеряло источник адреса: {comment!r} — приложение начнёт брать "
+        "адрес TCP-соединения, а в проде это адрес Caddy"
+    )
 
 
 def test_первичный_ключ_счётчика_это_ключ_поиска_слоя_входа(upgrade_sql: str) -> None:
@@ -251,6 +303,7 @@ def test_adr_007_и_adr_008_существуют_и_держат_приняты�
         "ADR-003",
         "APPEND_ONLY_TABLES",
         "fe0b025e",
+        "abb0151c",
         "X-Forwarded-For",
         "window_start",
     ):
