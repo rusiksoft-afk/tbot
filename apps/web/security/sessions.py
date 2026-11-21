@@ -84,6 +84,9 @@ LOGIN_PATH: Final = "/login"
 LOGOUT_PATH: Final = "/logout"
 SESSION_EXPIRED_PATH: Final = "/session-expired"
 
+#: Страница «вход заблокирован» (`docs/tz/09-web-ui-and-design.md` §9: состояния внятные).
+LOCKED_PATH: Final = "/locked"
+
 #: Куда попадает пользователь, успешно прошедший парольный шаг. Страницы ввода кода ещё нет
 #: (её вводит `T-103`, `apps/web/routes/totp.py`), поэтому редирект идёт на корневую страницу
 #: каркаса M0. Константа названа, а не вписана в обработчик: у `T-103` будет ровно одна правка —

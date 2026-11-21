@@ -37,6 +37,7 @@ from apps.web.forms import FormBodyTooLarge
 from apps.web.routes import login as login_routes
 from apps.web.routes import sessions as session_routes
 from apps.web.security.csrf import CsrfRejected
+from apps.web.security.headers import apply_security_headers
 from apps.web.security.sessions import REASON_QUERY, SessionRedirect, clear_session_cookie
 from apps.web.store import LoginTiming, StoreUnavailableError, build_session_factory
 from packages.common import metrics
@@ -137,6 +138,21 @@ def create_app(settings: Settings) -> FastAPI:
             clear_request_context()
         response.headers["X-Trace-Id"] = trace_id
         return response
+
+    @app.middleware("http")
+    async def _security_headers_middleware(request: Any, call_next: Any) -> Any:
+        """Закрытый набор заголовков безопасности на любом ответе (§8.3).
+
+        Middleware, а не каждый маршрут: отказные ответы (`403` CSRF, `413` тела, `503` без базы,
+        редирект «сессия не подходит») создаются обработчиками исключений, и маршрут их не видит.
+        Значения те же, что у периметра в `deploy/caddy/Caddyfile` — расхождение двух политик
+        браузер пересёк бы, а не выбрал.
+
+        Порядок: этот middleware идёт внутри `ServerErrorMiddleware`, поэтому необработанный
+        `500` (plain text от Starlette) заголовков не получает — это единственная ветка без
+        политики, и она не должна отдавать текст стека наружу (§8.4).
+        """
+        return apply_security_headers(await call_next(request))
 
     @app.exception_handler(SessionRedirect)
     async def _session_redirect(request: Request, exc: SessionRedirect) -> Response:

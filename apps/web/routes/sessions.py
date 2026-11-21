@@ -27,6 +27,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from apps.web.security.csrf import csrf_context, require_csrf
 from apps.web.security.sessions import (
+    LOCKED_PATH,
     LOGIN_PATH,
     LOGOUT_PATH,
     REASON_QUERY,
@@ -65,6 +66,24 @@ EXPLANATIONS: Final[dict[str, str]] = {
 #: редиректа, или код, который появится позже.
 GENERIC_EXPLANATION: Final = "Сеанс завершён. Войдите заново, чтобы продолжить работу."
 
+#: Объяснения заблокированного входа (`docs/tz/09-web-ui-and-design.md` §9: `/locked`).
+#: Набор закрыт и не совпадает с набором причин сеанса: блокировка входа и завершение сеанса —
+#: разные состояния, и путать их в тексте нельзя (у первого нет «войти заново» прямо сейчас).
+#: Код `rate` появляется вместе со срезом `R3d` (предел частоты по адресу); он включён сюда
+#: заранее, потому что страница обязана объяснять причину, а не отказывать в объяснении.
+LOCK_EXPLANATIONS: Final[dict[str, str]] = {
+    "attempts": "Вход в эту учётную запись временно заблокирован после нескольких неверных "
+    "попыток ввести пароль. Блокировка снимается сама — попробуйте позже, менять ничего не нужно.",
+    "rate": "С этого адреса было слишком много попыток входа за короткое время. Предел держится "
+    "на адресе, а не на учётной записи: повторите позже.",
+}
+
+#: Общее объяснение для прямого захода на страницу или для кода, которого в наборе ещё нет.
+GENERIC_LOCK_EXPLANATION: Final = (
+    "Вход временно заблокирован. Если вы не пытались войти и блокировки не ожидали, "
+    "сообщите администратору."
+)
+
 
 @router.get(SESSION_EXPIRED_PATH, response_class=HTMLResponse)
 def session_expired(
@@ -84,6 +103,28 @@ def session_expired(
     context = {"page_title": "Сеанс завершён", "explanation": explanation} | csrf_context(None)
     response: HTMLResponse = request.app.state.templates.TemplateResponse(
         request, "session_expired.html", context
+    )
+    return response
+
+
+@router.get(LOCKED_PATH, response_class=HTMLResponse)
+def login_locked(
+    request: Request, reason: Annotated[str | None, Query(alias=REASON_QUERY)] = None
+) -> HTMLResponse:
+    """Страница «вход заблокирован» (`docs/tz/09-web-ui-and-design.md` §9).
+
+    Существование страницы — не косметика: объяснение блокировки в ответе `429` короткое, а
+    человеку нужен отдельный адрес, куда он может вернуться и где состояние описано спокойно
+    (§9: состояния внятные). Отдельный адрес нужен и для ссылки из письма-уведомления (`T-117`).
+
+    Страница не охраняется сессией по той же причине, что и `/session-expired`: она показывается,
+    когда живой сессии нет, а охрана привела бы к петле редиректов. Причина берётся из закрытого
+    набора `LOCK_EXPLANATIONS`; значение параметра в текст не подставляется никогда.
+    """
+    explanation = LOCK_EXPLANATIONS.get(reason or "", GENERIC_LOCK_EXPLANATION)
+    context = {"page_title": "Вход заблокирован", "explanation": explanation} | csrf_context(None)
+    response: HTMLResponse = request.app.state.templates.TemplateResponse(
+        request, "locked.html", context
     )
     return response
 

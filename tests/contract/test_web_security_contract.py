@@ -30,6 +30,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import pathlib
+import re
 from collections.abc import Iterator
 from typing import Final
 
@@ -42,12 +43,15 @@ from pydantic import SecretStr
 from apps.web.main import create_app
 from apps.web.routes.sessions import EXPLANATIONS
 from apps.web.security.csrf import CSRF_FORM_FIELD, CSRF_HEADER, CSRF_LABEL, CSRF_META_NAME
+from apps.web.security.headers import HSTS_POLICY, SECURITY_HEADERS
 from apps.web.security.sessions import (
     COOKIE_HTTP_ONLY,
     COOKIE_PATH,
     COOKIE_SAMESITE,
     COOKIE_SECURE,
+    LOCKED_PATH,
     SESSION_COOKIE_NAME,
+    SESSION_EXPIRED_PATH,
     display_reason_codes,
 )
 from apps.web.store import USER_AGENT_MAX_LEN
@@ -316,3 +320,104 @@ def test_адрес_базы_в_форме_psycopg(settings: Settings) -> None:
     assert "create_engine(" in code
     assert "postgresql://" not in code
     assert settings.db_url is None or isinstance(settings.db_url, SecretStr)
+
+
+# ─── заголовки безопасности: три артефакта обязаны совпадать (§8.3, срез `R3c`) ────────────────
+
+_CADDYFILE: Final = _ROOT / "deploy" / "caddy" / "Caddyfile"
+
+
+def _caddy_header_values() -> dict[str, str]:
+    """Значения заголовков из блока `header { … }` файла Caddy.
+
+    Разбор ручной и намеренно строгий: без него приложение и периметр живут каждая со своей
+    политикой, а браузер при двух `Content-Security-Policy` берёт пересечение — то есть эффект,
+    который никто не проектировал (§8.3).
+    """
+    lines = _read(_CADDYFILE).splitlines()
+    values: dict[str, str] = {}
+    inside = False
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith("header {"):
+            inside = True
+            continue
+        if not inside:
+            continue
+        if line == "}":
+            break
+        match = re.match(r'^(?P<name>[-A-Za-z]+)\s+"(?P<value>[^"]*)"', line)
+        if match:
+            values[match.group("name")] = match.group("value")
+    assert values, f"в {_CADDYFILE.name} не найден блок заголовков"
+    return values
+
+
+def test_значения_заголовков_совпадают_с_8_3() -> None:
+    tz = _read(_TZ_SECURITY)
+    for marker in (
+        "default-src 'self'",
+        "frame-ancestors 'none'",
+        "base-uri 'self'",
+        "form-action 'self'",
+        "Referrer-Policy: same-origin",
+        "X-Content-Type-Options",
+        "nosniff",
+        "max-age=63072000; includeSubDomains",
+        "Permissions-Policy",
+    ):
+        assert marker in tz, f"§8.3 обязан содержать {marker!r}"
+
+
+def test_значения_приложения_и_caddy_не_расходятся() -> None:
+    """Одно значение на заголовок в двух артефактах: приложение и периметр.
+
+    Приложение обязано уметь отдавать политики само (job `compose-smoke` и отладка внутри сети
+    состава ходят в `web` напрямую, минуя Caddy), и тогда два набора обязаны совпадать побайтово.
+    """
+    caddy = _caddy_header_values()
+    for name, value in SECURITY_HEADERS.items():
+        assert caddy.get(name) == value, (
+            f"{name}: значение приложения не совпадает со значением в `Caddyfile` — правка "
+            "обязана пройти по обоим артефактам, иначе браузер получит две политики"
+        )
+
+
+def test_набор_заголовков_приложения_закрыт() -> None:
+    """Никаких `Cross-Origin-*` и `X-XSS-Protection`: консоль одноисточниковая (§8.3)."""
+    assert set(SECURITY_HEADERS) == {
+        "Content-Security-Policy",
+        "Strict-Transport-Security",
+        "Referrer-Policy",
+        "X-Content-Type-Options",
+        "X-Frame-Options",
+        "Permissions-Policy",
+    }
+    assert "preload" not in HSTS_POLICY.lower(), "HSTS `preload` — решение заказчика, не оформителя"
+    for value in SECURITY_HEADERS.values():
+        assert "unsafe-inline" not in value
+        assert "unsafe-eval" not in value
+
+
+def test_заголовки_ставит_middleware_а_не_маршруты(app: FastAPI) -> None:
+    """Обработчики исключений создают ответы вне маршрутов: заголовки навешивает middleware.
+
+    Проверка по исходнику фабрики приложения: без вызова `apply_security_headers` в middleware
+    отказ `403`/`413`/`503` и редирект «сессия не подходит» остаются без политики, а увидеть это
+    можно только на живом ответе — то есть на приёмке.
+    """
+    source = _read(_ROOT / "apps" / "web" / "main.py")
+    assert '@app.middleware("http")' in source
+    assert "apply_security_headers(await call_next(request))" in source
+    assert app.state.templates.env.autoescape is True
+
+
+def test_страницы_состояний_из_9_остаются_в_приложении(app: FastAPI) -> None:
+    """`docs/tz/09-web-ui-and-design.md` §9: `/session-expired`, `/locked` — обязательные адреса."""
+    paths = _app_paths(app)
+    for path in (SESSION_EXPIRED_PATH, LOCKED_PATH):
+        assert path in paths, f"адрес {path} исчез из перечня приложения: §9 требует страницы"
+        methods = {method.lower() for method in paths[path]}
+        assert "get" in methods, f"{path}: страница состояния не отдаётся методом GET"
+    for name in ("session_expired.html", "locked.html", "login.html", "base.html"):
+        assert (_TEMPLATES / name).exists(), f"шаблон {name} удалён — страница состояния пропала"

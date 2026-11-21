@@ -46,8 +46,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from apps.web.forms import form_fields, login_pair
 from apps.web.security.csrf import csrf_context, ensure_same_origin
 from apps.web.security.sessions import (
+    LOCKED_PATH,
     LOGIN_PATH,
     POST_LOGIN_REDIRECT,
+    REASON_QUERY,
     StoreDep,
     issue_session_cookie,
     session_ip,
@@ -72,6 +74,10 @@ USER_AGENT_HEADER: Final = "User-Agent"
 #: существование учётной записи, что противоречит закрытому допуску (§1.2) и контуру перебора (§8.1).
 GENERIC_FAILURE_DETAIL: Final = "Неверный логин или пароль."
 
+#: Код причины для ссылки на страницу состояния: совпадает с ключом `LOCK_EXPLANATIONS`
+#: (`apps/web/routes/sessions.py`) и с тем, что позже поставит срез `R3d` для предела по адресу.
+LOCK_REASON_ATTEMPTS: Final = "attempts"
+
 #: Пустая форма. Отдельный ответ нужен, чтобы не тратить стоимость Argon2id на пустой ввод и не
 #: приближать блокировку: пользователь, дважды нажавший «Войти» с пустыми полями, не должен
 #: получить блокировку учётной записи, а переборщик — возможности размывать счётчик неудач.
@@ -92,9 +98,26 @@ def _retry_after(until: datetime, moment: datetime) -> int:
     return max(seconds, 1)
 
 
-def _render_login(request: Request, detail: str, status_code: int) -> HTMLResponse:
-    """Страница входа с объяснением. `csrf_token` пустой — см. модульный докстринг про ADR-008."""
-    context = {"page_title": "Вход", "detail": detail} | csrf_context(None)
+def _render_login(
+    request: Request,
+    detail: str,
+    status_code: int,
+    locked_reason: str | None = None,
+) -> HTMLResponse:
+    """Страница входа с объяснением. `csrf_token` пустой — см. модульный докстринг про ADR-008.
+
+    `locked_reason` ставится только на отказе «вход заблокирован`: страница входа обязана дать
+    отдельный адрес состояния (`/locked`, `docs/tz/09-web-ui-and-design.md` §9), а не прятать
+    объяснение в коротком абзаце над формой. Для прочих отказов ссылки нет: «пароль не тот» и
+    «вход заблокирован» — разные состояния, и показывать ссылку на блокировку при неверном пароле
+    значит подставлять пользователю неверный диагноз.
+    """
+    locked_url = f"{LOCKED_PATH}?{REASON_QUERY}={locked_reason}" if locked_reason else None
+    context = {
+        "page_title": "Вход",
+        "detail": detail,
+        "locked_url": locked_url,
+    } | csrf_context(None)
     response: HTMLResponse = request.app.state.templates.TemplateResponse(
         request, "login.html", context, status_code=status_code
     )
@@ -148,7 +171,12 @@ async def login_submit(request: Request, store: StoreDep) -> Response:
     try:
         ensure_login_allowed(user, now=moment)
     except LoginLockedError as exc:
-        response = _render_login(request, detail=_lock_detail(exc.until), status_code=429)
+        response = _render_login(
+            request,
+            detail=_lock_detail(exc.until),
+            status_code=429,
+            locked_reason=LOCK_REASON_ATTEMPTS,
+        )
         response.headers["Retry-After"] = str(_retry_after(exc.until, moment))
         return response
 
@@ -156,7 +184,12 @@ async def login_submit(request: Request, store: StoreDep) -> Response:
         locked_until = register_login_failure(user, now=moment)
         store.commit()
         if locked_until is not None:
-            response = _render_login(request, detail=_lock_detail(locked_until), status_code=429)
+            response = _render_login(
+                request,
+                detail=_lock_detail(locked_until),
+                status_code=429,
+                locked_reason=LOCK_REASON_ATTEMPTS,
+            )
             response.headers["Retry-After"] = str(_retry_after(locked_until, moment))
             return response
         return _render_login(request, detail=GENERIC_FAILURE_DETAIL, status_code=401)
