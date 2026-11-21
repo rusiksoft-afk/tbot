@@ -133,6 +133,13 @@ jobs:
       # прямо в тесте, потому что в CI роль приложения создаётся только для проверки.
       - name: append-only права роли приложения (AC-identity-04)
         run: python -m pytest tests/integration/test_postgres_roles.py -q -rs
+      # Счётчик частоты запросов (TZ §8.3, docs/adr/ADR-007) и CHECK формата хэша значения куки
+      # на живой базе: PK-дубликаты окна, закрытый перечень областей, окно только 60 секунд
+      # (пятиминутное окно §8.2 в схему не входило — вопрос открыт), серверные default'ы и доступ
+      # роли приложения без правок файла прав. Оффлайн-половинка —
+      # `tests/contract/test_rate_limits_schema.py`.
+      - name: счётчик частоты запросов на живой базе (TZ §8.3, ADR-007)
+        run: python -m pytest tests/integration/test_rate_buckets_db.py -q -rs
 
   secret-scan:
     name: поиск секретов (gitleaks)

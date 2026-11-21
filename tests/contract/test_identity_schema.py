@@ -29,6 +29,7 @@ import sys
 import tempfile
 from functools import lru_cache
 from pathlib import Path
+from typing import Final
 
 import pytest
 import sqlalchemy as sa
@@ -63,6 +64,19 @@ IDENTITY_TABLES: frozenset[str] = frozenset(
 # Ревизия 0001 (`app_meta`) и служебная таблица Alembic — не часть схемы идентичности.
 _NON_IDENTITY_TABLES: frozenset[str] = frozenset({"app_meta", "alembic_version"})
 
+# Таблицы схемы, которых нет в перечне §4.1, но которые появились по решению заказчика и
+# обоснованы в ADR: имя таблицы → файл обоснования. Пустой словарь — правильное состояние для
+# всего, что описано в §4.1; каждая новая «лишняя» таблица обязана появиться здесь вместе с ADR,
+# иначе следующая ревизия тихо расширит схему без решения заказчика (проверка ниже читает файлы).
+_OPERATIONAL_TABLES: Final[dict[str, str]] = {
+    "rate_buckets": "docs/adr/ADR-007-rate-limit-counter-table.md",  # TZ §8.3, ask `fe0b025e`
+}
+
+# Всё, что создаёт история миграций кроме служебных таблиц: перечни §4.1 плюс обоснованные
+# добавления. Сверки «модели ↔ ревизия» идут по этому множеству, а сверки «схема ↔ §4.1» —
+# строго по `IDENTITY_TABLES`: иначе «лишняя» таблица прикрывала бы отсутствие таблиц из ТЗ.
+_SCHEMA_TABLES: frozenset[str] = IDENTITY_TABLES | frozenset(_OPERATIONAL_TABLES)
+
 # `postgresql+psycopg://` — форма площадки (TZ §14.9); без пароля: строка подключения с
 # учётными данными в репозитории запрещает `tests/contract/test_no_forbidden_references.py`.
 # База при этом не открывается: `--sql` только генерирует текст.
@@ -70,6 +84,10 @@ _FAKE_DB_URL = "postgresql+psycopg://tbot@127.0.0.1:5432/tbot_offline"
 
 _CREATE_TABLE_RE = re.compile(r"^CREATE TABLE (?P<name>\w+) \($")
 _CONSTRAINT_RE = re.compile(r"^CONSTRAINT (?P<name>\w+) ")
+# Ограничение, добавленное к уже существующей таблице (ревизия `0003` так добавляет CHECK формата
+# `sessions.token_hash`): в офлайн-SQL это отдельная строка `ALTER TABLE … ADD CONSTRAINT …`,
+# внутри блока `CREATE TABLE` её нет.
+_ALTER_ADD_CONSTRAINT_RE = re.compile(r"^ALTER TABLE (\w+) ADD CONSTRAINT (\w+) ", re.M)
 _INDEX_RE = re.compile(r"^CREATE (?:UNIQUE )?INDEX (?P<name>\w+) ON (?P<table>\w+) ", re.M)
 _FORBIDDEN_TYPES: tuple[str, ...] = (
     "DOUBLE PRECISION",
@@ -111,7 +129,12 @@ def _offline_sql(*args: str) -> str:
 
 
 def _parse_tables(sql: str) -> dict[str, dict[str, list[str]]]:
-    """Разобрать `CREATE TABLE … ( … );` на колонки и именованные ограничения."""
+    """Разобрать `CREATE TABLE … ( … );` на колонки и именованные ограничения.
+
+    Отдельно собираются ограничения, добавленные `ALTER TABLE … ADD CONSTRAINT` к таблице,
+    созданной более ранней ревизией: без них офлайн-разбор «не видит» половину схемы, и
+    последующие проверки сравнивали бы модели с недополученным набором ограничений.
+    """
     tables: dict[str, dict[str, list[str]]] = {}
     current: dict[str, list[str]] | None = None
     for raw in sql.splitlines():
@@ -130,6 +153,9 @@ def _parse_tables(sql: str) -> dict[str, dict[str, list[str]]]:
             current["constraints"].append(constraint.group("name"))
         elif line:
             current["columns"].append(line.split()[0])
+    for table_name, constraint_name in _ALTER_ADD_CONSTRAINT_RE.findall(sql):
+        entry = tables.setdefault(table_name, {"columns": [], "constraints": []})
+        entry["constraints"].append(constraint_name)
     return tables
 
 
@@ -166,12 +192,17 @@ def downgrade_sql() -> str:
     return _offline_sql("downgrade", "head:base")
 
 
-def test_цепочка_ревизий_линейна_и_наверху_0002() -> None:
+def test_цепочка_ревизий_линейна_и_без_развилок() -> None:
+    """Одна линия истории и известный состав ревизий (приёмка T-009, продолжение `T-102`).
+
+    `heads` обязан быть одиночным: развилка означает, что две сессии завели соседние ревизии и
+    `upgrade head` на площадке начнёт падать с «multiple heads».
+    """
     script = ScriptDirectory.from_config(Config(str(ROOT / "alembic.ini")))
     heads = script.get_heads()
-    assert heads == ["0002"], f"ожидалась одна линия истории, получено: {heads}"
+    assert heads == ["0003"], f"ожидалась одна линия истории, получено: {heads}"
     walked = [rev.revision for rev in script.walk_revisions()]
-    assert set(walked) == {"0001", "0002"}, f"состав ревизий изменился: {walked}"
+    assert set(walked) == {"0001", "0002", "0003"}, f"состав ревизий изменился: {walked}"
 
 
 def test_каждая_ревизия_умеет_откатываться_не_пустышкой() -> None:
@@ -186,17 +217,34 @@ def test_каждая_ревизия_умеет_откатываться_не_п
 
 
 def test_схема_идентичности_соответствует_перечню_тз_4_1() -> None:
-    assert set(Base.metadata.tables) == IDENTITY_TABLES, (
-        "состав таблиц идентичности не совпадает с TZ §4.1: "
-        f"{sorted(set(Base.metadata.tables) ^ IDENTITY_TABLES)}"
+    """Таблицы §4.1 обязаны быть все; сверх §4.1 — только обоснованные ADR добавлением.
+
+    Проверка намеренно не «равно», а «⊆ + список лишнего»: иначе новая таблица вне ТЗ
+    (счётчик частоты, §8.3) выглядела бы как нарушение §4.1, и следующая сессия удалила бы её
+    «для соответствия». Но и произвольным добавлением это быть не может: каждая лишняя таблица обязана
+    быть перечислена с файлом обоснования, и этот файл обязан существовать.
+    """
+    modelled = set(Base.metadata.tables)
+    missing = IDENTITY_TABLES - modelled
+    assert not missing, f"в модели нет таблиц из TZ §4.1: {sorted(missing)}"
+    extra = modelled - IDENTITY_TABLES - _NON_IDENTITY_TABLES
+    assert extra == set(_OPERATIONAL_TABLES), (
+        "в models.py появились таблицы вне перечня §4.1 и без обоснования: "
+        f"{sorted(extra - set(_OPERATIONAL_TABLES))}; обоснование — ADR и перечень в этом тесте"
     )
+    for table, adr in sorted(_OPERATIONAL_TABLES.items()):
+        assert (ROOT / adr).exists(), f"{table}: обоснование {adr} не найдено"
+        text = (ROOT / adr).read_text(encoding="utf-8")
+        assert (
+            f"`{table}`" in text or table in text
+        ), f"{adr} не упоминает {table}: обоснование должно объяснять именно эту таблицу"
 
 
 def test_модели_и_ревизия_создают_одни_те_же_таблицы(upgrade_sql: str) -> None:
     tables = _parse_tables(upgrade_sql)
     created = set(tables) - _NON_IDENTITY_TABLES
-    assert created == IDENTITY_TABLES, f"ревизия создаёт не те таблицы: {sorted(created)}"
-    for name in sorted(IDENTITY_TABLES):
+    assert created == _SCHEMA_TABLES, f"ревизия создаёт не те таблицы: {sorted(created)}"
+    for name in sorted(_SCHEMA_TABLES):
         modelled = {column.name for column in Base.metadata.tables[name].columns}
         actual = set(tables[name]["columns"])
         assert modelled == actual, (
@@ -209,7 +257,7 @@ def test_модели_и_ревизия_создают_одни_те_же_таб
 def test_имена_ограничений_совпадают_с_конвенцией_и_между_собой(upgrade_sql: str) -> None:
     tables = _parse_tables(upgrade_sql)
     prefixes = ("pk_", "fk_", "ck_", "uq_", "ix_")
-    for name in sorted(IDENTITY_TABLES):
+    for name in sorted(_SCHEMA_TABLES):
         expected = _constraint_names_from_models(name)
         actual = set(tables[name]["constraints"])
         assert expected == actual, (
@@ -221,36 +269,45 @@ def test_имена_ограничений_совпадают_с_конвенц�
                 prefixes
             ), f"{name}: имя {constraint} вне конвенции {sorted(prefixes)}"
     # PK у каждой таблицы обязан быть (иначе `pg_dump` и репликация теряют строку).
-    for name in sorted(IDENTITY_TABLES):
+    for name in sorted(_SCHEMA_TABLES):
         assert f"pk_{name}" in set(tables[name]["constraints"]), f"{name}: нет первичного ключа"
 
 
 def test_индексы_модели_и_ревизии_совпадают(upgrade_sql: str) -> None:
-    expected = _index_names_from_models(set(IDENTITY_TABLES))
+    expected = _index_names_from_models(set(_SCHEMA_TABLES))
     actual = _index_names(upgrade_sql)
-    assert (
-        set(actual) <= IDENTITY_TABLES
-    ), f"лишние индексы: {sorted(set(actual) - IDENTITY_TABLES)}"
-    for name in sorted(IDENTITY_TABLES):
+    assert set(actual) <= _SCHEMA_TABLES, f"лишние индексы: {sorted(set(actual) - _SCHEMA_TABLES)}"
+    for name in sorted(_SCHEMA_TABLES):
         assert expected[name] == actual.get(name, set()), (
             f"{name}: индексы разошлись — модель: {sorted(expected[name])}, "
             f"ревизия: {sorted(actual.get(name, set()))}"
         )
 
 
-def test_обратная_миграция_снимает_всё_созданное_0002(downgrade_sql: str) -> None:
+def test_обратная_миграция_снимает_всё_созданное_ревизиями(downgrade_sql: str) -> None:
+    """`downgrade head:base` обязан убрать всё, что создали ревизии, — включая счётчик частоты.
+
+    Отдельно проверяется снятие `CHECK`, добавленного ревизией `0003` к чужой таблице: такие
+    ограничения не видны в `DROP TABLE`, и их потеря означает, что «чистая» база после отката
+    всё ещё несёт часть схемы, а повторный `upgrade head` упадёт на существующем ограничении.
+    """
     dropped_tables = set(re.findall(r"^DROP TABLE (\w+);", downgrade_sql, re.M))
     assert (
-        dropped_tables >= IDENTITY_TABLES
-    ), f"downgrade не снимает таблицы: {sorted(IDENTITY_TABLES - dropped_tables)}"
-    expected_indexes = _index_names_from_models(set(IDENTITY_TABLES))
+        dropped_tables >= _SCHEMA_TABLES
+    ), f"downgrade не снимает таблицы: {sorted(_SCHEMA_TABLES - dropped_tables)}"
+    expected_indexes = _index_names_from_models(set(_SCHEMA_TABLES))
     dropped_indexes = set(re.findall(r"^DROP INDEX (\w+);", downgrade_sql, re.M))
-    for table in sorted(IDENTITY_TABLES):
+    for table in sorted(_SCHEMA_TABLES):
         missing = expected_indexes[table] - dropped_indexes
         assert not missing, f"{table}: downgrade не снимает индексы {sorted(missing)}"
     # citext создаётся прямой миграцией — обязан сниматься обратной, иначе в базе остаётся
     # расширение, которое больше никто не создаёт и не удаляет осознанно.
     assert "DROP EXTENSION IF EXISTS citext;" in downgrade_sql, "downgrade не снимает citext"
+    # CHECK формата хэша значения куки добавлен к уже существующей таблице — его снятие обязано
+    # быть видно в обратном DDL (см. docstring выше).
+    assert (
+        "ALTER TABLE sessions DROP CONSTRAINT ck_sessions_token_hash_format;" in downgrade_sql
+    ), "downgrade не снимает CHECK формата sessions.token_hash, добавленный ревизией 0003"
     # Порядок: таблицы снимаются до расширения (колонки citext блокируют DROP EXTENSION).
     assert downgrade_sql.index("DROP TABLE users;") < downgrade_sql.index(
         "DROP EXTENSION IF EXISTS citext;"
@@ -278,12 +335,12 @@ def test_в_схеме_нет_вещественных_типов_и_денег(
         ), f"в DDL встречается запрещённый тип {forbidden} (TZ §4.11, REQ-storage-02)"
     floats = [
         f"{table_name}.{column.name}: {type(column.type).__name__}"
-        for table_name in sorted(IDENTITY_TABLES)
+        for table_name in sorted(_SCHEMA_TABLES)
         for column in Base.metadata.tables[table_name].columns
         # `sa.Float` покрывает и `postgresql.DOUBLE_PRECISION` (его потомок).
         if isinstance(column.type, sa.Float)
     ]
-    assert not floats, "вещественный тип в схемах идентичности: " + "; ".join(floats)
+    assert not floats, "вещественный тип в таблицах схемы: " + "; ".join(floats)
 
 
 def test_время_везде_с_часовым_поясом(upgrade_sql: str) -> None:

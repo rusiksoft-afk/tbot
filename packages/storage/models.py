@@ -39,6 +39,7 @@ from sqlalchemy import (
     Index,
     Integer,
     LargeBinary,
+    SmallInteger,
     Text,
     UniqueConstraint,
     Uuid,
@@ -70,6 +71,22 @@ SESSION_AUTH_STEPS: Final[tuple[str, ...]] = ("password", "totp", "full")
 INVITATION_STATES: Final[tuple[str, ...]] = ("pending", "used", "revoked")
 
 # §8.2: «допуск ±1 шаг (по умолчанию ±1, максимум ±2)».
+# Области прикладного счётчика частоты запросов (TZ §8.3, docs/adr/ADR-007). Перечень закрытый и
+# ровно из четырёх значений: §8.3 перечисляет `/login` 10 запросов/мин/IP, `/totp` 10/мин/сессия и
+# 5/мин/IP, все mutation-эндпоинты 60/мин/пользователь. Пятое значение — это всегда новая ревизия
+# и новый CHECK, а не «добавили строку в кортеж».
+RATE_SCOPES: Final[tuple[str, ...]] = (
+    "login_ip",  # /login — 10 запросов/мин/IP (§8.3)
+    "totp_session",  # /totp — 10 запросов/мин/сессия (§8.3)
+    "totp_ip",  # /totp — 5 запросов/мин/IP (§8.3)
+    "mutation_user",  # все mutation-эндпоинты — 60 запросов/мин/пользователь (§8.3)
+)
+# Длительность окна: §8.3 все лимиты задаёт «в минуту», поэтому окно ровно одно — 60 секунд.
+# Пятиминутное окно из §8.2 («3 неудачи с одного IP за 5 минут → временный бан IP») здесь
+# сознательно нет: кто держит этот бан, заказчиком не решено (docs/adr/ADR-007, HANDOFF §4),
+# и расширять CHECK «на будущее» незачем.
+RATE_WINDOW_SECONDS: Final = 60
+
 TOTP_WINDOW_MIN: Final = 0
 TOTP_WINDOW_DEFAULT: Final = 1
 TOTP_WINDOW_MAX: Final = 2
@@ -362,6 +379,11 @@ class UserSession(Base):
         # от последней активности и сдвигается, абсолютные 12 часов — от создания и не сдвигаются.
         # Значение колонки считает `packages/identity/sessions.py` как
         # `min(сейчас + idle, created_at + abs)`, здесь ограничение только про порядок моментов.
+        # Формат хэша значения куки держит база, а не только приложение: §8.3 требует искать
+        # сессию по этому значению, и случайно сохранённое значение куки (или обрезанный хэш)
+        # должны быть видны как ошибка схемы, а не как «сессии нет». Решением заказчика CHECK
+        # добавлен в ближайшую новую ревизию, а не отдельной миграцией (ask `fe0b025e`).
+        CheckConstraint("token_hash ~ '^[0-9a-f]{64}$'", name="token_hash_format"),
         CheckConstraint("expires_at > created_at", name="expires_after_created"),
         CheckConstraint("last_seen_at >= created_at", name="last_seen_not_before_created"),
         Index("ix_sessions_user_id", "user_id"),
@@ -490,4 +512,77 @@ class AuditLogEntry(Base):
     )
     hash: Mapped[str] = mapped_column(
         Text(), nullable=False, comment="SHA-256 от канонического JSON записи + hash_prev"
+    )
+
+
+class RateBucket(Base):
+    """Счётчик частоты запросов (TZ §8.3, `docs/adr/ADR-007`, задача `T-102`).
+
+    Таблицы нет в перечне §4.1 — это следствие того, что §8.3 требует счётчик на уровне
+    приложения, а Caddy встроенного ограничения частоты запросов не имеет (ADR-003). Форма одна
+    на все четыре области: строка на (область, субъект, начало окна).
+
+    Три решения здесь неочевидны из ТЗ, поэтому они зафиксированы в ADR-007 и повторяются в
+    именах ограничений.
+
+    1. **Первичный ключ составной** (`scope`, `bucket_key`, `window_start`): у строки счётчика нет
+       жизни вне ключа, а точечный запрос слоя входа («счётчик по области, субъекту и текущему
+       окну») получает и уникальность, и индекс одним объектом. UUIDv7-суррогат здесь ничего не
+       даёт и только добавляет лишний индекс.
+    2. **Внешних ключей нет намеренно.** Общее правило §4 (`ON DELETE RESTRICT`) привязало бы
+       короткие по жизни счётчики к строкам `users`/`sessions`: удаление учётной записи упиралось
+       бы в её же счётчики, а счётчики обязаны умирать по возрасту. Целостность субъекта здесь не
+       нужна — это операционные данные.
+    3. **`window_seconds` — колонка, а не константа приложения**, и она ограничена значением 60.
+       Окно живёт вместе со строкой: если окно когда-нибудь изменится, старые строки останутся с
+       тем окном, при котором были созданы, а не «пересчитаются задним числом».
+
+    Строки обязан чистить фоновый процесс (`jobs`): индекс `ix_rate_buckets_window_start` для
+    этого и заведён. Счётчик не входит в реестр `APPEND_ONLY_TABLES` — он изменяемый по природе,
+    и права на него даются не файлом прав, а владением (таблицу создаёт миграция ролью
+    приложения, ADR-006).
+    """
+
+    __tablename__ = "rate_buckets"
+    __table_args__ = (
+        CheckConstraint(
+            "scope IN (" + ", ".join(f"'{scope}'" for scope in RATE_SCOPES) + ")",
+            name="scope",
+        ),
+        CheckConstraint(f"window_seconds = {RATE_WINDOW_SECONDS}", name="window_seconds"),
+        CheckConstraint("length(bucket_key) BETWEEN 1 AND 64", name="bucket_key_len"),
+        CheckConstraint("attempts >= 0", name="attempts_not_negative"),
+        Index("ix_rate_buckets_window_start", "window_start"),
+        {
+            "comment": (
+                "Прикладной счётчик частоты запросов (TZ §8.3, ADR-007): строка на "
+                "(область, субъект, начало минутного окна). subject — IP из X-Forwarded-For "
+                "либо строка UUID сессии/пользователя; чистка — по window_start."
+            )
+        },
+    )
+
+    scope: Mapped[str] = mapped_column(Text(), primary_key=True)
+    # Субъект лимита: для `login_ip`/`totp_ip` — канонический текст адреса из `X-Forwarded-For`
+    # (до 45 символов для IPv6), для `totp_session`/`mutation_user` — строка UUID (36 символов).
+    # Одним текстом, а не раздельными колонками: раздельные колонки не входят в первичный ключ
+    # (ключевые колонки не бывают NULL), а проверка «заполнена ровно одна» раздула бы схему.
+    bucket_key: Mapped[str] = mapped_column(
+        Text(),
+        primary_key=True,
+        comment=(
+            "Субъект лимита: канонический текст адреса из X-Forwarded-For (login_ip, totp_ip) "
+            "или строка UUID сессии/пользователя (totp_session, mutation_user)"
+        ),
+    )
+    # Начало окна обязано быть выровненным (`date_trunc`), иначе один и тот же интервал времени
+    # даст несколько строк и лимит перестанет считаться. Ровняет приложение.
+    window_start: Mapped[datetime] = mapped_column(TIMESTAMPTZ, primary_key=True)
+    window_seconds: Mapped[int] = mapped_column(
+        SmallInteger(), nullable=False, server_default=text(f"{RATE_WINDOW_SECONDS}")
+    )
+    # Как и `users.failed_attempts` (урок `T-101`): серверный default не помогает неотправленному
+    # объекту SQLAlchemy — арифметика «+1» на нём падает до флаша.
+    attempts: Mapped[int] = mapped_column(
+        Integer(), nullable=False, server_default=text("0"), default=0
     )

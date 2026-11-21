@@ -64,6 +64,7 @@ _PG_TYPE_NAMES: Final[dict[str, str]] = {
     "Text": "text",
     "DateTime": "timestamp with time zone",
     "Integer": "integer",
+    "SmallInteger": "smallint",
     "BigInteger": "bigint",
     "LargeBinary": "bytea",
     "INET": "inet",
