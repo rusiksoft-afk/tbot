@@ -258,6 +258,8 @@
     (модуль не открывает соединений и не коммитит), записи `audit_log` о попытках и блокировках —
     `T-109`. Перед деплоем этого среза переснять digest'ы: `argon2-cffi` меняет образ
     (`runbook stand-deploy §2`). Разбор — `docs/HANDOFF.md §1.25`.
+    CI `161e8a6`: run `44870294097` — 9 job'ов зелёные (455 passed, покрытие 96,00%, `pip-audit` чисто),
+    образы пересобраны — run `44870294092`.
 - [ ] **T-102** Сессии: куки (HttpOnly/Secure/SameSite), `auth_step`, idle 30 мин / abs 12 ч, пересоздание после критичных действий, список сессий + отзыв
   - Приёмка: TZ §8.3 (куки, CSRF, CSP, HSTS)
   - Проверка: `test_session_matrix`, `test_csrf_required`, `test_session_revoke`
