@@ -27,17 +27,20 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
+import logging
 import re
 import secrets
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
 from uuid import UUID
 
 import pytest
+import structlog
 from fastapi.testclient import TestClient
 from httpx import Response
 
@@ -46,6 +49,7 @@ import apps.web.routes.sessions as session_routes
 import apps.web.routes.totp as totp_routes
 import apps.web.security.rate_limit as rate_limit_module
 import apps.web.security.sessions as security_sessions
+from apps.web.qrcode import QrBuildError, QrGraphic, qr_graphic
 from apps.web.routes.totp import (
     ALREADY_BOUND_DETAIL,
     CODE_FAILURE_DETAIL,
@@ -80,14 +84,16 @@ from apps.web.security.sessions import (
     TOTP_CODE_PATH,
 )
 from packages.common.config import Settings
+from packages.common.logging import configure_logging
 from packages.identity.totp import (
     TOTP_FAILURE_HORIZON,
     TOTP_MAX_FAILED_CODES,
     TOTP_PERIOD_SECONDS,
     new_totp_secret,
     totp_code,
+    totp_provisioning_uri,
 )
-from packages.identity.totp_enrollment import PENDING_ENROLLMENT_TTL
+from packages.identity.totp_enrollment import PENDING_ENROLLMENT_TTL, TOTP_ISSUER
 from packages.storage.models import TotpEnrollment, User, UserSession
 from tests.integration.web_support import (
     TEST_LOGIN,
@@ -1233,3 +1239,219 @@ def test_страница_привязки_открывается_без_фай�
     assert row is not None
     assert row.confirmed_at is None, "подтверждение прошло без файла ключей"
     assert _попытки(store, _пользователь(store).id, clock) == 0
+
+
+# ─── §8.2 «QR + ручной ввод секрета»: картинка привязки (срез `R4d`) ─────────────────────────
+
+
+def _картинка_из_ответа(text: str) -> tuple[int, str]:
+    """Пара «сторона квадрата в модулях / строка путей» из разметки ответа.
+
+    Разбор вынесен отдельно, потому что сравнение идёт с ожиданием, которое тест собирает сам:
+    сверять «в странице есть картинка» бессмысленно — проверять нужно, какая именно.
+    """
+    рамка = re.search(r'<svg[^>]*viewBox="0 0 (\d+) (\d+)"', text)
+    assert рамка, f"в ответе нет встроенной картинки привязки: {text[:400]}"
+    assert рамка.group(1) == рамка.group(2), "холст QR не квадратный"
+    путь = re.search(r'<path d="([^"]*)"', text)
+    assert путь, f"в разметке нет пути QR: {text[:400]}"
+    return int(рамка.group(1)), путь.group(1)
+
+
+def _ожидание_картинки(secret: str) -> QrGraphic:
+    """Картинка, собранная тестом из показанного секрета, а не из того, что вернул маршрут."""
+    return qr_graphic(totp_provisioning_uri(secret, account_name=TEST_LOGIN, issuer=TOTP_ISSUER))
+
+
+def test_qr_картинка_кодирует_тот_же_секрет_что_показывает_страница(client: TestClient) -> None:
+    """§8.2: «QR + ручной ввод секрета» — картинка и ключ обязаны быть про одно и то же значение.
+
+    Сравнение не «длина ненулевая», а строка путей с ожиданием, которое тест собирает сам: из
+    показанного в `<code>` секрета, логина учётной записи и метки `issuer`. Так ловятся три
+    дефекта, на глаз на странице неотличимые: картинка из другого секрета (например из прежней,
+    только что отозванной привязки), картинка без метки или без параметров (`issuer`, `algorithm`,
+    `digits`, `period`) — генератор привяжет не то, — и картинка, собранная повторным
+    расшифровыванием `secret_enc`, то есть вторая точка вывода материала (`ADR-015` п. 6).
+    """
+    _войти(client)
+    token = _токен(client)
+    ответ = client.post(MFA_ENROLL_START_PATH, data={CSRF_FORM_FIELD: token}, headers=_headers())
+    assert _статус(ответ) == 200, ответ.text
+    ключи = SECRET_BLOCK.findall(ответ.text)
+    assert len(ключи) == 1, "секрет показан не один раз"
+    секрет = ключи[0]
+
+    модули, путь = _картинка_из_ответа(ответ.text)
+    ожидание = _ожидание_картинки(секрет)
+    assert (
+        путь == ожидание.path_d
+    ), "QR кодирует не ту `otpauth://`-ссылку, которая следует из показанного ключа и логина"
+    assert модули == ожидание.modules, "размер картинки не совпадает с ожиданием"
+    assert ответ.text.count("<svg") == 1, "картинка выведена больше одного раза"
+
+    # Повторная выдача меняет и ключ, и картинку: иначе «начать заново» вернуло бы прежний QR.
+    второй = client.post(
+        MFA_ENROLL_START_PATH, data={CSRF_FORM_FIELD: _токен(client)}, headers=_headers()
+    )
+    другой = SECRET_BLOCK.findall(второй.text)[0]
+    assert другой != секрет, "повторная выдача повторила секрет"
+    модули2, путь2 = _картинка_из_ответа(второй.text)
+    assert путь2 != путь, "картинка повторяется вместе с прежним секретом"
+    assert модули2 == _ожидание_картинки(другой).modules
+
+
+def test_ответы_без_картинки_не_несут_ни_её_ни_ссылку_ни_секрет(client: TestClient) -> None:
+    """Ни `GET` страницы, ни другие состояния картинки не имеют (§8.2, `ADR-015` п. 6).
+
+    Картинка — тот же секрет, только в форме, которую генератор считывает за секунду. Вывод на
+    `GET` означал бы и повторный показ (§8.2: «в UI больше не показывается»), и повторное
+    расшифровывание `secret_enc`. `otpauth://`-ссылка и встроенное изображение в разметке — тот
+    же риск в другом виде: ссылку видно в адресной строке и в access-логе прокси.
+    """
+    _войти(client)
+    начало = client.get(MFA_ENROLL_PATH, headers=_headers())
+    assert _статус(начало) == 200, начало.text
+    assert "Начать" in начало.text, "без привязки страница не предложила её начать"
+    assert "<svg" not in начало.text, "состояние `start` показало картинку"
+
+    _token, секрет = _начать_привязку(client)
+
+    страница = client.get(MFA_ENROLL_PATH, headers=_headers())
+    assert _статус(страница) == 200, страница.text
+    assert ENROLL_ONCE_DETAIL in страница.text, "начатая привязка не объяснила путь «заново»"
+    for marker in ("<svg", "<path d=", "otpauth", "data:", секрет):
+        assert marker not in страница.text, f"`GET` привязки отдаёт {marker!r}"
+
+    код = client.get(TOTP_CODE_PATH, headers=_headers(), follow_redirects=False)
+    assert _статус(код) == 302, "неподтверждённая привязка не уводит на страницу привязки"
+
+
+def test_в_разметке_привязки_нет_ни_нарушения_csp_ни_внешнего_источника(client: TestClient) -> None:
+    """Картинка встроена геометрией: без `data:`, без `<img>` и без чужого адреса.
+
+    Единственный способ показать `<img>` при CSP `img-src 'self'` (§8.3) — ослабить политику, а
+    это решение заказчика, не оформителя (`tests/integration/test_compose_prod_contract.py`
+    держит `img-src` ровно `'self'`). Второй способ — отдельный адрес с картинкой, и он же
+    вторая точка вывода секрета. Проверка держит оба закрытыми, пока шаблон не переписали.
+    """
+    _войти(client)
+    token = _токен(client)
+    ответ = client.post(MFA_ENROLL_START_PATH, data={CSRF_FORM_FIELD: token}, headers=_headers())
+
+    assert "<svg" in ответ.text, "картинки нет — проверять нечего"
+    for forbidden in ("data:", "<img", "otpauth", "//", "http://", "https://"):
+        assert forbidden not in ответ.text, f"в разметке привязки появился источник {forbidden!r}"
+    assert 'fill="#000"' in ответ.text, "у картинки нет тёмного переднего плана"
+    assert (
+        'fill="#fff"' in ответ.text
+    ), "у картинки нет светлого фона: QR без контрастного фона читают не все генераторы"
+
+
+def test_без_картинки_страница_привязки_остаётся_рабочей(
+    client: TestClient, store: MemoryStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Отказ кодировщика не ломает привязку: §8.2 требует QR **и** ручной ввод, а не вместо.
+
+    Проверка ровно про тот случай, который обычно и чинят неправильно: если картинка —
+    обязательная часть ответа, отказ кодировщика превращается в `500` или в «привязка не
+    началась». Здесь ответ остаётся `200`, ключ показан, отсутствие картинки объяснено в том же
+    ответе, где картинка стояла бы, а привязка создана и активна: человек вводит ключ руками и
+    продолжает. Дальше страница ведёт себя как обычно: повторного показа нет (§8.2), и объяснение
+    не превращается в «секрет можно увидеть ещё раз».
+    """
+
+    def отказ(нагрузка: str) -> QrGraphic:
+        raise QrBuildError(f"проверка: нагрузка {len(нагрузка)} знаков не помещается в QR")
+
+    monkeypatch.setattr(totp_routes, "qr_graphic", отказ)
+    _войти(client)
+    token = _токен(client)
+    ответ = client.post(MFA_ENROLL_START_PATH, data={CSRF_FORM_FIELD: token}, headers=_headers())
+
+    assert _статус(ответ) == 200, "отказ кодировщика сломал выдачу привязки"
+    ключи = SECRET_BLOCK.findall(ответ.text)
+    assert len(ключи) == 1, "без картинки пропал и ручной ключ (§8.2)"
+    секрет = ключи[0]
+    assert (
+        "не собрался" in ответ.text
+    ), "отсутствующую картинку страница не объяснила: человек ищет QR, которого нет"
+    assert "<svg" not in ответ.text, "без картинки в разметке остался блок картинки"
+    assert "<path d=" not in ответ.text, "без картинки в разметке остался путь QR"
+
+    страница = client.get(MFA_ENROLL_PATH, headers=_headers())
+    assert секрет not in страница.text, "страница повторила ключ вместе с отсутствующей картинкой"
+
+    user_id = _пользователь(store).id
+    assert store.active_enrollment(user_id) is not None, "отказ кодировщика отменил привязку"
+    assert len(_привязки(store, user_id)) == 1
+
+
+@pytest.fixture
+def json_logs() -> Iterator[Callable[[], list[str]]]:
+    """Логи процесса в буфер — тем же конвейером, что у боевого процесса (`packages/common/logging`).
+
+    Приёмник подменяется буфером, а не `caplog`: форматирует и маскирует конвейер `structlog`, и
+    «ушло ли в stdout» зависело бы от порядка плагинов pytest, а не от проверяемого.
+    """
+    stream = io.StringIO()
+    configure_logging("DEBUG", json_output=True, stream=stream)
+
+    def readout() -> list[str]:
+        return [line for line in stream.getvalue().splitlines() if line.strip()]
+
+    yield readout
+    logging.getLogger().handlers.clear()
+    structlog.reset_defaults()
+
+
+def test_отказ_кодировщика_объясняется_в_логе_и_не_содержит_секрета(
+    client: TestClient,
+    json_logs: Callable[[], list[str]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Строка `totp_qr_unavailable` в логе есть, а полезной нагрузки в ней нет (§8.4).
+
+    Отказ обязан быть различим в разборе — иначе «QR не собирается» неотличимо от «QR не
+    просили». При этом в логе не должно быть ни base32-ключа, ни `otpauth://`-ссылки целиком: в
+    ссылке ключ лежит открытым текстом, а логи и access-лог прокси живут дольше страницы.
+    """
+
+    def отказ(нагрузка: str) -> QrGraphic:
+        raise QrBuildError(f"проверка: нагрузка {len(нагрузка)} знаков не помещается в QR")
+
+    monkeypatch.setattr(totp_routes, "qr_graphic", отказ)
+    _войти(client)
+    _token, секрет = _начать_привязку(client)
+
+    строки = json_logs()
+    assert строки, "отказ кодировщика не объяснён в логе процесса"
+    захват = "\n".join(строки)
+    assert "totp_qr_unavailable" in захват, "в логе нет ни строки об отказе, ни её причин"
+    assert секрет not in захват, "base32-ключ привязки ушёл в лог"
+    assert "otpauth" not in захват, "ссылка привязки ушла в лог"
+
+
+def test_неудача_кода_не_оставляет_секрет_и_ссылку_в_логе(
+    client: TestClient, json_logs: Callable[[], list[str]], clock: Clock
+) -> None:
+    """Лента неудач подтверждения пишет исход отказа, но не материал привязки.
+
+    Проверка не повторяет предыдущую: здесь картинка собирается нормально, а в лог уходит
+    отказная ветка `totp_confirm_rejected`. Смысл в том, что ни одна ветка ответа о привязке не
+    имеет права печатать ключ или `otpauth://`-ссылку — в том числе та, где с QR всё получилось.
+    """
+    _войти(client)
+    _token, секрет = _начать_привязку(client)
+    token = _токен(client)
+    неверный = _чужой_код(clock)
+    ответ = client.post(
+        MFA_ENROLL_VERIFY_PATH,
+        data={CSRF_FORM_FIELD: token, FIELD_FIRST_CODE: неверный, FIELD_SECOND_CODE: неверный},
+        headers=_headers(),
+    )
+    assert _статус(ответ) == 401, ответ.text
+
+    захват = "\n".join(json_logs())
+    assert "totp_confirm_rejected" in захват, "отказ подтверждения не объяснён в логе процесса"
+    assert секрет not in захват, "base32-ключ привязки ушёл в лог"
+    assert "otpauth" not in захват, "ссылка привязки ушла в лог"
