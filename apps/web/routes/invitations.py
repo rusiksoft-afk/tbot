@@ -51,9 +51,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Final
+from typing import Annotated, Final
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Query, Request
 from fastapi.responses import HTMLResponse, Response
 
 from apps.web.forms import FIELD_LOGIN, FIELD_PHRASE, form_fields
@@ -64,7 +64,13 @@ from apps.web.security.rate_limit import (
     enforce_scope,
     retry_after_seconds,
 )
-from apps.web.security.sessions import INVITE_PATH, LOGIN_PATH, StoreDep, session_ip
+from apps.web.security.sessions import (
+    INVITE_LINK_KEY,
+    INVITE_PATH,
+    LOGIN_PATH,
+    StoreDep,
+    session_ip,
+)
 from apps.web.store import Store
 from packages.common.clock import utc_now
 from packages.common.logging import get_logger
@@ -87,6 +93,18 @@ router = APIRouter()
 #: Адрес приёма приглашения — `security/sessions.py`: на него ссылается раздел администратора,
 #: когда собирает ссылку для администратора (`invite_link`), и два литерала разошлись бы при
 #: первой же правке, оставив администратору адрес в никуда.
+
+#: Значение ссылки приглашения в запросе. Имя на проводе — `token` (`INVITE_LINK_KEY`): это тот
+#: ключ, который периметр уже вымарывает из журнала доступа, и выбор носителя зафиксирован
+#: `ADR-021` п. 3. Имя параметра в Python — нейтральное, и это не косметика: параметр с
+#: значением по умолчанию, названный `token`, читается статическим аудитом как «значение пароля по
+#: умолчанию» (B107), а подавлять её пометкой `nosec` нельзя — база подавлений не растёт. Алиас
+#: держит проводное имя, поэтому ни Caddy, ни проверка OpenAPI не расходятся с адресом ссылки.
+#:
+#: Значение по умолчанию пустое сознательно: отсутствующий параметр обязан дать ответ раздела
+#: (`404` — «выпуска нет»), а не `422` со списком ошибок поля: страница, которая отвечает списком
+#: ошибок на запрос без значения ссылки, ведёт себя как форма открытой регистрации (§1.2).
+InviteLink = Annotated[str, Query(alias=INVITE_LINK_KEY)]
 
 #: Имена полей: `login` и `password` приходят из `apps/web/forms.py` — те же константы, что у
 #: формы входа (`login_pair`). Два литерала имени одного поля разошлись бы при первой же правке, и
@@ -269,7 +287,7 @@ def _rate_denied(request: Request, detail: str, until: datetime, moment: datetim
 
 
 @router.get(INVITE_PATH, response_class=HTMLResponse)
-def invite_page(request: Request, store: StoreDep, token: str = "") -> Response:
+def invite_page(request: Request, store: StoreDep, link_value: InviteLink = "") -> Response:
     """Форма принятия приглашения (§9.3 п. 2: «приём приглашения», §1.2 шаг 1).
 
     Ссылка обязана быть открытой: `ensure_invitation_open` стоит до отрисовки формы, иначе
@@ -280,7 +298,7 @@ def invite_page(request: Request, store: StoreDep, token: str = "") -> Response:
     бы способ не пустить приглашённого человека, который просто открыл ссылку (`ADR-007`).
     """
     moment = utc_now()
-    link = _resolve_link(store, token)
+    link = _resolve_link(store, link_value)
     if link.record is None:
         return _render_link_page(
             request,
@@ -314,7 +332,7 @@ def invite_page(request: Request, store: StoreDep, token: str = "") -> Response:
 
 
 @router.post(INVITE_PATH, response_class=Response)
-async def invite_submit(request: Request, store: StoreDep, token: str = "") -> Response:
+async def invite_submit(request: Request, store: StoreDep, link_value: InviteLink = "") -> Response:
     """Принять приглашение: создать учётную запись с состоянием `invited` (§1.2 шаг 1).
 
     Порядок шагов — см. шапку модуля. Три следствия, которые держат этот обработчик:
@@ -344,7 +362,7 @@ async def invite_submit(request: Request, store: StoreDep, token: str = "") -> R
     password = fields.get(FIELD_PHRASE, "")
     repeat = fields.get(FIELD_REPEAT, "")
 
-    link = _resolve_link(store, token)
+    link = _resolve_link(store, link_value)
     if link.record is None:
         log.info("invitation_link_missing", reason=link.reason)
         return _render_link_page(

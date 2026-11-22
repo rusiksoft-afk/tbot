@@ -59,7 +59,12 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from apps.web.store import SqlStore
 from packages.common.db import sqlalchemy_url
-from packages.identity.invitations import INVITATION_TTL, invitation_token_hash, new_invitation
+from packages.identity.invitations import (
+    INVITATION_TTL,
+    invitation_secret,
+    invitation_token_hash,
+    new_invitation,
+)
 from packages.identity.users import new_user
 from packages.storage.models import Invitation, User, UserSession
 from tests.integration.web_support import TEST_PASSWORD
@@ -244,15 +249,18 @@ def _прямой_выпуск(
 
     Домен такие значения не создаёт намеренно — и именно поэтому у схемы есть второй контур:
     запись вне домена (правка таблицы при разборе инцидента, `T-109`) обязана упиреться в
-    ограничение. `token_hash` берётся из хэша произвольной строки: он обязан быть валидного
-    вида (колонка `Text`, CHECK на форму хэша у выпусков нет — её держит `is_sha256_hex` в
-    слое чтения, и проверяется она офлайн).
+    ограничение. Значение для хэша берётся у доменного генератора (`invitation_secret`), а не
+    сочиняется: `invitation_token_hash` сам проверяет форму значения и на произвольной строке
+    бросает `MalformedInvitationTokenError` (это и показал прогон job `миграции`), а смысл
+    проверки в том, чтобы отказать строке, **некорректной только в измеряемом измерении** —
+    состоянии или адресате. Хэш лежит в колонке `Text`, CHECK на его форму у выпусков нет:
+    форму проверяет слой чтения (`is_sha256_hex`), и это держит офлайн-половинка.
     """
     строка = Invitation(
         login=f"{_LOGIN_PREFIX}{suffix}{uuid.uuid4().hex[:6]}" if адресат else None,
         email=None,
         role="operator",
-        token_hash=invitation_token_hash(f"проверка-ограничения-{suffix}-{uuid.uuid4().hex}"),
+        token_hash=invitation_token_hash(invitation_secret()),
         state=state,
         expires_at=_NOW + INVITATION_TTL,
         created_by=_идентификатор(админ),
