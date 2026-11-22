@@ -35,14 +35,22 @@ from apps.web.security.sessions import (
     Principal,
     require_full_session,
 )
-from apps.web.store import BucketWindow, Store, get_store
+from apps.web.store import ACCOUNTS_LIST_LIMIT, BucketWindow, Store, get_store
 from packages.common.clock import utc_now
 from packages.common.config import Settings
 from packages.common.ids import uuid7
+from packages.identity.authorization import ROLE_ADMIN
 from packages.identity.backup_codes import BackupCodeError, is_sha256_hex
 from packages.identity.sessions import IssuedSession, token_hash_of
-from packages.identity.users import new_user
-from packages.storage.models import BackupCode, TotpEnrollment, TotpFailure, User, UserSession
+from packages.identity.users import CONSOLE_STATE, new_user
+from packages.storage.models import (
+    BackupCode,
+    Invitation,
+    TotpEnrollment,
+    TotpFailure,
+    User,
+    UserSession,
+)
 
 #: Пароль тестовой учётной записи: проходит §8.1 (длина, словарь, «пароль = логин/домен»), иначе
 #: `new_user` откажется создавать запись и проверка дойдёт до входа уже с другим пользователем.
@@ -70,6 +78,7 @@ class MemoryStore:
         self._enrollments: dict[UUID, TotpEnrollment] = {}
         self._totp_failures: list[TotpFailure] = []
         self._backup_codes: list[BackupCode] = []
+        self._invitations: list[Invitation] = []
         self.commits: int = 0
         self.hash_lookups: list[str] = []
 
@@ -168,13 +177,99 @@ class MemoryStore:
         """
         return next((user for user in self._users.values() if user.id == user_id), None)
 
-    def add(self, obj: User | UserSession | TotpEnrollment | TotpFailure) -> None:
+    def invitation_by_hash(self, token_hash: str) -> Invitation | None:
+        """Зеркало `SqlStore.invitation_by_hash`: приглашение по хэшу значения ссылки.
+
+        Предикат и проверка формы скопированы побайтово. Чего память не доказывает: что хэш
+        доживает до базы в виде колонки с `UNIQUE` и что поиск попадает в индекс, а не
+        вычитывает таблицу. Это держит `tests/integration/test_invitations_db.py` (job
+        `миграции`) — там же, где проверяется `CHECK` формата хэша резервных кодов.
+        """
+        if not is_sha256_hex(token_hash):
+            return None
+        return next((row for row in self._invitations if row.token_hash == token_hash), None)
+
+    def invitation_of_id(self, invitation_id: UUID) -> Invitation | None:
+        """Зеркало `SqlStore.invitation_of_id`: приглашение по `id`."""
+        return next((row for row in self._invitations if row.id == invitation_id), None)
+
+    def accounts(
+        self,
+        *,
+        states: Sequence[str] | None = None,
+        role: str | None = None,
+        limit: int = ACCOUNTS_LIST_LIMIT,
+    ) -> tuple[User, ...]:
+        """Зеркало `SqlStore.accounts`: фильтры по состоянию и роли.
+
+        Порядок здесь — порядок добавления, а не `created_at`: у объектов, не проходивших `INSERT`,
+        серверного значения `created_at` нет, и изобретать его в памяти означало бы проверять
+        сортировку по выдуманному полю. Что список отсортирован по `created_at` и что потолок
+        `LIMIT` применяется в запросе, держит живой файл `tests/integration/test_invitations_db.py`.
+        """
+        rows = [
+            user
+            for user in self._users.values()
+            if (states is None or user.state in set(states)) and (role is None or user.role == role)
+        ]
+        return tuple(rows[: min(int(limit), ACCOUNTS_LIST_LIMIT)])
+
+    def pending_invitations(self, *, limit: int = ACCOUNTS_LIST_LIMIT) -> tuple[Invitation, ...]:
+        """Зеркало `SqlStore.pending_invitations`: только `pending`, срок не фильтруется.
+
+        Просроченные выпуски остаются в списке и здесь — не потому, что память о сроке не знает,
+        а потому что признак живости решает домен (`ensure_invitation_open`), и у слоя доступа
+        не должно быть своего календаря.
+        """
+        return tuple(row for row in self._invitations if row.state == "pending")[
+            : min(int(limit), ACCOUNTS_LIST_LIMIT)
+        ]
+
+    def claim_invitation(self, *, invitation_id: UUID, now: datetime) -> bool:
+        """Зеркало `SqlStore.claim_invitation`: тот же предикат перехода, что в guarded-`UPDATE`.
+
+        Чего память не доказывает: что переход атомарен. Два «параллельных» приёма одной ссылки
+        физически не приходят, поэтому форма «нашли — пометили» прошла бы здесь так же зелёно;
+        гонку приёма с отзывом держит живой файл `tests/integration/test_invitations_db.py`
+        (job `миграции`) — ровно так же, как `test_backup_code_single_use` держит её для
+        резервных кодов.
+        """
+        for row in self._invitations:
+            if row.id == invitation_id and row.state == "pending" and row.expires_at > now:
+                row.state = "used"
+                row.used_at = now
+                return True
+        return False
+
+    def revoke_invitation_row(self, *, invitation_id: UUID) -> bool:
+        """Зеркало `SqlStore.revoke_invitation_row`: переход `pending` → `revoked`."""
+        for row in self._invitations:
+            if row.id == invitation_id and row.state == "pending":
+                row.state = "revoked"
+                return True
+        return False
+
+    def active_admin_count(self, *, except_user_id: UUID | None = None) -> int:
+        """Зеркало `SqlStore.active_admin_count`: сколько `admin` остаются в `active`."""
+        return sum(
+            1
+            for user in self._users.values()
+            if user.role == ROLE_ADMIN
+            and user.state == CONSOLE_STATE
+            and (except_user_id is None or user.id != except_user_id)
+        )
+
+    def add(self, obj: User | UserSession | TotpEnrollment | TotpFailure | Invitation) -> None:
         if isinstance(obj, UserSession):
             self._sessions[obj.token_hash] = obj
         elif isinstance(obj, TotpEnrollment):
             self._enrollments[obj.id] = obj
         elif isinstance(obj, TotpFailure):
             self._totp_failures.append(obj)
+        elif isinstance(obj, Invitation):
+            # отдельный список, а не словарь: открытым может быть не более одного выпуска на
+            # учётную запись, но это держит частичный уникальный индекс, а не структура памяти
+            self._invitations.append(obj)
         else:
             # пользователь: `login` — ключ, регистронезависимость та же, что у `citext`
             self._users[obj.login.casefold()] = obj

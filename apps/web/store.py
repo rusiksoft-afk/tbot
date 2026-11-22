@@ -62,10 +62,13 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from packages.common.config import Settings
 from packages.common.db import sqlalchemy_url
+from packages.identity.authorization import ROLE_ADMIN
 from packages.identity.backup_codes import BackupCodeError, is_sha256_hex
 from packages.identity.passwords import hash_password, verify_password
+from packages.identity.users import CONSOLE_STATE
 from packages.storage.models import (
     BackupCode,
+    Invitation,
     RateBucket,
     TotpEnrollment,
     TotpFailure,
@@ -77,6 +80,12 @@ from packages.storage.models import (
 #: а колонка `sessions.user_agent` — `TEXT` без CHECK (при этом §8.3 показывает её пользователю в
 #: списке устройств). Ограничение держит приложение, потому что база его не держит.
 USER_AGENT_MAX_LEN: int = 256
+
+#: Потолок списка учётных записей и приглашений (§9.3 п. 6). Строка `users` растёт приглашениями
+#: и архивированием, поэтому порядок величины здесь — десятки, а не миллионы; потолок нужен не для
+#: производительности, а чтобы у маршрута не появилось соблазна вытащить таблицу целиком.
+#: Постраничность — за кадром этого среза (`ADR-020` п. 8).
+ACCOUNTS_LIST_LIMIT: int = 200
 
 
 class StoreUnavailableError(RuntimeError):
@@ -151,7 +160,99 @@ class Store(Protocol):
         403/404 без утечки»). Ключ — `id` первичный, поэтому отдельного индекса не требуется.
         """
 
-    def add(self, obj: User | UserSession | TotpEnrollment | TotpFailure) -> None:
+    def invitation_by_hash(self, token_hash: str) -> Invitation | None:
+        """Приглашение по хэшу значения из ссылки (`T-105`, §1.2, `ADR-020` п. 3).
+
+        Искать по значению ссылки, а не по `id`, приходится потому, что письмо содержит только
+        ссылку: `id` строки в ней нет и быть не должно (передаваемый идентификатор строки — это
+        ещё и способ перебирать строки, меняя один символ). Хэш уникальный (`UNIQUE`), поэтому
+        `scalar_one_or_none`.
+
+        Возвращается строка в любом её состоянии — просроченная, использованная и отозванная.
+        Решение о том, что с ней делать, принимает домен (`ensure_invitation_open`), и это тот же
+        порядок, что с сессиями: слой доступа находит запись, а живая она или нет, решает
+        `packages/identity`. Если бы здесь же фильтровали по `expires_at`, в слое доступа
+        поселился бы второй календарь, а отказ «приглашение протухло» начал бы зависеть от часов
+        контейнера и часов базы по-разному в двух местах (§2.7).
+        """
+
+    def invitation_of_id(self, invitation_id: UUID) -> Invitation | None:
+        """Приглашение по `id` — для отзыва из списка (§9.3 п. 6 «список приглашений»).
+
+        `id` сюда приходит из формы, и сам по себе он ничего не даёт: значение ссылки из письма
+        в этом пути не участвует. Перебирать идентификаторы строк подбором нельзя по
+        `ADR-020` п. 3 (UUIDv7 выдаёт приложение). Строка возвращается в любом состоянии:
+        «отзывать уже отозванное» различает домен, а не слой доступа.
+        """
+
+    def accounts(
+        self,
+        *,
+        states: Sequence[str] | None = None,
+        role: str | None = None,
+        limit: int = ACCOUNTS_LIST_LIMIT,
+    ) -> tuple[User, ...]:
+        """Строки `users` по фильтру состояния и роли: очередь одобрения и список учётных записей.
+
+        §9.3 п. 6 требует и то, и другое на одном разделе; §1.2 описывает очередь как «учётные
+        записи, которые ждут второго шага». Один метод на оба списка намеренно: второй список
+        отличается только фильтром, и заводить отдельный запрос значило бы держать два правила
+        отбора, из которых одно когда-нибудь отстанет от другого.
+
+        Порядок — по `created_at` (новые позже), потолок — `ACCOUNTS_LIST_LIMIT`. Фильтр по
+        состоянию принимает значения из домена `users.state`; `states=None` — все состояния,
+        включая `archived`: список отзывов (§1.2 «отказ выражается архивированием») без архивных
+        строк не собирается. Значение состояния вне домена запросом не отсеивается молча — его
+        обязана заметить доменная проверка (`ensure_account_state`), иначе опечатка в фильтре
+        выглядела бы как «таких учётных записей нет».
+        """
+
+    def pending_invitations(self, *, limit: int = ACCOUNTS_LIST_LIMIT) -> tuple[Invitation, ...]:
+        """Неиспользованные и неотозванные выпуски — список приглашений (§9.3 п. 6).
+
+        Просроченные в этот список попадают: `state` у них остаётся `pending`, а срок — отдельное
+        свойство (`expires_at`). Фильтровать срок здесь нельзя по той же причине, по которой
+        нельзя фильтровать его в `invitation_by_hash`: в слое доступа поселился бы второй
+        календарь, и «приглашение протухло» зависело бы от часов процесса в одном месте и от
+        часов базы в другом (§2.7). То, что выпуск просрочен, показывает интерфейс.
+        """
+
+    def claim_invitation(self, *, invitation_id: UUID, now: datetime) -> bool:
+        """Заявить ссылку: `pending` → `used` одним guarded-`UPDATE` (`ADR-020` п. 4).
+
+        Один запрос, а не «прочитали состояние — решили — записали»: параллельный отзыв
+        (`revoke_invitation_row`) и параллельный приём одной и той же ссылки встречаются в реальном
+        времени, и «нашёл — пометил» нарисовал бы учётную запись поверх уже отозванного выпуска.
+        Тот же приём, что `claim_totp_step` и `spend_backup_code`.
+
+        Условие включает и срок (`expires_at > :now`): приём обязан сравниваться с теми же часами,
+        которые записали `expires_at` (их ставит процесс в `new_invitation`). Отметку `used_at`
+        ставит база (`now()`): это штамп, а не операнд сравнения, и остальные штампы этого слоя
+        тоже ставит база (`ADR-016` п. 6 — тот же довод про пару дат из одних часов).
+        """
+
+    def revoke_invitation_row(self, *, invitation_id: UUID) -> bool:
+        """Отозвать выпуск guarded-`UPDATE` по строке: `pending` → `revoked`.
+
+        Второй конец той же гонки: `WHERE state = 'pending'` обязан быть в запросе, иначе отзыв
+        победил бы уже состоявшийся приём, и учётная запись осталась бы созданной по
+        «отозванному» приглашению — то есть журнал показал бы доступ, которого по записи нет.
+        `rowcount = 0` означает «уже не открыто»; чем это является для человека (ошибкой или
+        «уже отозвано»), решает домен (`packages/identity/invitations.revoke_invitation`), а не
+        этот слой.
+        """
+
+    def active_admin_count(self, *, except_user_id: UUID | None = None) -> int:
+        """Сколько администраторов остаются в `active` — кроме названной учётной записи.
+
+        Нужно проверке «не остаться без администратора» (`ADR-020` п. 6): блокировка и
+        архивирование применяются к живому человеку, и единственная учётная запись с правами
+        `admin`, ушедшая в `suspended`, оставила бы систему без того, кто способен включить её
+        обратно. Счёт считает именно `active` (а не все строки с ролью `admin`), потому что
+        архивированный администратор раздать приглашение не может.
+        """
+
+    def add(self, obj: User | UserSession | TotpEnrollment | TotpFailure | Invitation) -> None:
         """Поставить объект в транзакцию текущего запроса.
 
         `RateBucket` в перечне намеренно нет: счётчик двигается только через `bump_rate_bucket`, а
@@ -413,7 +514,91 @@ class SqlStore:
     def user_of_id(self, user_id: UUID) -> User | None:
         return self._session.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
 
-    def add(self, obj: User | UserSession | TotpEnrollment | TotpFailure) -> None:
+    def invitation_by_hash(self, token_hash: str) -> Invitation | None:
+        if not is_sha256_hex(token_hash):
+            # Форма та же, что у хэшей резервных кодов: 64 hex-символа SHA-256, и её держит та же
+            # функция. Значение ссылки контролирует клиент, поэтому хэш чужой формы не обязан
+            # доходить до базы: пустой ответ по формату неотличим от пустого ответа по
+            # несуществующей строке (`ADR-020` п. 3).
+            return None
+        return self._session.execute(
+            select(Invitation).where(Invitation.token_hash == token_hash)
+        ).scalar_one_or_none()
+
+    def invitation_of_id(self, invitation_id: UUID) -> Invitation | None:
+        return self._session.execute(
+            select(Invitation).where(Invitation.id == invitation_id)
+        ).scalar_one_or_none()
+
+    def accounts(
+        self,
+        *,
+        states: Sequence[str] | None = None,
+        role: str | None = None,
+        limit: int = ACCOUNTS_LIST_LIMIT,
+    ) -> tuple[User, ...]:
+        statement = select(User)
+        if states is not None:
+            statement = statement.where(User.state.in_(tuple(states)))
+        if role is not None:
+            statement = statement.where(User.role == role)
+        statement = statement.order_by(User.created_at, User.id).limit(
+            min(int(limit), ACCOUNTS_LIST_LIMIT)
+        )
+        return tuple(self._session.execute(statement).scalars())
+
+    def pending_invitations(self, *, limit: int = ACCOUNTS_LIST_LIMIT) -> tuple[Invitation, ...]:
+        statement = (
+            select(Invitation)
+            .where(Invitation.state == "pending")
+            .order_by(Invitation.created_at, Invitation.id)
+            .limit(min(int(limit), ACCOUNTS_LIST_LIMIT))
+        )
+        return tuple(self._session.execute(statement).scalars())
+
+    def claim_invitation(self, *, invitation_id: UUID, now: datetime) -> bool:
+        statement = (
+            update(Invitation)
+            .where(
+                Invitation.id == invitation_id,
+                Invitation.state == "pending",
+                # Срок сравнивается прикладными часами: их же значение записано в `expires_at`
+                # (`new_invitation`), поэтому сравнение идёт с одним источником времени.
+                Invitation.expires_at > now,
+            )
+            .values(state="used", used_at=func.now())
+            # `synchronize_session=False` — как у `claim_totp_step`: объект, который вызывающий
+            # читал до перехода, намеренно остаётся несинхронизированным, а лишний `SELECT` перед
+            # `UPDATE` только добавил бы окно между чтением и переходом.
+            .execution_options(synchronize_session=False)
+        )
+        result = cast("CursorResult[Any]", self._session.execute(statement))
+        return bool(result.rowcount == 1)
+
+    def revoke_invitation_row(self, *, invitation_id: UUID) -> bool:
+        statement = (
+            update(Invitation)
+            .where(Invitation.id == invitation_id, Invitation.state == "pending")
+            .values(state="revoked")
+            .execution_options(synchronize_session=False)
+        )
+        result = cast("CursorResult[Any]", self._session.execute(statement))
+        return bool(result.rowcount == 1)
+
+    def active_admin_count(self, *, except_user_id: UUID | None = None) -> int:
+        statement = (
+            select(func.count())
+            .select_from(User)
+            .where(
+                User.role == ROLE_ADMIN,
+                User.state == CONSOLE_STATE,
+            )
+        )
+        if except_user_id is not None:
+            statement = statement.where(User.id != except_user_id)
+        return int(self._session.execute(statement).scalar_one())
+
+    def add(self, obj: User | UserSession | TotpEnrollment | TotpFailure | Invitation) -> None:
         self._session.add(obj)
 
     def active_enrollment(self, user_id: UUID) -> TotpEnrollment | None:
