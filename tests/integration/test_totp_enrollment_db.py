@@ -43,7 +43,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Final
 
 import pytest
-from sqlalchemy import Engine, create_engine, delete, event, func, select, text, update
+from sqlalchemy import Engine, create_engine, delete, event, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -169,18 +169,14 @@ def _выдать(db: Session, user: User, *, now: datetime = _NOW) -> TotpEnrol
 def _подтвердить(db: Session, привязка: TotpEnrollment, *, now: datetime = _NOW) -> None:
     """Подтверждение строки без подбора пар кодов: здесь проверяется состояние, а не подбор.
 
-    `confirmed_at` ставится `UPDATE`-ом, а не атрибутом объекта: право подтверждать
-    привязку у доменного слоя есть только у `confirm_enrollment`, а вызывать её здесь
-    означало бы проверять подбор пар кодов вместо состояния строки.
+    Право подтверждать привязку у доменного слоя есть только у `confirm_enrollment`, а
+    вызывать её здесь означало бы проверять подбор пар кодов вместо состояния строки. Поэтому
+    поле ставится атрибутом объекта и фиксируется `commit()`-ом: один `UPDATE` происходит до
+    очистки перехваченных запросов, и после него объект не остаётся «грязным» — иначе проверка
+    числа обновлений в тесте одноразовости посчитала бы и этот `UPDATE` тоже.
     """
-    подтверждена = now + timedelta(seconds=1)
-    db.execute(
-        update(TotpEnrollment)
-        .where(TotpEnrollment.id == привязка.id)
-        .values(confirmed_at=подтверждена)
-    )
+    привязка.confirmed_at = now + timedelta(seconds=1)
     db.commit()
-    привязка.confirmed_at = подтверждена
 
 
 def _отозвать(db: Session, привязка: TotpEnrollment, *, now: datetime = _NOW) -> None:
@@ -211,7 +207,11 @@ def _шаг_из_базы(engine: Engine, привязка_id: uuid.UUID) -> int
 
 
 def _обновления_привязок(запросы: list[str]) -> list[str]:
-    return [sql for sql in запросы if sql.lstrip().upper().startswith("UPDATE totp_enrollments")]
+    # Сравнение идёт по верхней границе регистра, потому что текст запроса нормализуется
+    # (`lstrip().upper()`): писать `startswith("UPDATE totp_enrollments")` после `upper()` —
+    # собственный дефект проверки: фильтр не находит ничего, цикл по пустому списку проходит,
+    # и проверка превращается в пустую (замер: первый прогон CI, 2026-11-22).
+    return [sql for sql in запросы if sql.lstrip().upper().startswith("UPDATE TOTP_ENROLLMENTS")]
 
 
 # ─── одна действующая привязка на учётку (частичный уникальный индекс) ─────────────────────────
@@ -348,8 +348,9 @@ def test_шаг_занимается_один_раз_и_только_выше_з
 
     обновления = _обновления_привязок(запросы)
     assert len(обновления) == 4, (
-        f"на четыре занятия шага пришлось {len(обновления)} обновлений: лишние обращения "
-        "(например SELECT перед UPDATE) означают не-атомарную форму"
+        f"на четыре занятия шага пришлось {len(обновления)} обновлений из "
+        f"{len(запросы)} перехваченных запросов: лишние обращения (например SELECT перед UPDATE) "
+        "означают не-атомарную форму"
     )
     for sql in обновления:
         assert "last_used_step IS NULL OR" in sql, f"в `UPDATE` нет ветки NULL: {sql}"
