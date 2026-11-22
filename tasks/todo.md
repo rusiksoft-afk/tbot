@@ -509,10 +509,29 @@
   - Приёмка: `REQ-identity-02/03`
   - Проверка: `test_no_public_registration` (сканирование маршрутов), `test_invitation_flow`
   - Файлы: `packages/identity/invitations.py`, `apps/web/routes/admin_users.py`
-- [ ] **T-106** Роли и авторизация на уровне сервиса: admin/operator/viewer, 403 без утечки, проверка владения объектом
+- [x] **T-106** Роли и авторизация на уровне сервиса: admin/operator/viewer, 403 без утечки, проверка владения объектом
   - Приёмка: `AC-identity-01`, TZ §1.1
   - Проверка: `test_role_matrix` (все маршруты × все роли)
   - Файлы: `packages/identity/authorization.py`, тесты
+  - Закрыта срезом 2026-11-22 (коммит `12abe40`, разбор — `docs/HANDOFF.md` §1.47, оформление —
+    `docs/adr/ADR-017`): закрытый набор ролей и лестница `viewer ⊂ operator ⊂ admin` на уровне
+    домена (`packages/identity/authorization.py`, значение вне набора не получает прав и не
+    нормализуется — CHECK `ck_users_role` отвергает его и на базе), два уровня допуска из карты
+    страниц §9.3 (`CONSOLE_TIER` = «любая роль» для профиля и безопасности, `ADMIN_TIER` = `admin`
+    для раздела администрирования), отказ `403` с одним телом на все причины и все маршруты и
+    зависимость роли **до** обращения к объекту (`apps/web/security/authorization.py`), охраняемый
+    адрес `GET /admin/users` поставлен до содержимого раздела, потому что `AC-identity-01` требует
+    отказа на реальном адресе, владение объектом — условие SQL плюс `owner_matches` («чужой живой
+    сеанс» и «идентификатор, которого не существовало» отвечают одинаково). Проверка:
+    `test_role_matrix` параметризована таблицей `ROUTE_POLICY` (51 пара маршрут × метод, три роли)
+    в `tests/integration/test_web_role_matrix.py` (27 проверок: `AC-identity-01`, побайтовая
+    одинаковость отказа для `operator` и `viewer`, «шаг входа важнее роли», владение объектом,
+    немедленная смена роли, выход без роли), плюс статический контракт покрытия
+    `tests/contract/test_web_roles_contract.py` (7 проверок) и
+    `tests/unit/test_authorization_roles.py` (14 проверок, сверка набора ролей с кодом, моделью и
+    ревизией `0002`). Остаток по границе других задач, не по этой: `state` учётной записи
+    (`invited`, `awaiting_approval`, `suspended`) и содержимое `/admin/users` — `T-105`; алерты и
+    записи `audit_log` об отказах допуска — `T-109` и `T-716`.
 - [ ] **T-107** KEK/DEK и шифрование токенов: AES-256-GCM + AAD, `key_version`, `make rotate-keys`, тесты дешифрования
   - Приёмка: `REQ-credentials-05`, `AC-credentials-05`
   - Проверка: `test_vault_roundtrip`, `test_no_plaintext_in_db_dump`, `make secret-scan`
