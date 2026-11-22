@@ -134,8 +134,33 @@ SQL
 # 1) Роль обязана получить пароль и LOGIN до перезапуска сервисов, иначе приложение отвалится с
 #    `password authentication failed for user "tbot_app"`. Значение берётся из смонтированного
 #    секрета внутри контейнера и не попадает в argv (в `ps` видно только текст команды).
-$COMPOSE exec -T postgres sh -c   'printf "ALTER ROLE tbot_app PASSWORD %L; ALTER ROLE tbot_app LOGIN;
-"      "$(cat /run/secrets/db_password)" | psql -q -X -v ON_ERROR_STOP=1 -U tbot -d tbot'
+#    Замер 2026-11-22 13:07 UTC: прежняя форма с `printf ... %L` в ЭТОМ контейнере нерабочая —
+#    `/bin/sh` образа `postgres:16.4` это dash, а `%L` расширение bash. Ответ:
+#    `sh: 1: printf: %L: invalid directive`, дальше psql получает обрывок
+#    `ALTER ROLE tbot_app PASSWORD ` и отвечает `syntax error at end of input`; код возврата при
+#    этом у конвейера нулевой (последнее звено — psql с empty input), то есть дефект тихий.
+#    Рабочая форма: SQL собирается на хосте (значение уже прошло проверку формы скрипта —
+#    `[A-Za-z0-9._~-]{16,64}`, кавычка внутрь значения попасть не может), файл 600 root, подаётся
+#    в psql по stdin и уничтожается сразу.
+sudo python3 - <<'PY'
+import pathlib
+v = pathlib.Path('/etc/tbot/secrets/db_password').read_text().strip()
+assert 16 <= len(v) <= 64 and all(c.isalnum() or c in '._~-' for c in v), 'нестандартная форма — ALTER не выполняется'
+pathlib.Path('/root/role-password.sql').write_text(
+    f"ALTER ROLE tbot_app PASSWORD '{v}';\nALTER ROLE tbot_app LOGIN;\n"
+    f"ALTER ROLE tbot PASSWORD '{v}';\n")
+pathlib.Path('/root/role-password.sql').chmod(0o600)
+PY
+sudo cat /root/role-password.sql | $COMPOSE exec -T postgres psql -q -X -v ON_ERROR_STOP=1 -U tbot -d tbot
+sudo shred -u /root/role-password.sql
+#    Пароль обязан получить и `tbot` (роль-владельцем, она же роль-мигратор по `ADR-018`): файл
+#    `db_password` — общий для обеих ролей (`ADR-006`), поэтому ротация обязана применять его к
+#    обеим, иначе путь миграций отвалится с `password authentication failed for user "tbot"`.
+#    Проверка «значение действительно сменилось»: значения не печатаются, смотрим только
+#    отпечатки SCRAM-верификаторов (первые 12 знаков sha256 от хеша):
+$COMPOSE exec -T postgres psql -qX -U tbot -d tbot -c "select rolname, rolcanlogin, rolsuper, left(encode(sha256(rolpassword::bytea),'hex'),12) as verif12 from pg_authid where rolname in ('tbot','tbot_app') order by 1" < /dev/null
+#    Грабля в самой проверке: `left(sha256(...),12)` не работает (`sha256` отдаёт `bytea`,
+#    `ERROR: function left(bytea, integer) does not exist`) — нужен `encode(...,'hex')`.
 
 # 2) Пересобрать `db_url` с новым пользователем (значение не показывается). Форма запуска —
 #    `--only`, а НЕ позиционные имена: замер на площадке 2026-11-21 01:08 UTC,

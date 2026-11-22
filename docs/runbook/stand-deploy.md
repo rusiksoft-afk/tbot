@@ -31,18 +31,21 @@
 
 ```bash
 sudo install -d -m 750 /opt/tbot
-sudo ssh-keygen -t ed25519 -f /root/.ssh/tbot_deploy_key -N '' -C 'deploy-key/tbot-vm-2026-11-20'  # уже создан 2026-11-20 — не пересоздавать
-sudo cat /root/.ssh/tbot_deploy_key.pub          # публичная часть — не секрет
+sudo ssh-keygen -t ed25519 -f /root/.ssh/tbot_deploy_key_20261122 -N '' \
+  -C 'tbot-deploy-key-2026-11-22/rotation-ADR-019'  # создан 2026-11-22, не пересоздавать
+sudo cat /root/.ssh/tbot_deploy_key_20261122.pub # публичная часть — не секрет
 # владелец репозитория добавляет её: Settings → Deploy keys → Add (не ставить write access)
 sudo sh -c 'ssh-keyscan -t ed25519 github.com >> /root/.ssh/known_hosts'
 # Ключ назван НЕ id_ed25519 — ssh сам его не предложит (он перебирает только id_*), поэтому
 # путь обязан быть указан явно и для проверки, и для клона:
-KEYOPTS="-o IdentitiesOnly=yes -o BatchMode=yes -i /root/.ssh/tbot_deploy_key"
+KEYOPTS="-o IdentitiesOnly=yes -o BatchMode=yes -i /root/.ssh/tbot_deploy_key_20261122"
 sudo ssh $KEYOPTS -T git@github.com        # ожидание: Hi rusiksoft-afk/tbot! …
 sudo GIT_SSH_COMMAND="ssh $KEYOPTS -o StrictHostKeyChecking=accept-new" \
   git clone git@github.com:rusiksoft-afk/tbot.git /opt/tbot
 cd /opt/tbot && git log --oneline -1
 ```
+
+**Статус на 2026-11-22 (ротация после перехода в публичный режим, `ADR-019`):** ключ от 2026-11-20 **отозван**: запись deploy key удалена из репозитория агентом по решению заказчика о ротации (ask `1dc0e2a8-b664-458e-ab28-6b8b06be17fb`). Рабочий файл на ВМ — `/root/.ssh/tbot_deploy_key_20261122` (600 `root:root`, `.pub` 644), в репозитории — deploy key `prod-vm-tbot-2026-11-22` (id `170741500`) с `read_only=true`, отпечаток `SHA256:IyvhuQQybp8m2dtinPdw/dAUw1EAz9dvidK/ninEj90`. Прежний deploy key `prod-vm-tbot` (id `170553844`, отпечаток `SHA256:bYb6ZnLlpjbjQoAG3GomNid/zWuRgL0yXvr8N6KVYxI`) удалён, проба им после отзыва даёт `Permission denied (publickey)` — это и есть доказательство отзыва. Файлы прежнего ключа сохранены на ВМ как `tbot_deploy_key{,.pub}.revoked-20261122`: отозванная приватная часть бесполезна, публичная нужна для сопоставления отпечатка в приёмке. Процедура целиком — `docs/runbook/secret-rotation.md` §4. Абзац «Статус на 2026-11-20» ниже описывает историю, а не рабочее состояние.
 
 **Статус на 2026-11-20:** ключ уже создан на ВМ (`/root/.ssh/tbot_deploy_key` 600 root:root,
 `.pub` 644), пересоздавать его нельзя — публичная часть будет добавлена заказчиком как deploy key
