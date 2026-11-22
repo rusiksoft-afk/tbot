@@ -36,7 +36,8 @@
 DO $guard$ … IF current_user = 'tbot_app' THEN RAISE EXCEPTION …  -- п. 0: файл идёт владелец схемы
 CREATE ROLE tbot_app NOLOGIN                       -- один раз (DO-блок по pg_roles)
 ALTER ROLE tbot_app NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS
-GRANT USAGE, CREATE ON SCHEMA public TO tbot_app   -- пользоваться схемой и создавать таблицы
+GRANT USAGE ON SCHEMA public TO tbot_app            -- пользоваться схемой
+REVOKE CREATE ON SCHEMA public FROM tbot_app       -- но не создавать в ней объекты (`ADR-018`)
 REVOKE CREATE ON SCHEMA public FROM PUBLIC         -- но не любой вход в базу
 ALTER TABLE audit_log OWNER TO CURRENT_USER        -- п. 2.1: журнал принадлежит владельцу схемы
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO tbot_app
@@ -48,10 +49,14 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE ON SEQUENCES TO tbot_app
 GRANT tbot_app TO CURRENT_USER                     -- чтобы проверить права через SET ROLE
 ```
 
-Право `CREATE` на схему и возврат владения журналом появились по решению заказчика от 2026-11-21
-(ask `8d2be9bb`, вариант Б): миграции `alembic` в этом составе идут той же ролью, что и приложение,
-а без права на схему следующая ревизия падает (`42501 permission denied for schema public` —
-замер на площадке). Цена и компенсирующий контроль — §5.1.
+Возврат владения журналом и точечные отзывы появились по решению заказчика от 2026-11-21
+(ask `8d2be9bb`, вариант Б). Право `CREATE` на схему тогда выдавалось именно потому, что
+миграции шли ролью приложения. С 2026-11-22 оно **отозвано**: `alembic` ходит ролью-
+владельцем схемы (`ADR-018`, ask `c7a6830e-9722-491d-9dbf-c8b291d3e84d`), потому что ревизии
+правят таблицы, созданные другой ролью, и под ролью приложения такой DDL отказывает
+(`42501 must be owner of table sessions` — реальный сбой деплоя 2026-11-22). Отзыв в файле
+прав обязателен, а не косметичен: на площадке право уже выдано, а файл исполняется повторно.
+Компенсирующий контроль журнала — §5.1, роль миграций — §5.4.
 
 `TRUNCATE`, `REFERENCES` и `TRIGGER` отзываются, потому что журнал нельзя ни очистить пачкой,
 ни сделать целью внешних ключей из новых таблиц, ни обвесить триггерами, меняющими правило
@@ -228,6 +233,11 @@ PY
 
 ### 5.1 `migrate` монтирует тот же секрет `db_url`: решение — вариант Б
 
+> **Заменено `ADR-018` (2026-11-22).** Секрет остаётся тот же и второй DSN не вводится —
+> это часть `ADR-006` в силе. Изменилось только то, **какая роль** берётся из этого
+> секрета для `migrate`: `TBOT_MIGRATION_DB_USER` (§5.4). Раздел ниже оставлен без правок,
+> потому что это запись решения и его цены на 2026-11-21.
+
 Замер на площадке 2026-11-21 01:00 UTC (`SET ROLE tbot_app` после применения `roles.sql`):
 
 ```
@@ -259,6 +269,27 @@ ALTER TABLE audit_log:              отказ SQLSTATE=42501
 Практическое правило для следующей ревизии с новой таблицей журнала: добавить имя в
 `APPEND_ONLY_TABLES` (`packages/storage/base.py`), добавить `ALTER TABLE … OWNER TO CURRENT_USER`
 в п. 2.1 и `REVOKE` в п. 4 `roles.sql`, затем применить файл на площадке — он идемпотентен.
+
+### 5.4 Роль миграций (`ADR-018`, 2026-11-22)
+
+Нового секрета нет: `migrate` получает переменную `TBOT_MIGRATION_DB_USER` в
+`deploy/compose.yaml` (у `web`, `engine`, `jobs` и `tgbot` её нет), а `migrations/env.py`
+меняет **имя пользователя** в адресе из `db_url`, сохраняя пароль
+(`packages.common.db.migration_url`). Проверка, что роль действительно та же, что и владелец
+таблиц:
+
+```bash
+# кто владеет таблицами
+sudo docker exec tbot-postgres-1 psql -U tbot -d tbot -c \
+  "select tablename, tableowner from pg_tables where schemaname='public' order by 2,1"
+# применяет ли миграции именно эта роль
+sudo docker compose -f /opt/tbot/deploy/compose.yaml \
+  -f /opt/tbot/deploy/compose.prod.yaml \
+  --env-file /opt/tbot/deploy/tbot.prod.env run --rm migrate alembic current
+```
+
+Без переменной поведение прежнее: роль берётся из `db_url`. Так работают CI-job `миграции`
+и dev-команда `make migrate`, где роль в адресе уже владелец схемы.
 
 ## 6. Откат шага 5
 

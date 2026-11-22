@@ -200,6 +200,13 @@ class Settings(BaseSettings):
     jobs_health_port: int = Field(default=9103, ge=1, le=65535)
 
     db_url: SecretStr | None = None
+    # Роль, под которой Alembic применяет ревизии (`ADR-018`). Имя роли — не секрет: пароль
+    # остаётся тем же значением в том же файле `db_url`, второго DSN-секрета нет.
+    # Читает её только `migrations/env.py` (через `packages.common.db.migration_url`):
+    # `web`, `engine`, `jobs` и `tgbot` соединяются ролью из `db_url` и это поле игнорируют —
+    # иначе ограниченный рантайм-процесс сам выбирал бы себе роль-владельца схемы. Держит
+    # контракт `test_роль_мигратора_не_попадает_в_рантайм_процессы`.
+    migration_db_user: str | None = None
     tg_bot_token: SecretStr | None = None
     tg_socks_password: SecretStr | None = None
 
@@ -240,6 +247,12 @@ class Settings(BaseSettings):
         filled = self._load_secret_files()
         if filled.telegram.socks_user and not filled.telegram.socks_host:
             reasons.append("для SOCKS-пользователя должен быть задан хост")
+        if self.migration_db_user is not None and not self.migration_db_user.strip():
+            reasons.append(
+                "TBOT_MIGRATION_DB_USER задан пустым: роль-мигратор обязан быть назван именем "
+                "роли либо не задан вовсе (ADR-018); пустое значение дало бы адрес без имени "
+                "пользователя"
+            )
         if reasons:
             raise ConfigError(reasons)
         return filled

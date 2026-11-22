@@ -160,3 +160,51 @@ def test_неизвестный_ключ_верхнего_уровня_откл�
     config_file.write_text("contour: sandbox\nunknown_section: {}\n", encoding="utf-8")
     with pytest.raises(ConfigError):
         load_settings(config_file)
+
+
+# ─── роль-мигратор (`ADR-018`) ────────────────────────────────────────────────
+
+
+def test_роль_мигратора_по_умолчанию_не_задана() -> None:
+    """Без `TBOT_MIGRATION_DB_USER` поведение прежнее: роль берётся из адреса.
+
+    Так работают job `миграции` в CI и dev-команда `make migrate`, где роль в адресе уже
+    владелец схемы. Пустое значение по умолчанию — не «отсутствие роли», а «не подменять».
+    """
+    assert Settings().migration_db_user is None
+
+
+def test_роль_мигратора_читается_из_окружения(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`TBOT_MIGRATION_DB_USER` — имя роли, а не секрет: пароль остаётся в `db_url`.
+
+    Значение не должно попадать ни в YAML, ни в файлы секретов: проверяется, что переменная
+    с префикса `TBOT_` доходит до поля (иначе compose её объявляет, а код не читает).
+    """
+    monkeypatch.setenv("TBOT_SECRETS_DIR", str(tmp_path))
+    monkeypatch.setenv("TBOT_MIGRATION_DB_USER", "tbot")
+    assert load_settings().migration_db_user == "tbot"
+
+
+def test_пустое_имя_роли_мигратора_отклоняется() -> None:
+    """Пустая строка дала бы адрес без имени пользователя вместо «не подменять».
+
+    Отдельная причина: `${VAR:-tbot}` в compose при пустом `VAR` в env-файле площадки
+    подставляет пустую строку, и молча соединяться «без пользователя» нельзя.
+    """
+    with pytest.raises(ConfigError) as excinfo:
+        make_settings(migration_db_user="   ")
+    assert any("TBOT_MIGRATION_DB_USER" in reason for reason in excinfo.value.reasons)
+
+
+def test_роль_мигратора_не_ищется_среди_секретов() -> None:
+    """Имя роли не должно попасть в перечень секретных файлов `secrets_dir`.
+
+    Иначе на площадке от неё потребовался бы файл в `/etc/tbot/secrets` — то есть второй
+    DSN-подобный секрет, от которого отказался заказчик (`ADR-006`, вариант А).
+    """
+    from packages.common.config import SECRET_FIELDS
+
+    assert "migration_db_user" not in SECRET_FIELDS
+    assert "migration_db_user" in Settings.model_fields

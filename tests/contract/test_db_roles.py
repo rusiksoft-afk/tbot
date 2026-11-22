@@ -10,15 +10,16 @@
 * файл не содержит секретов и не выдаёт прав уровня кластера (ADR-004: значения живут в
   `secrets-setup.sh`, здесь — только имена ролей и права);
 * есть `ALTER DEFAULT PRIVILEGES`: иначе следующая ревизия создаст таблицу, которой прав не хватит;
-* право `CREATE` на схему выдано явно (миграции идут ролью приложения — решение заказчика,
-  вариант Б), и каждая таблица реестра append-only возвращается роли-владельцу: иначе следующая
-  таблица журнала, созданная приложением, оказалась бы защищённой только комментарием;
+* право `USAGE` на схему выдано явно, а `CREATE` у рантайм-роли отозван: DDL делает
+  роль-мигратор (`ADR-018`), и каждая таблица реестра append-only возвращается роли-владельцу —
+  иначе следующая таблица журнала оказалась бы защищённой только комментарием;
 * файл отказывается работать, если его запускает роль приложения (`OWNER TO CURRENT_USER`
   иначе передал бы владение журналу самому приложению);
 * проверки прав не исчезли из CI (шаги job'а `migrations`);
-* модель ролей и общий пароль роли приложения закреплены решением заказчика в ADR-006, а в
-  стоп-листе `AGENTS.md` есть напоминание, что менять её молча нельзя: иначе следующий контекст
-  «чинит» компромисс, не зная, что тот выбран сознательно.
+* модель ролей и общий пароль роли приложения закреплены решением заказчика в ADR-006, а роль
+  миграций — решением от 2026-11-22 в ADR-018; в стоп-листе `AGENTS.md` есть напоминание, что
+  менять их молча нельзя: иначе следующий контекст «чинит» компромисс, не зная, что он выбран
+  сознательно.
 """
 
 from __future__ import annotations
@@ -36,6 +37,7 @@ ROOT = Path(__file__).resolve().parents[2]
 ROLES_SQL: Final = ROOT / "deploy" / "postgres" / "roles.sql"
 CI_FILE: Final = ROOT / ".github" / "workflows" / "ci.yml"
 ADR_006: Final = ROOT / "docs" / "adr" / "ADR-006-db-app-role-shared-password.md"
+ADR_018: Final = ROOT / "docs" / "adr" / "ADR-018-migration-role-schema-owner.md"
 AGENTS: Final = ROOT / "AGENTS.md"
 
 _APP_ROLE: Final = "tbot_app"
@@ -169,25 +171,127 @@ def test_права_не_выдаются_публично_и_не_оптом() 
     )
 
 
-def test_право_create_на_схему_выдано_явно_и_только_роли_приложения() -> None:
-    """Миграции идут ролью приложения: без `CREATE` на схему следующая ревизия падает.
+def test_рантайм_роль_пользуется_схемой_но_не_создаёт_в_ней_объектов() -> None:
+    """`USAGE` есть, `CREATE` отозван: DDL относится к роли-мигратору (`ADR-018`).
 
-    Основание — замер на площадке 2026-11-21: под ролью приложения `CREATE TABLE` даёт
-    `42501 permission denied for schema public`. Право выдано по решению заказчика
-    (ask `8d2be9bb`, вариант Б), поэтому проверяется и наличие, и то, что оно не превратилось
-    в выдачу всей схемы оптом.
+    Право `CREATE` на `public` выдавалось по варианту Б `ADR-006` (ask `8d2be9bb`), когда
+    миграции шли ролью приложения. Срез деплоя 2026-11-22 меряет цену этого решения: `ALTER
+    TABLE sessions ADD CONSTRAINT ck_sessions_token_hash_format` под ролью приложения даёт
+    `42501 must be owner of table sessions`, и заказчик вернул миграции роли-владельцем
+    (ask `c7a6830e-9722-491d-9dbf-c8b291d3e84d`). Значит проверка держит оба факта: выдача
+    `USAGE` (без неё невозможен DML) и явный отзыв `CREATE` (на площадке право уже выдано,
+    и без отзыва повторный запуск файла прав не вернул бы модель к норме).
     """
     sql = _sql()
-    assert re.search(
-        r"GRANT\s+USAGE,\s*CREATE\s+ON\s+SCHEMA\s+public\s+TO\s+tbot_app", sql, re.IGNORECASE
-    ), (
-        "в deploy/postgres/roles.sql нет явной выдачи USAGE + CREATE на public роли приложения: "
-        "alembic (его запускает та же роль) упадёт на CREATE TABLE, а право должно быть "
-        "перечислено явно, а не через GRANT ALL"
+    assert re.search(r"GRANT\s+USAGE\s+ON\s+SCHEMA\s+public\s+TO\s+tbot_app", sql, re.IGNORECASE), (
+        "в deploy/postgres/roles.sql нет явной выдачи USAGE на public роли приложения: "
+        "без права USAGE недоступен любой DML по схемам"
     )
+    assert re.search(
+        r"REVOKE\s+CREATE\s+ON\s+SCHEMA\s+public\s+FROM\s+tbot_app", sql, re.IGNORECASE
+    ), (
+        "нет явного отзыва CREATE у роли приложения: право выдавалось по ADR-006 и на площадке "
+        "оно уже есть, поэтому без отзыва идемпотентный запуск файла прав оставил бы "
+        "рантайм-роль с DDL в схеме"
+    )
+    assert not re.search(
+        r"GRANT\s+[^;]*CREATE[^;]*ON\s+SCHEMA\s+public\s+TO\s+tbot_app", sql, re.IGNORECASE
+    ), "право CREATE на схему не должно возвращаться роли приложения: DDL делает роль-мигратор"
     assert not re.search(
         r"GRANT\s+ALL(\s+ON\s+SCHEMA)?\s+ON?\s*SCHEMA", sql, re.IGNORECASE
     ), "права на схему не должны выдаваться оптом: перечень обязан быть явным"
+
+
+def test_роль_мигратора_выделена_только_процессу_миграций() -> None:
+    """`TBOT_MIGRATION_DB_USER` обязана быть у `migrate` и не должна быть у рантайм-процессов.
+
+    Смысл разделения ролей (`ADR-018`) в том, что ограниченный процесс не выбирает себе роль
+    сам: если переменная появится у `web`, `engine`, `jobs` или `tgbot`, процесс, знающий из
+    своего DSN общий пароль (`ADR-006`), получит роль-владельца прямо из окружения.
+    """
+    compose = yaml.safe_load((ROOT / "deploy" / "compose.yaml").read_text(encoding="utf-8"))
+    assert isinstance(compose, dict), "deploy/compose.yaml обязан разбираться как YAML"
+    services = compose["services"]
+    migrate_env = services["migrate"].get("environment") or {}
+    assert migrate_env.get("TBOT_MIGRATION_DB_USER") == "tbot", (
+        "у сервиса migrate нет TBOT_MIGRATION_DB_USER=tbot: alembic пойдёт ролью из db_url, "
+        "и ревизия, правящая таблицу роли-владельца, откажет по правам (замер площадки 2026-11-22)"
+    )
+    for service in ("web", "engine", "jobs", "tgbot", "postgres"):
+        env = services[service].get("environment")
+        # форма «КЛЮЧ=значение» (список) тоже должна проверяться
+        keys = {item.split("=", 1)[0] for item in env} if isinstance(env, list) else set(env or {})
+        assert "TBOT_MIGRATION_DB_USER" not in keys, (
+            f"роль-мигратор объявлена процессу {service}: рантайм-процесс получает DDL-права "
+            "роли-владельца схемы"
+        )
+
+
+# Файлы, которым разрешено знать про роль-мигратора: описание поля, разбор адреса и Alembic.
+# Рантайм-процессы (`apps/`, `packages/storage`, остальные `packages/*`) знать о ней не должны.
+_MIGRATION_ROLE_FILES: Final[frozenset[str]] = frozenset(
+    {"packages/common/config.py", "packages/common/db.py"}
+)
+
+
+def test_роль_мигратора_читает_только_alembic() -> None:
+    """Про роль-мигратора знают только конфигурация, разбор адреса и `migrations/env.py`.
+
+    Проверка парная к предыдущей: compose не выдаёт переменную лишним сервисам, но и код не
+    должен читать её сам. Иначе ограниченный процесс получает роль-владельца без всякого compose:
+    пароль общий (`ADR-006`), поэтому достаточно одного `os.environ` в неизвестном месте.
+
+    Последняя проверка держит деталь, на которой миграции падали бы молча: `str(URL)` в
+    SQLAlchemy печатает пароль как `***`, поэтому разбор обязан идти через
+    `render_as_string(hide_password=False)`.
+    """
+    needles = ("migration_db_user", "migration_url", "TBOT_MIGRATION_DB_USER")
+    offenders: list[str] = []
+    for path in [*(ROOT / "apps").rglob("*.py"), *(ROOT / "packages").rglob("*.py")]:
+        rel = path.relative_to(ROOT).as_posix()
+        if rel in _MIGRATION_ROLE_FILES:
+            continue
+        body = path.read_text(encoding="utf-8")
+        if any(needle in body for needle in needles):
+            offenders.append(rel)
+    assert not offenders, (
+        f"о роли-миграторе знают вне конфигурации и Alembic: {sorted(offenders)} — "
+        "рантайм-процесс не должен выбирать себе роль-владельца схемы"
+    )
+
+    env_src = (ROOT / "migrations" / "env.py").read_text(encoding="utf-8")
+    assert "migration_url(" in env_src, (
+        "migrations/env.py обязан строить адрес через migration_url: это единственное место, "
+        "где роль-мигратор применяется к адресу Alembic"
+    )
+    assert "settings.migration_db_user" in env_src, (
+        "migrations/env.py обязан читать TBOT_MIGRATION_DB_USER (settings.migration_db_user): "
+        "без этого ревизии идут ролью из db_url и падают на ALTER чужой таблицы"
+    )
+    db_src = (ROOT / "packages" / "common" / "db.py").read_text(encoding="utf-8")
+    assert "render_as_string(hide_password=False)" in db_src, (
+        "migration_url обязан рендерить адрес с паролем: str(URL) в SQLAlchemy маскирует "
+        "пароль как `***`, и миграции получили бы адрес без учётных данных"
+    )
+
+
+def test_модель_миграций_закреплена_в_adr_018() -> None:
+    """Смена роли миграций — решение заказчика, и оно обязано быть описано.
+
+    ADR-006 оставлен и не переписывается: он объясняет общий пароль. Новый ADR обязан назвать
+    замер, после которого модель поменялась, и второго DSN-секрета (`db_url_owner`) не вводить.
+    """
+    assert ADR_018.is_file(), f"нет ADR о роли миграций: {ADR_018}"
+    body = ADR_018.read_text(encoding="utf-8")
+    for marker in (
+        "`c7a6830e-9722-491d-9dbf-c8b291d3e84d`",
+        "must be owner of table sessions",
+        "`TBOT_MIGRATION_DB_USER`",
+        "`db_url_owner`",
+        "`ADR-006`",
+        "`REVOKE CREATE ON SCHEMA public FROM tbot_app`",
+    ):
+        assert marker in body, f"ADR-018 потерял обязательную часть решения: {marker!r}"
 
 
 def test_таблицы_append_only_возвращаются_владельцу_схемы() -> None:
@@ -287,6 +391,15 @@ def test_стоп_лист_напоминает_что_модель_ролей_�
     assert "ADR-006" in body, (
         "из стоп-листа пропала ссылка на ADR-006: сессия увидит общий пароль роли приложения как "
         "дефект и поправит его без решения заказчика"
+    )
+    assert "ADR-018" in body, (
+        "из стоп-листа пропала ссылка на ADR-018: сессия увидит, что `migrate` ходит ролью-"
+        "владельцем, и «починит» её на роль приложения — следующая ревизия упадёт на ALTER чужой "
+        "таблицы"
+    )
+    assert "`TBOT_MIGRATION_DB_USER`" in body, (
+        "в стоп-листе обязано быть имя переменной, которой migrate выбирает роль: без неё "
+        "разделение ролей выглядит случайностью, а не решением"
     )
     assert "`db_url_owner`" in body, (
         "в стоп-листе обязан быть назван отклонённый вариант (второй DSN-секрет) — иначе он "

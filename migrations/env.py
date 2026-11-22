@@ -4,6 +4,9 @@
 в `secrets_dir`. Без явно указанной базы миграции отказываются выполняться — «угадать» адрес
 нельзя, потому что одна и та же команда запускается и на dev-машине, и на площадке.
 
+Роль подключения для миграций — `TBOT_MIGRATION_DB_USER` (роль-владельцем схемы, `ADR-018`):
+`alembic` делает DDL, а DDL по чужому объекту роль приложения не выполняет.
+
 `target_metadata` — метаданные слоя `storage` (ORM-отображения таблиц, `packages/storage`).
 С ними `make revision` autogenerate видит существующую схему, а CI-шаг `alembic check` ловит
 ситуацию, когда ревизию забыли (модель описывает таблицу, которой в базе нет) или наоборот.
@@ -19,7 +22,7 @@ from sqlalchemy import engine_from_config, pool
 from sqlalchemy.engine import Connection
 
 from packages.common.config import ConfigError, load_settings
-from packages.common.db import sqlalchemy_url
+from packages.common.db import migration_url
 from packages.storage.base import Base
 
 config = context.config
@@ -43,7 +46,12 @@ def _database_url() -> str:
     # Диалект указывает явно (`postgresql+psycopg`): в конфигурации адрес хранится в обычной
     # форме `postgresql://…`, а SQLAlchemy выбрал бы psycopg2, которого в образе нет —
     # падение произошло бы только в CI (проверка `test_db_url`).
-    return sqlalchemy_url(settings.db_url.get_secret_value())
+    #
+    # Роль берётся из `TBOT_MIGRATION_DB_USER` (`ADR-018`): DDL требует прав владельца объекта,
+    # и под ролью приложения ревизия, правящая таблицу, созданную ролью-владельцем, отказывает
+    # (`42501 must be owner of table sessions` — замер на площадке 2026-11-22, ревизия `0003`).
+    # Пароль при этом тот же: имя роли — не секрет, второго DSN-файла нет.
+    return migration_url(settings.db_url.get_secret_value(), settings.migration_db_user)
 
 
 def run_migrations_offline() -> None:
