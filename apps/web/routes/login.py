@@ -76,6 +76,7 @@ from packages.identity.sessions import create_session
 from packages.identity.users import (
     LoginLockedError,
     ensure_login_allowed,
+    login_closed_reason,
     register_login_failure,
     register_login_success,
 )
@@ -191,6 +192,9 @@ async def login_submit(request: Request, store: StoreDep) -> Response:
        (`T-101`);
     6. сравнение пароля; у неизвестного логина всё равно тратится стоимость хэширования
        (`LoginTiming`), чтобы ответ по времени не различал существование учётной записи;
+       состояние учётной записи закрывает вход ровно тем же ответом (`login_closed_reason`,
+       §1.2, `ADR-020` п. 6): «заблокирована администратором» и «архивирована» неотличимы от
+       неверного пароля (§8.8), и неудача при этом считается, потому что доступ не открыт;
     7. неудача: счётчик неудач учётной записи и окно перебора по адресу (`ip_ban`, §8.2). Окно
        адреса считается и при неизвестном логине: §8.2 говорит «3 неудачные попытки с одного IP»,
        а не «по одной учётной записи», иначе переборщик обходил бы окно, меняя логины;
@@ -238,7 +242,15 @@ async def login_submit(request: Request, store: StoreDep) -> Response:
     except LoginLockedError as exc:
         return _denied(request, _lock_detail(exc.until), exc.until, LOCK_REASON_ATTEMPTS, moment)
 
-    if not verify_password(password=password, stored_hash=user.password_hash):
+    # Состояние записи проверяется тем же отказом, что и неверный пароль: различать
+    # «заблокировали» и «пароль не тот» ответом нельзя (§8.8: отказ не должен быть оракулом
+    # состояния учётной записи), поэтому отдельной ветки с другим текстом здесь нет вовсе.
+    # Неудача считается и когда пароль верный: `register_login_success` сбросил бы счётчик
+    # неудач у записи, которой вход запрещён, и оставила бы её живой для следующего перебора.
+    closed = login_closed_reason(user)
+    if not verify_password(password=password, stored_hash=user.password_hash) or (
+        closed is not None
+    ):
         locked_until = register_login_failure(user, now=moment)
         store.commit()
         banned = register_address_failure(store, address, moment=moment)

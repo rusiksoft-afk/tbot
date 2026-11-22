@@ -39,11 +39,12 @@ from starlette.templating import Jinja2Templates
 
 from apps.web.forms import FormBodyTooLarge
 from apps.web.routes import admin_users as admin_routes
+from apps.web.routes import invitations as invitation_routes
 from apps.web.routes import login as login_routes
 from apps.web.routes import profile as profile_routes
 from apps.web.routes import sessions as session_routes
 from apps.web.routes import totp as totp_routes
-from apps.web.security.authorization import handle_access_denied
+from apps.web.security.authorization import handle_access_denied, handle_account_state
 from apps.web.security.csrf import CsrfRejected, csrf_context
 from apps.web.security.headers import apply_security_headers
 from apps.web.security.keys import (
@@ -67,6 +68,7 @@ from packages.common.logging import (
 )
 from packages.identity.authorization import AccessDeniedError
 from packages.identity.passwords import MalformedPasswordHashError
+from packages.identity.users import AccountAccessError
 
 log = get_logger("web")
 
@@ -148,6 +150,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(session_routes.router)
     app.include_router(profile_routes.router)
     app.include_router(totp_routes.router)
+    app.include_router(invitation_routes.router)
     app.include_router(admin_routes.router)
 
     @app.middleware("http")
@@ -223,6 +226,22 @@ def create_app(settings: Settings) -> FastAPI:
         обработчики: иначе «забыли перехватить» появилось бы ровно там, где его не проверяли.
         """
         return handle_access_denied(request, exc)
+
+    @app.exception_handler(AccountAccessError)
+    async def _account_state_denied(request: Request, exc: AccountAccessError) -> Response:
+        """Страница «доступ закрыт состоянием учётной записи» (§9.3, §1.2, `ADR-020` п. 6).
+
+        Отдельный ответ, а не общий отказ допуска: безликий `403` нужен там, где иначе проставился
+        бы лик чужой учётной записи, а объяснение состояния получает владелец **своей** записи,
+        которой вход закрыт (§9.1 требует внятного состояния). Обработчик один и регистрируется
+        здесь, а не в маршрутах: исключение поднимает зависимость `enforce_role`, то есть до тела
+        обработчика, и «перехватить в каждом маршруте» физически невозможно — тот же приём, что у
+        `AccessDeniedError` и отказов CSRF (`ADR-017` п. 3).
+
+        Состояние проверяется на каждый охраняемый запрос, поэтому блокировка и одобрение
+        применяются к живому сеансу немедленно, а не после перезапуска `web`.
+        """
+        return handle_account_state(request, exc)
 
     @app.exception_handler(FormBodyTooLarge)
     async def _form_too_large(_request: Request, exc: FormBodyTooLarge) -> JSONResponse:

@@ -156,7 +156,11 @@ from packages.identity.totp_enrollment import (
     revoke_enrollment,
     verify_enrollment_code,
 )
-from packages.identity.users import LoginLockedError, ensure_login_allowed
+from packages.identity.users import (
+    LoginLockedError,
+    enqueue_for_approval,
+    ensure_login_allowed,
+)
 from packages.storage.models import User
 
 log = get_logger("web")
@@ -1152,6 +1156,19 @@ async def enroll_verify(request: Request, principal: CodeMutation, store: StoreD
         superseded=superseded,
     )
 
+    # §1.2 шаг 2 и `ADR-020` п. 3: подтверждённая привязка второго фактора ставит учётную
+    # запись в очередь одобрения. Отдельного ответа об этом нет: человек видит страницу пачки
+    # резервных кодов, а состояние своей записи — на страницах входа и профиля (`T-105`).
+    # Переход идемпотентен: повторная привязка уже одобренной записи очередь не
+    # переустанавливает и не стирает автора одобрения. Фиксируется переход тем же
+    # `commit()`-ом, что и поднятие шага ниже (`security/sessions.touch_session`) — отдельного
+    # фиксировать нечего: оба изменения относятся к одному решению.
+    if enqueue_for_approval(user):
+        log.info(
+            "account_awaiting_approval",
+            user_id=str(user.id),
+            session_id=str(principal.session.id),
+        )
     advance_auth_step(principal.session, step="totp", now=moment)
     touch_session(store, principal)
     # Не редирект, а страница: значения пачки живут только в этом ответе, а redirect обязан был бы

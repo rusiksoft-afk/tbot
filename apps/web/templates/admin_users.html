@@ -1,0 +1,169 @@
+{% extends "base.html" %}
+{# Раздел администрирования: очередь одобрения, учётные записи, открытые приглашения
+   (§9.3 п. 6, `ADR-017` п. 6, `ADR-020`, `T-105` срез `R7b`).
+
+   Кнопки показаны для каждой учётной записи, а не только «разрешённые»: допустимость перехода
+   решает домен (`STATE_TRANSITIONS`), и второй копии правила в разметке нет. Разметка, которая
+   прячет недопустимое, оставила бы маршрут открытым и при этом не объяснила бы администратору,
+   почему кнопка исчезла (`ADR-017` п. 1).
+
+   Опасные действия (`Заблокировать`, `В архив`) открывают страницу подтверждения `GET`-ом, а
+   изменение делает только `POST` со скрытым полем токена (§8.3, `ADR-008`) — тот же порядок, что
+   у отзыва сеанса в `session_revoke.html`. `Одобрить` и `Разблокировать` доступа не закрывают,
+   поэтому делаются прямой формой.
+
+   Даты приходят из обработчика уже подписанными по часам площадки (§9.1): разметка, которая сама
+   считает время, неминуемо забудет подпись часового пояса на одном из мест. #}
+{% block content %}
+<h1>{{ page_title }}</h1>
+<p>{{ section_note }}</p>
+{% if note %}
+<p role="status">{{ note }}</p>
+{% endif %}
+{% if detail %}
+<p role="alert">{{ detail }}</p>
+{% endif %}
+
+<h2>Очередь одобрения</h2>
+{% if queue %}
+<table>
+  <caption>Учётные записи, которые ждут одобрения (§1.2 шаг 2)</caption>
+  <thead>
+    <tr>
+      <th scope="col">Логин</th>
+      <th scope="col">Роль</th>
+      <th scope="col">Создана</th>
+      <th scope="col">Действие</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in queue %}
+    <tr>
+      <th scope="row">{{ row.login }}</th>
+      <td>{{ row.role }}</td>
+      <td>{{ row.created }}</td>
+      <td>
+        {# Первый вход уже сделан (запись попала в очередь после привязки второго фактора),
+           поэтому одобрение — прямая форма без подтверждающей страницы. #}
+        <form method="post" action="{{ row.approve_url }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit">Одобрить</button>
+        </form>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p>{{ empty_queue_note }}</p>
+{% endif %}
+
+<h2>Новое приглашение</h2>
+{# Выпуск делается на отдельный адрес, а не на адрес раздела: значение ссылки живёт только в
+   ответе выпуска и показывается ровно один раз (`ADR-020` п. 3). Повторно открыть выпуск нельзя,
+   поэтому раздел, который можно перечитать, ссылкой не отвечает. #}
+<form method="post" action="{{ issue_url }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p>
+    <label for="invite-login">Логин адресата</label>
+    <input id="invite-login" name="{{ field_login }}" type="text" autocomplete="off"
+           maxlength="254">
+  </p>
+  <p>
+    <label for="invite-email">Адрес электронной почты адресата</label>
+    <input id="invite-email" name="{{ field_email }}" type="text" autocomplete="off"
+           maxlength="254">
+  </p>
+  <p>
+    <label for="invite-role">Роль приглашаемого</label>
+    <select id="invite-role" name="{{ field_role }}">
+      {% for role in role_choices %}
+      <option value="{{ role }}">{{ role }}</option>
+      {% endfor %}
+    </select>
+  </p>
+  <p><button type="submit">Выпустить приглашение</button></p>
+</form>
+
+<h2>Учётные записи</h2>
+{% if accounts %}
+<table>
+  <caption>Все состояния, включая архивные (§4.1: удаление — только архивированием)</caption>
+  <thead>
+    <tr>
+      <th scope="col">Логин</th>
+      <th scope="col">Роль</th>
+      <th scope="col">Состояние</th>
+      <th scope="col">Создана</th>
+      <th scope="col">Одобрена</th>
+      <th scope="col">Действие</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in accounts %}
+    <tr>
+      <th scope="row">
+        {{ row.login }}
+        {% if row.is_self %}
+        <span>({{ self_label }})</span>
+        {% endif %}
+      </th>
+      <td>{{ row.role }}</td>
+      <td>{{ row.state_label }}</td>
+      <td>{{ row.created }}</td>
+      <td>{{ row.approved }}</td>
+      <td>
+        <form method="post" action="{{ row.approve_url }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit">Одобрить</button>
+        </form>
+        <a href="{{ row.suspend_url }}">Заблокировать</a>
+        <form method="post" action="{{ row.unsuspend_url }}">
+          <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+          <button type="submit">Разблокировать</button>
+        </form>
+        <a href="{{ row.archive_url }}">В архив</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p>{{ action_note }}</p>
+{% else %}
+<p>{{ empty_accounts_note }}</p>
+{% endif %}
+
+<h2>Открытые приглашения</h2>
+{% if invitations %}
+<table>
+  <caption>Выпуски, которые ещё принимают учётную запись (§1.2)</caption>
+  <thead>
+    <tr>
+      <th scope="col">Кому адресовано</th>
+      <th scope="col">Роль</th>
+      <th scope="col">Выпущено</th>
+      <th scope="col">Срок действия</th>
+      <th scope="col">Состояние ссылки</th>
+      <th scope="col">Действие</th>
+    </tr>
+  </thead>
+  <tbody>
+    {% for row in invitations %}
+    <tr>
+      <th scope="row">{{ row.target }}</th>
+      <td>{{ row.role }}</td>
+      <td>{{ row.created }}</td>
+      <td>{{ row.expires }}</td>
+      <td>{{ row.status }}</td>
+      <td><a href="{{ row.revoke_url }}">Отозвать</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+<p>{{ invitations_note }}</p>
+{% else %}
+<p>{{ empty_invitations_note }}</p>
+{% endif %}
+
+<p><a href="{{ users_url }}">Обновить раздел</a></p>
+{% endblock %}

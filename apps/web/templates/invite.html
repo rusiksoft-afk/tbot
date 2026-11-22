@@ -1,0 +1,62 @@
+{% extends "base.html" %}
+{# Приём приглашения по одноразовой ссылке (§1.2 шаг 1, `ADR-020` п. 3–4, `ADR-021`).
+
+   Формы нет, если ссылка закрыта: страница не предлагает задать пароль там, где пароль уже
+   ничего не примет, — объяснение состояния стоит на месте формы (§9.1).
+
+   Скрытого поля токена в форме нет сознательно, и это не забытость: сеанса у приглашённого ещё
+   нет, а токен `ADR-008` выводится из пары «значение куки + `id` сеанса», то есть вывод токена для
+   него не определён. Вместо токена работают проверка источника (`ensure_same_origin`) и предел
+   частоты по адресу (§8.3) — ровно та же схема, что у `login.html`, с тем же обоснованием
+   (`ADR-009`, `ADR-021` п. 2); исключение поименовано в проверке
+   `tests/contract/test_web_security_contract.py`.
+
+   Значение ссылки в разметку не печатается: `action=""` означает «отправить на тот же адрес, по
+   которому открыта страница», поэтому носитель доступа живёт только в адресе страницы и не
+   попадает ни в тело ответа, ни в журнал приложения (§8.4). #}
+{% block content %}
+<h1>{{ page_title }}</h1>
+{% if accepted %}
+{# Принято: учётная запись создана, но доступ ещё не открыт — очередь одобрения и второй фактор
+   (§1.2) объясняются текстом, а не молчаливым возвратом к форме. #}
+<p role="status">{{ note }}</p>
+<p>Логин: <strong>{{ login_value }}</strong></p>
+{% if role_label %}
+<p>Роль: <strong>{{ role_label }}</strong></p>
+{% endif %}
+<p><a href="{{ login_url }}">Вход в консоль</a></p>
+{% else %}
+{% if detail %}
+<p role="alert">{{ detail }}</p>
+{% endif %}
+{% if explanation %}
+<p role="alert">{{ explanation }}</p>
+{% endif %}
+{% if form_open %}
+{% if target_note %}
+<p>{{ target_note }}</p>
+{% endif %}
+{% if role_label %}
+<p>Роль по приглашению: <strong>{{ role_label }}</strong></p>
+{% endif %}
+<form method="post" action="">
+  <p>
+    <label for="invite-login">Логин</label>
+    <input id="invite-login" name="{{ login_form_field }}" type="text" autocomplete="username"
+           value="{{ login_value }}" required maxlength="254">
+  </p>
+  <p>
+    <label for="invite-password">Пароль</label>
+    <input id="invite-password" name="{{ password_form_field }}" type="password"
+           autocomplete="new-password" required>
+  </p>
+  <p>
+    <label for="invite-repeat">Пароль ещё раз</label>
+    <input id="invite-repeat" name="{{ repeat_form_field }}" type="password"
+           autocomplete="new-password" required>
+  </p>
+  <p><button type="submit">Задать пароль и создать учётную запись</button></p>
+</form>
+{% endif %}
+{% endif %}
+{% endblock %}
