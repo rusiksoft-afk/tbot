@@ -62,6 +62,7 @@ from apps.web.security.sessions import (
     SESSION_COOKIE_NAME,
     SESSION_EXPIRED_PATH,
     SESSIONS_PATH,
+    TOTP_CODE_PATH,
     Principal,
 )
 from packages.common.config import Settings
@@ -256,12 +257,16 @@ def test_шаг_password_не_рисует_форму(client: TestClient, store:
     Токен на шаге `'password'` выводится (сессия есть), поэтому отказ не может держаться на CSRF:
     нужен именно шаг входа. Иначе «знаю пароль» означало бы «могу сменить пароль и выгнать все
     живые входы владельца» — отказ в обслуживании вместо защиты.
+
+    С `T-103` отказ ведёт на страницу кода (§8.2: на шаге пароля доступны страница кода и
+    `/logout`), а не на страницу входа: человек с верным паролем уже внутри церемонии входа, и
+    возврат на `/login` заставил бы его вводить пароль заново, то есть создал бы вторую сессию.
     """
     secret = _войти(client)
     assert _сеанс(store, secret).auth_step == "password"
     response = client.get(SECURITY_PATH, follow_redirects=False)
     assert response.status_code == 302
-    assert response.headers["location"] == LOGIN_PATH
+    assert response.headers["location"] == TOTP_CODE_PATH
     assert FIELD_NEW_PHRASE not in response.text
 
 

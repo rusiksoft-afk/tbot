@@ -55,13 +55,14 @@ from apps.web.routes.sessions import (
 )
 from apps.web.security.csrf import CSRF_FORM_FIELD, expected_token
 from apps.web.security.sessions import (
+    CONSOLE_PATH,
     LOGIN_PATH,
-    POST_LOGIN_REDIRECT,
     REASON_QUERY,
     SESSION_COOKIE_NAME,
     SESSION_EXPIRED_PATH,
     SESSIONS_PATH,
     SESSIONS_REVOKE_ALL_PATH,
+    TOTP_CODE_PATH,
     Principal,
 )
 from packages.common.config import Settings
@@ -270,11 +271,13 @@ def test_список_требует_полного_входа(client: TestClien
     response = client.get(SESSIONS_PATH, follow_redirects=False)
     assert response.status_code == 302
     assert (
-        response.headers["location"] == LOGIN_PATH
-    ), "шаг 'password' ведёт на страницу входа (§8.2)"
-    assert (
-        response.headers["location"] != POST_LOGIN_REDIRECT
-    ), "список не должен пускать шаг 'password' дальше страницы входа"
+        response.headers["location"] == TOTP_CODE_PATH
+    ), "шаг 'password' ведёт на страницу кода (§8.2)"
+    assert response.headers["location"] not in {
+        SESSIONS_PATH,
+        CONSOLE_PATH,
+        LOGIN_PATH,
+    }, "список не должен пускать шаг 'password' ни в консоль, ни обратно на вход"
     assert other.revoked_at is None
     assert _record(store, secret).revoked_at is None
 

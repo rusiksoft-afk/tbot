@@ -19,6 +19,7 @@ CSRF-токена и объясняющих страниц должны запу
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import Annotated, Final, cast
 from uuid import UUID
 
@@ -37,7 +38,7 @@ from apps.web.store import BucketWindow, Store, get_store
 from packages.common.config import Settings
 from packages.identity.sessions import IssuedSession, token_hash_of
 from packages.identity.users import new_user
-from packages.storage.models import User, UserSession
+from packages.storage.models import TotpEnrollment, TotpFailure, User, UserSession
 
 #: Пароль тестовой учётной записи: проходит §8.1 (длина, словарь, «пароль = логин/домен»), иначе
 #: `new_user` откажется создавать запись и проверка дойдёт до входа уже с другим пользователем.
@@ -62,6 +63,8 @@ class MemoryStore:
         self._users: dict[str, User] = {}
         self._sessions: dict[str, UserSession] = {}
         self._buckets: dict[tuple[str, str, datetime], tuple[int, int]] = {}
+        self._enrollments: dict[UUID, TotpEnrollment] = {}
+        self._totp_failures: list[TotpFailure] = []
         self.commits: int = 0
         self.hash_lookups: list[str] = []
 
@@ -133,11 +136,68 @@ class MemoryStore:
         """
         return next((user for user in self._users.values() if user.id == user_id), None)
 
-    def add(self, obj: User | UserSession) -> None:
+    def add(self, obj: User | UserSession | TotpEnrollment | TotpFailure) -> None:
         if isinstance(obj, UserSession):
             self._sessions[obj.token_hash] = obj
-            return
-        self._users[obj.login.casefold()] = obj
+        elif isinstance(obj, TotpEnrollment):
+            self._enrollments[obj.id] = obj
+        elif isinstance(obj, TotpFailure):
+            self._totp_failures.append(obj)
+        else:
+            # пользователь: `login` — ключ, регистронезависимость та же, что у `citext`
+            self._users[obj.login.casefold()] = obj
+
+    def active_enrollment(self, user_id: UUID) -> TotpEnrollment | None:
+        """Зеркало `SqlStore.active_enrollment`: одна неотозванная привязка на учётку.
+
+        Предикат скопирован побайтово (`user_id`, `revoked_at IS NULL`). Чего память не доказывает:
+        что вторую неотозванную строку не даст частичный уникальный индекс
+        `ix_totp_enrollments_user_active`, и что предикат попадает в индекс, а не вычитывает все
+        строки учётной записи. Это держит живой файл
+        `tests/integration/test_totp_enrollment_db.py` (job `миграции`).
+        """
+        return next(
+            (
+                row
+                for row in self._enrollments.values()
+                if row.user_id == user_id and row.revoked_at is None
+            ),
+            None,
+        )
+
+    def totp_failures(self, user_id: UUID, *, not_before: datetime) -> tuple[TotpFailure, ...]:
+        """Зеркало `SqlStore.totp_failures`: лента неудач не раньше границы окна (§8.2).
+
+        Порядок возврата — по `at`, как в запросе: иначе «5 подряд» в памяти и на базе считались бы
+        по разным последовательностям. Границу окна задаёт вызывающий, и здесь она тоже в фильтре, а
+        не «отфильтровано потом».
+        """
+        return tuple(
+            row
+            for row in sorted(self._totp_failures, key=lambda row: row.at)
+            if row.user_id == user_id and row.at > not_before
+        )
+
+    def claim_totp_step(self, enrollment_id: UUID, *, step: int) -> bool:
+        """Зеркало `SqlStore.claim_totp_step`: тот же предикат, что у guarded-`UPDATE`.
+
+        Честная граница: в памяти нет ни `UPDATE`, ни блокировки строки, поэтому эта реализация не
+        может доказать атомарность — два «параллельных» запроса в одном тесте физически не приходят.
+        Здесь проверяется только то, что форма предиката (`last_used_step IS NULL OR
+        last_used_step < step` плюс состояние строки `revoked_at IS NULL AND
+        confirmed_at IS NOT NULL`) понята слоем одинаково: код, равный уже принятому шагу, не
+        проходит, и отозванная/неподтверждённая привязка шаг не занимает. Собственно атомарность и
+        `rowcount = 0` на повторе держит живая проверка
+        `tests/integration/test_totp_enrollment_db.py` (job `миграции`) — ровно та же граница, что у
+        счётчика частоты (`ADR-007`).
+        """
+        row = self._enrollments.get(enrollment_id)
+        if row is None or row.revoked_at is not None or row.confirmed_at is None:
+            return False
+        if row.last_used_step is not None and row.last_used_step >= step:
+            return False
+        row.last_used_step = step
+        return True
 
     def commit(self) -> None:
         self.commits += 1
@@ -194,6 +254,14 @@ class MemoryStore:
         `window_seconds` в снимок не входит намеренно — окно проверяют живые проверки схемы.
         """
         return {key: attempts for key, (_, attempts) in self._buckets.items()}
+
+    def enrollments(self) -> tuple[TotpEnrollment, ...]:
+        """Снимок привязок для проверок: включая отозванные и неподтверждённые.
+
+        Проверкам нужно различать «привязка не создалась» и «привязка создана и отозвана» —
+        по странице ответа эти два состояния неотличимы намеренно.
+        """
+        return tuple(self._enrollments.values())
 
     def sessions(self) -> tuple[UserSession, ...]:
         return tuple(self._sessions.values())
@@ -305,6 +373,18 @@ def timing_spy(client: TestClient) -> TimingSpy:
     spy = cast(FastAPI, client.app).state.login_timing
     assert isinstance(spy, TimingSpy), "планировщик не подменён — проверка времени бессмысленна"
     return spy
+
+
+def set_kek_file(client: TestClient, path: Path) -> None:
+    """Путь файла ключей KEK для приложения клиента (срез `R4c`, `ADR-014` п. 5).
+
+    Боевой путь (`/etc/tbot/keys/kek.json`) в проверке не используется: он требует POSIX-прав и root,
+    а на dev-машине его нет. Приложение читает путь из состояния процесса (`create_app` кладёт туда
+    `Settings.kek_file`), поэтому подмена пути — это ровно тот же код загрузки, что на площадке,
+    включая разбор формата и проверку прав (на POSIX-ветке проверки живут в
+    `tests/unit/test_envelope_crypto.py`).
+    """
+    cast(FastAPI, client.app).state.kek_file = path
 
 
 def session_cookie(client: TestClient) -> str:

@@ -23,10 +23,13 @@ from httpx import Response
 from apps.web.routes.sessions import EXPLANATIONS, GENERIC_EXPLANATION
 from apps.web.security.csrf import CSRF_FORM_FIELD, expected_token
 from apps.web.security.sessions import (
+    CONSOLE_PATH,
     COOKIE_PATH,
     COOKIE_SAMESITE,
+    LOGIN_PATH,
     POST_LOGIN_REDIRECT,
     SESSION_COOKIE_NAME,
+    TOTP_CODE_PATH,
     Principal,
     display_reason_codes,
 )
@@ -352,14 +355,22 @@ def test_сессии_с_истёкшими_обоими_сроками_пока
 def test_охраняемый_маршрут_не_пускает_сессию_на_шаге_password(
     client: TestClient, store: MemoryStore
 ) -> None:
-    """§8.2: шага `'password'` мало (проверка на маршруте-щупе, см. `probe_router`)."""
+    """§8.2: шага `'password'` мало (проверка на маршруте-щупе, см. `probe_router`).
+
+    Ведёт на страницу кода: с `T-103` она существует, и это единственное, что доступно шагу
+    пароля (кроме `/logout`). Прежняя цель — `/login` — была заменой отсутствующей страницы;
+    теперь возврат на вход создал бы вторую сессию у человека, который уже ввёл верный пароль.
+    """
     _войти(client, store)
     response = client.get("/probe-full", follow_redirects=False)
     assert response.status_code == 302
-    assert response.headers["location"] == "/login", (
-        "до `T-103` страницы кода нет: вести пользователя в несуществующий маршрут — значит "
-        "показать 404 человеку с верным паролем"
-    )
+    assert (
+        response.headers["location"] == TOTP_CODE_PATH
+    ), "шаг 'password' обязан вести на страницу кода (§8.2)"
+    assert response.headers["location"] not in {
+        CONSOLE_PATH,
+        LOGIN_PATH,
+    }, "охраняемый маршрут нельзя ни открывать шагу пароля, ни откатывать в начало входа"
 
 
 def test_шаг_full_открывает_охраняемый_маршрут(client: TestClient, store: MemoryStore) -> None:
