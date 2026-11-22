@@ -21,8 +21,6 @@
   привязка, то есть «перетереть привязку» со страницы первичной привязки нельзя;
 * **резервных кодов** (`T-104`) и ссылки «использовать резервный код» (§9.3 п. 2): ссылки на
   несуществующий адрес в шаблоне нет, она появится вместе с `/mfa-recovery`;
-* **QR-кода** (`R4d`): страница выдаёт секрет текстом для ручного ввода (§8.2 «QR + ручной ввод»),
-  картинку собирает следующий срез из того же значения, не расшифровывая `secret_enc` повторно;
 * **счётчика попыток** на странице кода (§9.3 п. 2: «счётчик попыток не показывается, но блокировка
   объясняется») — за это отвечает `LOCK_NOTE`, в котором правило описано, а состояние нет;
 * **записей `audit_log`** о привязке, подтверждении, блокировках и отказах `429` (§8.7): имена событий
@@ -53,6 +51,7 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
 from apps.web.forms import form_fields
+from apps.web.qrcode import QrBuildError, QrGraphic, qr_graphic
 from apps.web.routes.sessions import RateLimitedMutation
 from apps.web.security.csrf import csrf_context
 from apps.web.security.keys import request_key_ring
@@ -93,6 +92,7 @@ from packages.identity.totp import (
     TOTP_MAX_FAILED_CODES,
     TOTP_PERIOD_SECONDS,
     register_totp_code_failure,
+    totp_provisioning_uri,
     totp_step,
 )
 from packages.identity.totp_enrollment import (
@@ -217,6 +217,28 @@ WINDOW_NOTE: Final = "Код действителен 30 секунд. Если 
 # ─── мелочь, которую иначе разносят по трём местам ─────────────────────────────────────────────
 
 
+def _qr_of_enrollment(secret: str, login: str, issuer: str) -> QrGraphic | None:
+    """QR-картинка привязки: из того же значения, которое уже показал этот ответ.
+
+    `secret` — одноразовое значение `NewEnrollment.secret` (`ADR-014` п. 6): `secret_enc`
+    повторно не расшифровывается, поэтому точек вывода материала привязки остаётся ровно
+    столько же, сколько было до `R4d` — одна (`ADR-015` п. 6). Метка аккаунта — логин учётной
+    записи, `issuer` — значение из строки привязки (`TOTP_ISSUER`), чтобы картинка, ручной ключ
+    и колонка `issuer` не разошлись: по метке генератор различает учётные записи.
+
+    Отказ кодировщика ловится здесь, а не на странице: страница привязки обязана остаться
+    рабочей даже без картинки (§8.2 требует QR **и** ручной ввод), а привязка к этому моменту
+    уже создана и зафиксирована. В лог уходят только причина и длина ссылки: в
+    `otpauth://`-строке лежит секрет, и наружу она не выводится ни в каком виде.
+    """
+    uri = totp_provisioning_uri(secret, account_name=login, issuer=issuer)
+    try:
+        return qr_graphic(uri)
+    except QrBuildError as exc:
+        log.warning("totp_qr_unavailable", detail=str(exc), payload_chars=len(uri))
+        return None
+
+
 def _window_line(moment: datetime) -> str:
     """Строка таймера окна (§9.3 п. 2) для шаблона.
 
@@ -329,6 +351,7 @@ def _render_enroll(
     moment: datetime,
     note: str = "",
     secret: str | None = None,
+    qr: QrGraphic | None = None,
     locked_url: str | None = None,
 ) -> HTMLResponse:
     """Страница первичной привязки в одном из состояний.
@@ -340,6 +363,11 @@ def _render_enroll(
 
     `secret` непустой ровно в одной ветке — сразу после `POST /mfa-enroll/start` (§8.2: «в UI больше не
     показывается»). Проверка «секрет выводит ровно один шаблон и ровно в одном месте» — контрактная.
+
+    `qr` — картинка привязки (`R4d`), и она бывает непустой ровно там же, где и `secret`: в контекст
+    кладутся только геометрия (`qr_path`, `qr_modules`), а не `otpauth://`-ссылка. Ни `GET`-страница
+    привязки, ни состояние `stale`/`bound` картинки не получают: их сборка означала бы повторное
+    расшифровывание `secret_enc` и второй вывод материала (§8.2, `ADR-015` п. 6).
     """
     context = {
         "page_title": "Привязка генератора кодов",
@@ -347,6 +375,8 @@ def _render_enroll(
         "detail": detail,
         "note": note,
         "secret": secret or "",
+        "qr_path": qr.path_d if qr is not None else "",
+        "qr_modules": qr.modules if qr is not None else 0,
         "window": _window_line(moment),
         "locked_url": locked_url,
         "start_url": MFA_ENROLL_START_PATH,
@@ -713,6 +743,12 @@ def enroll_start(request: Request, principal: CodeMutation, store: StoreDep) -> 
     created = new_enrollment(user_id=user.id, now=moment, ring=ring)
     store.add(created.enrollment)
     store.commit()
+    # Картинка строится из `created.secret` — того же значения, которое этот ответ показывает
+    # для ручного ввода (`ADR-015` п. 6); порядок аргументов прямой, чтобы контракт не путал
+    # передачу значения в картинку с передачей его в контекст страницы. Порядок «сначала
+    # зафиксировали привязку, потом картинку» значим: отказ кодировщика не должен отменять уже
+    # созданную привязку, а картинка — удобство, которого может не оказаться (§8.2 требует QR
+    # и ручной ввод, а не вместо него).
     return _render_enroll(
         request,
         principal,
@@ -722,6 +758,7 @@ def enroll_start(request: Request, principal: CodeMutation, store: StoreDep) -> 
         moment=moment,
         note=CONFIRM_NOTE,
         secret=created.secret,
+        qr=_qr_of_enrollment(created.secret, user.login, created.enrollment.issuer),
     )
 
 
