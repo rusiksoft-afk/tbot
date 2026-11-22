@@ -260,6 +260,22 @@ class MemoryStore:
         )
 
     def add(self, obj: User | UserSession | TotpEnrollment | TotpFailure | Invitation) -> None:
+        # `id` проставляется здесь. Боевой путь получает его на `flush`: первичный ключ в моделях
+        # объявлен с прикладным default (`_new_uuid` → `uuid7`, `packages/storage/models.py`),
+        # а в памяти нет ни `INSERT`, ни `flush`, поэтому объект остаётся с `id = None`. Оставить
+        # так нельзя, и следствия не косметические:
+        #   * раздел администратора строит адреса вида `{ADMIN_USERS_PATH}/{record.id}/approve` —
+        #     с `None` это адрес «/None/», то есть отказ «объекта нет» на законную операцию;
+        #   * предикаты `invitation_of_id`, `revoke_invitation_row` и `claim_invitation` сравнивают
+        #     `row.id == invitation_id`, а `None == None` совпадает с *первой* строкой без
+        #     идентификатора: отзыв или заявка закрыли бы не тот выпуск (проверено на этом
+        #     двойнике — тест `test_просроченная_и_отозванная_ссылки_объясняются_поразному`
+        #     ловит именно это).
+        # Значение то же, что дал бы `flush` (`uuid7`), поэтому и порядок строк по `id` совпадает
+        # с хронологией, как на базе. Проверки, которые проставляли `id` вручную (`seed_user`,
+        # `issued.record.id = uuid4()`), не ломаются: они перетирают значение своими.
+        if cast("object", obj.id) is None:
+            obj.id = uuid7()
         if isinstance(obj, UserSession):
             self._sessions[obj.token_hash] = obj
         elif isinstance(obj, TotpEnrollment):

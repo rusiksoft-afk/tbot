@@ -42,10 +42,20 @@ import pytest
 from fastapi.testclient import TestClient
 from httpx import Response
 
-from apps.web.routes.admin_users import ADMIN_USERS_NOTE, ADMIN_USERS_PATH
+from apps.web.routes.admin_users import (
+    ADMIN_ACCOUNT_APPROVE_PATH,
+    ADMIN_ACCOUNT_ARCHIVE_PATH,
+    ADMIN_ACCOUNT_SUSPEND_PATH,
+    ADMIN_ACCOUNT_UNSUSPEND_PATH,
+    ADMIN_INVITATION_REVOKE_PATH,
+    ADMIN_INVITATIONS_PATH,
+    ADMIN_USERS_NOTE,
+    ADMIN_USERS_PATH,
+)
 from apps.web.security.authorization import DENIAL_BODY
 from apps.web.security.csrf import CSRF_FORM_FIELD, csrf_token_for
 from apps.web.security.sessions import (
+    INVITE_PATH,
     LOCKED_PATH,
     LOGIN_PATH,
     LOGOUT_PATH,
@@ -241,7 +251,78 @@ ROUTE_POLICY: Final[dict[tuple[str, str], Policy]] = {
     (ADMIN_USERS_PATH, "GET"): Policy(
         TIER_ADMIN,
         frozenset({200}),
-        "раздел администратора из карты §9.3 п. 6: адрес занят допуском, содержимое строит `T-105`",
+        "раздел администратора из карты §9.3 п. 6: адрес занят допуском, содержимое строит срез `R7b` (`T-105`)",
+    ),
+    (ADMIN_INVITATIONS_PATH, "POST"): Policy(
+        TIER_ADMIN,
+        frozenset({400}),
+        "выпуск приглашения: пустая форма → `400`, потому что адресата требует домен (§1.2); "
+        "значение ссылки показывается ровно один раз в ответе выпуска (`ADR-020` п. 3)",
+    ),
+    (ADMIN_INVITATION_REVOKE_PATH, "GET"): Policy(
+        TIER_ADMIN,
+        frozenset({404}),
+        "подтверждение отзыва выпуска: в матрице адрес проверяется идентификатором, которого не "
+        "существовало никогда → `404` без подробностей; отзыв живого выпуска держит отдельная "
+        "проверка ниже (`ADR-020` п. 4)",
+    ),
+    (ADMIN_INVITATION_REVOKE_PATH, "POST"): Policy(
+        TIER_ADMIN,
+        frozenset({404}),
+        "отзыв выпуска guarded-`UPDATE`-ом: в матрице — несуществующий `id` (`404`); что отзыв "
+        "не закрывает уже принятую учётную запись, проверяет отдельная проверка ниже",
+    ),
+    (ADMIN_ACCOUNT_APPROVE_PATH, "POST"): Policy(
+        TIER_ADMIN,
+        frozenset({404}),
+        "одобрение (§1.2 шаг 2): в матрице — несуществующий `id` учётной записи; переход "
+        "`awaiting_approval → active` и отметку автора делает домен (`ADR-020` п. 3)",
+    ),
+    (ADMIN_ACCOUNT_SUSPEND_PATH, "GET"): Policy(
+        TIER_ADMIN,
+        frozenset({404}),
+        "страница подтверждения блокировки: `GET` ничего не меняет (§9.1), в матрице — "
+        "несуществующий `id`",
+    ),
+    (ADMIN_ACCOUNT_SUSPEND_PATH, "POST"): Policy(
+        TIER_ADMIN,
+        frozenset({404}),
+        "блокировка: в матрице — несуществующий `id`; для живого объекта порядок «счёт "
+        "администраторов → переход → отзыв сеансов» проверяет отдельная проверка ниже (§8.3, "
+        "`ADR-020` п. 6)",
+    ),
+    (ADMIN_ACCOUNT_UNSUSPEND_PATH, "POST"): Policy(
+        TIER_ADMIN,
+        frozenset({404}),
+        "разблокировка: действие открывает доступ, поэтому подтверждающей страницы нет; в "
+        "матрице — несуществующий `id`",
+    ),
+    (ADMIN_ACCOUNT_ARCHIVE_PATH, "GET"): Policy(
+        TIER_ADMIN,
+        frozenset({404}),
+        "страница подтверждения архивирования: переход терминальный (§1.2), подтверждение "
+        "обязано называть объект (§9.1); в матрице — несуществующий `id`",
+    ),
+    (ADMIN_ACCOUNT_ARCHIVE_PATH, "POST"): Policy(
+        TIER_ADMIN,
+        frozenset({404}),
+        "архивирование: тот же порядок закрытия доступа, что у блокировки, и отсутствие "
+        "обратного перехода; в матрице — несуществующий `id`",
+    ),
+    (INVITE_PATH, "GET"): Policy(
+        TIER_CEREMONY,
+        frozenset({404}),
+        "приём приглашения по одноразовой ссылке: без значения ссылки страница, принимающая "
+        "пароль, не существует — `404`; что это не открытая регистрация, держит "
+        "`test_no_public_registration.py` (`ADR-020` п. 3, `ADR-021` п. 3)",
+    ),
+    (INVITE_PATH, "POST"): Policy(
+        TIER_CEREMONY,
+        frozenset({404}),
+        "приём ссылки без действующего значения: адрес не смотрит на тело формы и отвечает `404` "
+        "(тот же ответ, что у `GET` — §8.8 «один ответ на несколько случаев»); роли ещё нет, "
+        "поэтому вместо токена сеанса — проверка источника и частота по адресу (`ADR-021` п. 2), "
+        "а отказ формы `400` держит `test_invitation_flow`",
     ),
 }
 
@@ -254,10 +335,13 @@ GET_GUARDS: Final[dict[str, str]] = {
 }
 
 #: То же для мутаций: имя стража, которое обязано появиться в дереве зависимостей мутационного
-#: маршрута того же уровня. Уровню `admin` здесь соответствия нет сознательно: мутаций раздела
-#: администратора ещё нет (`T-105`), и заводить стража «на будущее» значило бы писать мёртвый код.
+#: маршрута того же уровня. Раздел администратора добавлен срезом `R7b` (`T-105`): у него своя
+#: зависимость `require_admin_role_mutation`, а не `require_admin_role` рядом с `FullMutation`,
+#: потому что живой сеанс проверялся бы дважды и два обращения к строке сеанса могли бы увидеть
+#: разные состояния (сеанс отозвали другим входом между ними).
 MUTATION_GUARDS: Final[dict[str, str]] = {
     TIER_ANY_ROLE: "require_console_role_mutation",
+    TIER_ADMIN: "require_admin_role_mutation",
 }
 
 #: Все имена стражей: контракт проверяет, что у маршрута без уровня роли ни один из них не стоит.
@@ -385,7 +469,7 @@ def _вызвать(
     роль: str,
     *,
     address_index: int = 1,
-    session_id: UUID = STRANGE_ID,
+    object_id: UUID = STRANGE_ID,
 ) -> Response:
     """Вызвать маршрут так же, как его вызывает браузер: форма с токеном, `Origin`, адрес.
 
@@ -393,7 +477,14 @@ def _вызвать(
     тест получил бы итоговую страницу, и «роль не пущена» перестал бы отличаться от «роль пустила,
     и страница редиректит».
     """
-    url = path.replace("{session_id}", str(session_id))
+    url = path
+    for элемент in (
+        "{session_id}",
+        "{user_id}",
+        "{invitation_id}",
+    ):
+        url = url.replace(элемент, str(object_id))
+
     headers = _headers(address_index)
     # Ответ `TestClient` типизирован как `Any` (стубов у
     # httpx-перегрузок нет), поэтому ответ держится в
