@@ -1,4 +1,5 @@
-"""Страница ввода кода 2FA и первичная привязка TOTP (TZ §8.2, §8.3, §9.3 п. 2–3; `T-103`, срез `R4c`).
+"""Страница ввода кода 2FA, первичная привязка TOTP и расход резервного кода
+(TZ §8.2, §8.3, §9.3 п. 2–3; `T-103` срез `R4c`, `T-104` срез `R5c`).
 
 Здесь закрывается вторая половина входа, о которой `R3a`–`R3f` говорили как о границе: у сессии шага
 `'password'` появляется страница кода (§8.2 шаг (2)), а у учётной записи без привязки — страница
@@ -6,11 +7,41 @@
 только ввод кода и `/logout`» проверялось на тестовом щупе.
 
 Что здесь есть: `GET/POST /totp` (код входа и перевод на шаг `'full'`), `GET /mfa-enroll` (состояние
-привязки), `POST /mfa-enroll/start` (выдать секрет) и `POST /mfa-enroll/verify` (подтвердить двумя
-кодами). Лимиты — все три, которые требует §8.3: `totp_session` (10/мин/сессия), `totp_ip` (5/мин/IP) и
-общий предел мутаций на пользователя (60/мин, `ADR-007`). Окно перебора по адресу `ip_ban` (§8.2)
-здесь читается и двигается на тех же основаниях, что и на входе: §8.2 говорит «3 неудачные попытки с
-одного IP», а попытка кода — такая же попытка.
+привязки), `POST /mfa-enroll/start` (выдать секрет), `POST /mfa-enroll/verify` (подтвердить двумя
+кодами и выпустить пачку резервных кодов) и `GET/POST /mfa-recovery` (расход резервного кода,
+§9.3 п. 3). Лимиты — все три, которые требует §8.3: `totp_session` (10/мин/сессия), `totp_ip`
+(5/мин/IP) и общий предел мутаций на пользователя (60/мин, `ADR-007`). Окно перебора по адресу
+`ip_ban` (§8.2) здесь читается и двигается на тех же основаниях, что и на входе: §8.2 говорит «3
+неудачные попытки с одного IP», а попытка кода — такая же попытка.
+
+Почему `/mfa-recovery` лежит в этом модуле, а не в отдельном. Резервный код — вторая форма того же
+второго фактора, а не самостоятельная страница: у него тот же охраняющий шаг (`CODE_PAGE_STEPS`), та
+же цепочка «токен → счётчик мутаций → шаг страницы», те же две области §8.3, то же окно перебора по
+адресу и та же лента неудач `totp_failures` (`ADR-016` п. 8: раздельные счётчики дали бы 5 + 5
+попыток и обошли бы блокировку чередованием полей). Разнести эти две формы по разным модулям —
+значит завести вторую копию `_register_failure_and_lock`, `_rejection_answer` и `_code_denied`, а
+расхождение копий не ловилось бы ничем: счётчики снова считались бы по-разному ровно там, где §8.2
+требует одного счёта. Общая разметка при этом остаётся своей — у страницы своя форма и свой шаблон.
+
+Резервные коды: выдача, расход и семидневный срок (`ADR-016`). Пачка из 10 кодов выпускается ровно
+один раз — в ответе `POST /mfa-enroll/verify`, рядом с подтверждением привязки (решение заказчика от
+2026-11-22, ask `2f6bab2b`, `ADR-016` п. 2), и больше нигде: открытые значения существуют ровно между
+генерацией и показом, в базе остаются только хэши (п. 3 того же ADR). Порядок обращений к слою
+доступа значим: «аннулирование неиспользованных остатков → вставка новой пачки»; обратный порядок
+оставляет учётную запись без единого рабочего кода, и это проверяет живой файл
+`tests/integration/test_backup_codes_db.py`.
+
+Расход кода (`POST /mfa-recovery`) поднимает сессию до `'full'`: это шаг полной аутентификации, а не
+промежуточное состояние (§8.2 «расход кода = шаг полной аутентификации», `ADR-016` п. 9), поэтому у
+полной сессии эта страница уже не открывается. Семидневный срок перевыпуска (§8.2) держит переход
+«пароль + код 2FA», а не состояние сессии: при просрочке `POST /totp` отказывает до криптографии, а
+резервный путь остаётся открытым, пока есть хотя бы одна строка с `used_at IS NULL` (решение заказчика
+там же, `ADR-016` п. 6). Активные сессии просрочка не отзывает. Отдельного признака «коды выпущены»
+не вводится: состояние выводится из `recovery_state` и из наличия неиспользованных строк.
+
+Файл ключей на резервном пути не читается: коду нечего расшифровывать, и в этом его смысл — он
+остаётся доступным и тогда, когда страница кода отвечает `503` из-за недоступного `kek.json`
+(`ADR-015` п. 7).
 
 Чего здесь сознательно нет:
 
@@ -19,31 +50,42 @@
   админского допуска — это маршруты зоны профиля и администрирования, а не зоны входа. Ограничение
   видно по коду: `POST /mfa-enroll/start` отказывает `409`, если у учётной записи есть подтверждённая
   привязка, то есть «перетереть привязку» со страницы первичной привязки нельзя;
-* **резервных кодов** (`T-104`) и ссылки «использовать резервный код» (§9.3 п. 2): ссылки на
-  несуществующий адрес в шаблоне нет, она появится вместе с `/mfa-recovery`;
+* **перевыпуска пачки по требованию.** Выпуск привязан к подтверждению привязки, отдельной команды
+  «выпустить ещё коды» на `/profile/security` (§9.3 п. 5) пока нет — это остаток `T-104`. Следствие
+  осознанное и названо в предупреждении на странице: обязательство §8.2 («выпустить новые в течение
+  7 дней») нельзя выполнить изнутри входа, пока этой команды нет, и следующий срез обязан
+  закрыть её раньше, чем площадка начнёт тратить резервные коды;
 * **счётчика попыток** на странице кода (§9.3 п. 2: «счётчик попыток не показывается, но блокировка
-  объясняется») — за это отвечает `LOCK_NOTE`, в котором правило описано, а состояние нет;
-* **записей `audit_log`** о привязке, подтверждении, блокировках и отказах `429` (§8.7): имена событий
-  и цепочка хэшей относятся к `T-109` (перенос зафиксирован `ADR-009`). Компенсирующие контроля на
-  месте: состояние привязки — в `totp_enrollments`, попытки — в `totp_failures`, блокировка — в
-  `users.locked_until`, бан адреса — в `rate_buckets`, и всё это объясняется человеку сразу.
+  объясняется») — за это отвечает `LOCK_NOTE`, в котором правило описано, а состояние нет; на
+  странице резервного кода показывается не счётчик попыток, а состояние набора (`spare`) — это
+  собственные данные учётной записи, а не карта для переборщика;
+* **алерта администратору о расходе кода** (§8.2 «+ алерт администратору»): доставка уведомлений —
+  `T-716`, в этом срезе остаётся именованное событие журнала `backup_code_spent`;
+* **записей `audit_log`** о привязке, подтверждении, выпуске и расходе кодов, блокировках и отказах
+  `429` (§8.7): имена событий и цепочка хэшей относятся к `T-109` (перенос зафиксирован `ADR-009`).
+  Компенсирующие контроля на месте: состояние привязки — в `totp_enrollments`, попытки — в
+  `totp_failures`, коды и их расход — в `backup_codes`, блокировка — в `users.locked_until`, бан
+  адреса — в `rate_buckets`, и всё это объясняется человеку сразу.
 
 Шаг `'totp'` и почему он не даёт доступа. Подтверждение привязки переводит сессию на шаг `'totp'`, и
-это **не** полный вход: полный даёт только ввод кода (§8.2 шаг (2)). Различие не формальное: секрет
-привязки выдаёт тому же владельцу то же приложение, чью сессию оно защищает. Сессия, которая может
-попросить секрет, показать два кода и «подтвердить» привязку, не должна автоматически оказываться
-внутри консоли, — иначе второй фактор сводится к одному паролю. Поэтому у входа остаётся отдельное
-событие: код, который расходуется (`last_used_step`) и поднимает сессию до `'full'` (`ADR-015` п. 3).
+это **не** полный вход: полный даёт только ввод кода (§8.2 шаг (2)) либо расход резервного кода
+(`ADR-016` п. 9). Различие не формальное: секрет привязки выдаёт тому же владельцу то же приложение,
+чью сессию оно защищает. Сессия, которая может попросить секрет, показать два кода и «подтвердить»
+привязку, не должна автоматически оказываться внутри консоли, — иначе второй фактор сводится к одному
+паролю. Поэтому у входа остаётся отдельное событие: код, который расходуется (`last_used_step`) и
+поднимает сессию до `'full'` (`ADR-015` п. 3).
 
 Одноразовость и коды подтверждения. Подтверждение привязки расходует свои два кода (`ADR-013`): после
-успешного `verify` страница кода ждёт **новый** код из следующего окна, и шаблон говорит об этом прямо.
-Тот же шаг кода, которым подтвердили привязку, вход не откроет — это держат и домен, и guarded-`UPDATE`
-в `store.claim_totp_step` (живая проверка — `tests/integration/test_totp_enrollment_db.py`).
+успешного `verify` страница кода ждёт **новый** код из следующего окна, и шаблон говорит об этом
+прямо. Тот же шаг кода, которым подтвердили привязку, вход не откроет — это держат и домен, и
+guarded-`UPDATE` в `store.claim_totp_step` (живая проверка —
+`tests/integration/test_totp_enrollment_db.py`). У резервного кода одноразовость держит тот же
+приём: guarded-`UPDATE` в `store.spend_backup_code` (живая `test_backup_code_single_use`).
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import Annotated, Final
 
@@ -73,6 +115,7 @@ from apps.web.security.sessions import (
     MFA_ENROLL_PATH,
     MFA_ENROLL_START_PATH,
     MFA_ENROLL_VERIFY_PATH,
+    MFA_RECOVERY_PATH,
     POST_CODE_REDIRECT,
     REASON_QUERY,
     TOTP_CODE_PATH,
@@ -86,6 +129,16 @@ from apps.web.security.sessions import (
 from apps.web.store import Store
 from packages.common.clock import utc_now
 from packages.common.logging import get_logger
+from packages.identity.backup_codes import (
+    BACKUP_CODE_LENGTH,
+    RECOVERY_REGENERATION_WINDOW,
+    BackupCodeFormatError,
+    RecoveryState,
+    display_backup_code,
+    hash_backup_code,
+    new_backup_codes,
+    recovery_state,
+)
 from packages.identity.sessions import advance_auth_step
 from packages.identity.totp import (
     TOTP_FAILURE_HORIZON,
@@ -151,6 +204,21 @@ FIELD_SECOND_CODE: Final = "second_code"
 #: отказ был про код, а не про размер запроса.
 MAX_CODE_CHARS: Final = 16
 
+# ─── имена и границы поля резервного кода (§8.2, `T-104`, срез `R5c`) ───────────────────────
+
+#: Имя поля формы резервного кода. Оно же — имя ключа маскировки журнала (`_MASK_KEYS` в
+#: `packages/common/logging.py`): совпадение намеренное, а не «историческое». Значение резервного
+#: кода — секрет входа, и шанс, что оно окажется в записи журнала, закрывается в двух местах:
+#: маршруты его не логируют, а маска не даёт сделать это случайно.
+FIELD_BACKUP_CODE: Final = "backup_code"
+
+#: Ограничение длины предъявленного резервного кода. Держит приложение, а не шаблон, по той же
+#: причине, что и `MAX_CODE_CHARS`: `maxlength` обходят подменой тела. Граница заведомо больше
+#: 10 знаков: показ разбит группами (`display_backup_code`), человек переносит код с дефисом,
+#: тире и пробелами, а `normalize_backup_code` их убирает. И заведомо меньше предела тела формы
+#: (`apps/web/forms.py`), чтобы отказ был про код, а не про размер запроса.
+MAX_BACKUP_CODE_CHARS: Final = 32
+
 # ─── тексты состояний (§9: состояние внятное, объяснение — без пользы для переборщика) ─────────
 
 #: Общая формулировка отказа кода. Различий «не тот код», «повтор кода» и «не похоже на код» в ответе
@@ -215,6 +283,112 @@ WINDOW_NOTE: Final = "Код действителен 30 секунд. Если 
 
 
 # ─── мелочь, которую иначе разносят по трём местам ─────────────────────────────────────────────
+
+
+# ─── резервные коды: тексты состояний (§8.2, `ADR-016` п. 5, 6, 9) ────────────────────────
+
+#: Общая формулировка отказа резервного кода. Различий «не тот код», «уже израсходован» и «код
+#: другой учётной записи» в ответе нет намеренно (`ADR-016` п. 3, п. 5): по различию ответов
+#: подбором находилось бы, какой код у этой учётной записи уже потрачен. Различие уходит только в
+#: лог процесса (`found` — «нашли неиспользованный, но guarded-переход отказал»).
+RECOVERY_FAILURE_DETAIL: Final = (
+    "Резервный код не подходит. Каждый код используется один раз: возьмите следующий из списка."
+)
+
+#: Отказ по формату можно показать прямо: он не отвечает на вопрос «есть ли такое значение у этой
+#: учётной записи» и экономит человеку попытку из лимита на заведомо бессмысленном вводе
+#: (`ADR-016` п. 5). Значения в тексте нет: сообщение об отказе уходит в журнал.
+RECOVERY_FORMAT_DETAIL: Final = (
+    f"Резервный код — {BACKUP_CODE_LENGTH} символов из алфавита без похожих знаков: в нём нет "
+    "I, L, O, 0 и 1. Разделители вводить можно, они игнорируются."
+)
+
+EMPTY_BACKUP_CODE_DETAIL: Final = "Нужно ввести резервный код."
+
+#: Постоянное объяснение страницы резервного кода. Срок блокировки здесь не назван числом минут
+#: намеренно: его ставит `LOCK_DURATION`, и вторая копия числа разошлась бы с кодом (для страницы
+#: кода это держит отдельная контрактная проверка).
+RECOVERY_NOTE: Final = (
+    f"Каждый резервный код используется один раз. После первого расхода нужно выпустить новые "
+    f"коды: на это {RECOVERY_REGENERATION_WINDOW.days} суток. Неудачные попытки ввода резервных "
+    f"кодов считаются вместе с кодами 2FA: после {TOTP_MAX_FAILED_CODES} неудачных кодов подряд "
+    "вход в учётную запись закрывается."
+)
+
+#: Успех расхода: код принят, доступ открыт, и повторить расход нечем (`ADR-016` п. 9).
+RECOVERY_SPENT_DETAIL: Final = "Код принят: вход выполнен. Этот резервный код израсходован."
+
+#: Отказ перехода «пароль + код 2FA» при просроченном семидневном сроке (§8.2: «иначе учётная
+#: запись блокируется на вход, не на торговлю»). Текст обязан назвать и выход: пока есть
+#: неиспользованный резервный код, войти можно им (`ADR-016` п. 6, решение заказчика от 2026-11-22,
+#: ask `2f6bab2b`). Блокировка живёт ровно на этом переходе, а не в состоянии сессии: активные
+#: сессии просрочка не отзывает (п. 6 там же).
+GRACE_EXPIRED_DETAIL: Final = (
+    "Срок перевыпуска резервных кодов истёк: вход по паролю и коду 2FA закрыт. Войти можно "
+    "резервным кодом, пока хотя бы один не израсходован, — и сразу после этого выпустить новые."
+)
+
+#: Состояние «неиспользованных кодов не осталось». Это принятый риск (`ADR-016` п. 6): при
+#: просроченном сроке путь перевыпуска закрыт вместе со входом, и снимает его только сброс
+#: привязки администратором (§9.3 п. 6, задача `T-106` не сделана). Формулировка обязана говорить
+#: правду, а не оставлять форму с заведомо неверным ответом.
+NO_SPARE_CODE_DETAIL: Final = (
+    "Неиспользованных резервных кодов не осталось. Выпустить новые можно только изнутри входа, "
+    "а вход закрыт: обратитесь к администратору для сброса привязки."
+)
+
+
+def _recovery_note(state: RecoveryState) -> str:
+    """Предупреждение о перевыпуске (§8.2) для страницы кода и страницы резервного кода.
+
+    Пустая строка означает «обязательства перевыпустить нет»: коды никогда не расходовались либо
+    после расхода уже выпущена новая пачка (`recovery_state`, `ADR-016` п. 6). Текст строится по
+    состоянию набора, а не по факту конкретного запроса: предупреждение обязано оставаться и на
+    следующем входе, иначе обязательство §8.2 забывается вместе со страницей, на которой код был
+    потрачен.
+
+    Число неиспользованных кодов показывается самому владельцу его собственного набора — страница
+    охранена шагом `'password'`/`'totp'`, то есть доступна тому, кто уже ввёл пароль. На ответ
+    отказа это не влияет: «своего», «чужого» и «израсходованного» кода страница не различает
+    (§8.8), а `unused` описывает набор учётной записи целиком, а не предъявленное значение.
+    """
+    deadline = state.regeneration_deadline
+    if not state.needs_regeneration or deadline is None:
+        return ""
+    moment_text = deadline.strftime("%d.%m.%Y %H:%M")
+    if state.login_blocked:
+        return (
+            f"Срок перевыпуска резервных кодов истёк {moment_text} UTC. Вход по паролю и коду 2FA "
+            f"закрыт; неиспользованных кодов осталось: {state.unused}."
+        )
+    return (
+        f"Нужно выпустить новые резервные коды: срок до {moment_text} UTC, неиспользованных "
+        f"кодов осталось: {state.unused}."
+    )
+
+
+def _recovery_warning_after_spend(spare_left: int, moment: datetime) -> str:
+    """Предупреждение §8.2 в том же ответе, где код был истрачен.
+
+    Дедлайн здесь — только текст для человека: решение о просрочке принимает `recovery_state` по
+    датам из таблицы, а момент расхода ставит база (`used_at = now()`, `ADR-016` п. 7, п. 11).
+
+    Пересчитывать состояние по объектам текущего запроса нельзя: guarded-`UPDATE` расхода идёт с
+    `synchronize_session=False` (`SqlStore.spend_backup_code`), и строка в identity map осталась
+    бы с прежним `used_at`, а `expire_on_commit=False` не сбрасывает её после коммита. Поэтому
+    остаток считается арифметикой от снимка, сделанного **до** расхода.
+    """
+    deadline = (moment + RECOVERY_REGENERATION_WINDOW).strftime("%d.%m.%Y %H:%M")
+    if spare_left <= 0:
+        return (
+            "Это был последний неиспользованный резервный код. Новые коды нужно выпустить до "
+            f"{deadline} UTC: после истечения срока вход будет закрыт полностью, а снимает его "
+            "только сброс привязки администратором."
+        )
+    return (
+        f"Новые резервные коды нужно выпустить до {deadline} UTC. Неиспользованных осталось: "
+        f"{spare_left}; после истечения срока вход по паролю и коду 2FA закрывается."
+    )
 
 
 def _qr_of_enrollment(secret: str, login: str, issuer: str) -> QrGraphic | None:
@@ -318,6 +492,7 @@ def _render_code(
     status_code: int,
     moment: datetime,
     note: str = LOCK_NOTE,
+    recovery_note: str = "",
     locked_url: str | None = None,
 ) -> HTMLResponse:
     """Страница кода: форма ввода кода плюс объяснение состояния.
@@ -334,6 +509,8 @@ def _render_code(
         "locked_url": locked_url,
         "code_url": TOTP_CODE_PATH,
         "enroll_url": MFA_ENROLL_PATH,
+        "recovery_url": MFA_RECOVERY_PATH,
+        "recovery_note": recovery_note,
     } | csrf_context(principal)
     response: HTMLResponse = request.app.state.templates.TemplateResponse(
         request, "totp.html", context, status_code=status_code
@@ -352,6 +529,7 @@ def _render_enroll(
     note: str = "",
     secret: str | None = None,
     qr: QrGraphic | None = None,
+    codes: Sequence[str] = (),
     locked_url: str | None = None,
 ) -> HTMLResponse:
     """Страница первичной привязки в одном из состояний.
@@ -383,6 +561,11 @@ def _render_enroll(
         "verify_url": MFA_ENROLL_VERIFY_PATH,
         "enroll_url": MFA_ENROLL_PATH,
         "code_url": TOTP_CODE_PATH,
+        # Показные формы пачки резервных кодов (`ABCDE-FGHJK`): разделители — только показ, хэш
+        # считается по канону (`ADR-016` п. 4). Непустым `codes` бывает ровно одно состояние
+        # страницы — `issued`, то есть ответ `POST /mfa-enroll/verify` (`ADR-016` п. 2), и это
+        # держит контрактная проверка.
+        "codes": tuple(display_backup_code(code) for code in codes),
     } | csrf_context(principal)
     response: HTMLResponse = request.app.state.templates.TemplateResponse(
         request, "mfa_enroll.html", context, status_code=status_code
@@ -453,11 +636,15 @@ def _rejection_answer(
     moment: datetime,
     render: Callable[[str, int], HTMLResponse],
     denied: Callable[[str, datetime, str], HTMLResponse],
+    failure_detail: str = CODE_FAILURE_DETAIL,
 ) -> Response:
     """Один ответ на любую неудачу кода: лента, окно адреса, затем — блокировки по порядку.
 
     `render` и `denied` выбирают страницу (код входа или привязка): тексты и коды отказов общие,
-    разметки разные. Порядок отказов закреплён и не «как получилось»: блокировка учётной записи важнее
+    разметки разные. `failure_detail` — текст «кода нет» для своей страницы: для резервного кода
+    «возьмите новый код из окна» было бы неправдой (окна у него нет, а код одноразовый), и при этом
+    сам отказ обязан оставаться одним для чужого, израсходованного и несуществующего значения
+    (§8.8, `ADR-016` п. 5) — различаются подсказки, но не факт отказа. Порядок отказов закреплён и не «как получилось»: блокировка учётной записи важнее
     бана адреса, потому что у неё меньшая зона (одна учётная запись против адреса, за которым могут
     сидеть другие люди — `ADR-007` предупреждает, что коллективный ключ наказывает соседей), и человеку
     важнее узнать про свою учётную запись.
@@ -471,7 +658,7 @@ def _rejection_answer(
         return denied(_lock_explanation(locked_until), locked_until, LOCK_REASON_ATTEMPTS)
     if banned is not None:
         return denied(_address_explanation(banned), banned, LOCK_REASON_RATE)
-    return render(CODE_FAILURE_DETAIL, 401)
+    return render(failure_detail, 401)
 
 
 @router.get(TOTP_CODE_PATH, response_class=HTMLResponse)
@@ -497,6 +684,10 @@ def code_page(request: Request, principal: CodeSession, store: StoreDep) -> Resp
     user = store.user_of_id(principal.session.user_id)
     if user is None:
         return _account_gone()
+    # Состояние резервных кодов читается и на `GET`: предупреждение §8.2 обязано быть видно до
+    # попытки, а не только после отказа. Отдельного флага «коды выпущены» для этого нет —
+    # состояние выводится из строк набора (`ADR-016` п. 6 и раздел «Решения заказчика» п. 1).
+    grace = recovery_state(store.backup_code_rows(user.id), now=moment)
     try:
         ensure_login_allowed(user, now=moment)
     except LoginLockedError as exc:
@@ -506,10 +697,18 @@ def code_page(request: Request, principal: CodeSession, store: StoreDep) -> Resp
             detail=_lock_explanation(exc.until),
             status_code=200,
             moment=moment,
+            recovery_note=_recovery_note(grace),
             locked_url=f"{LOCKED_PATH}?{REASON_QUERY}={LOCK_REASON_ATTEMPTS}",
         )
     detail = CONFIRM_NOTE if principal.session.auth_step == "totp" else ""
-    return _render_code(request, principal, detail=detail, status_code=200, moment=moment)
+    return _render_code(
+        request,
+        principal,
+        detail=detail,
+        status_code=200,
+        moment=moment,
+        recovery_note=_recovery_note(grace),
+    )
 
 
 @router.post(TOTP_CODE_PATH, response_class=Response)
@@ -584,6 +783,33 @@ async def code_submit(request: Request, principal: CodeMutation, store: StoreDep
     enrollment = store.active_enrollment(user.id)
     if enrollment is None or enrollment.confirmed_at is None:
         raise SessionRedirect(MFA_ENROLL_PATH)
+
+    # Просроченный семидневный срок перевыпуска блокирует именно этот переход — «пароль + код 2FA»,
+    # и блокирует **до** криптографии: код не проверяется и не расходуется, потому что при просрочке
+    # вход закрыт правилом §8.2, а не потому, что код неверный (`ADR-016` п. 6, решение заказчика от
+    # 2026-11-22, ask `2f6bab2b`). Резервный путь эта проверка не перекрывает: он открыт ровно
+    # тогда, когда есть неиспользованные строки, и проверяет это сам (`POST /mfa-recovery`).
+    grace = recovery_state(store.backup_code_rows(user.id), now=moment)
+    if grace.login_blocked:
+        log.warning(
+            "recovery_grace_expired",
+            path=request.url.path,
+            session_id=str(principal.session.id),
+            deadline=(
+                grace.regeneration_deadline.isoformat()
+                if grace.regeneration_deadline is not None
+                else ""
+            ),
+            spare=grace.unused,
+        )
+        return _render_code(
+            request,
+            principal,
+            detail=GRACE_EXPIRED_DETAIL,
+            status_code=403,
+            moment=moment,
+            recovery_note=_recovery_note(grace),
+        )
 
     if not code:
         return _render_code(
@@ -899,6 +1125,342 @@ async def enroll_verify(request: Request, principal: CodeMutation, store: StoreD
             ),
         )
 
+    # Пачка резервных кодов выпускается здесь и больше нигде (§8.2, `ADR-016` п. 2, решение
+    # заказчика от 2026-11-22, ask `2f6bab2b`): значения показываются ровно в этом ответе, а в базе
+    # остаются только хэши. Порядок обращений к слою доступа значим: сначала аннулирование
+    # неиспользованных остатков прежней пачки, затем вставка новой. Наоборот — нельзя: аннулирование
+    # идёт по предикату `used_at IS NULL` и, вызванное после вставки, задевает и новую пачку,
+    # то есть оставляет учётную запись без единого рабочего кода. Это проверяет живой файл
+    # `tests/integration/test_backup_codes_db.py` (job `миграции`).
+    #
+    # Открытые значения в слой не передаются никогда: хэши считаются здесь, между генерацией и
+    # показом (`ADR-016` п. 3, п. 7). `superseded == 0` при первом выпуске — норма, а не ошибка:
+    # прежней пачки ещё нет.
+    codes = new_backup_codes()
+    superseded = store.invalidate_unused_backup_codes(user.id)
+    store.insert_backup_code_hashes(user.id, tuple(hash_backup_code(code) for code in codes))
+    log.info(
+        "backup_codes_issued",
+        user_id=str(user.id),
+        session_id=str(principal.session.id),
+        count=len(codes),
+        superseded=superseded,
+    )
+
     advance_auth_step(principal.session, step="totp", now=moment)
     touch_session(store, principal)
-    return RedirectResponse(TOTP_CODE_PATH, status_code=302)
+    # Не редирект, а страница: значения пачки живут только в этом ответе, а redirect обязан был бы
+    # либо выбросить их, либо выести в параметр адреса (след в access-логе прокси и в истории
+    # браузера — `ADR-016` п. 11 про «показ обязан быть один раз»). Шаг `'totp'` при этом подняан,
+    # и ссылка на странице ведёт на `GET /totp` за **новым** кодом входа: коды подтверждения
+    # израсходованы (`ADR-015` п. 3).
+    return _render_enroll(
+        request,
+        principal,
+        state="issued",
+        detail="",
+        status_code=200,
+        moment=moment,
+        note=CONFIRM_NOTE,
+        codes=codes,
+    )
+
+
+# ─── резервный код входа (§9.3 п. 3, `ADR-016` п. 6, 7, 9; `T-104`, срез `R5c`) ────────────
+
+
+def _render_recovery(
+    request: Request,
+    principal: Principal,
+    *,
+    detail: str,
+    status_code: int,
+    note: str = RECOVERY_NOTE,
+    warning: str = "",
+    spare: int = 0,
+    spent: bool = False,
+    form: bool = True,
+    locked_url: str | None = None,
+) -> HTMLResponse:
+    """Страница расхода резервного кода (§9.3 п. 3: «расход резервного кода + предупреждение»).
+
+    `spare` — сколько неиспользованных кодов у этой учётной записи. Это описание её набора, а не
+    предъявленного значения: различий «кода нет» / «код чужой» / «код уже потрачен» в ответе на
+    отказ нет намеренно (§8.8, `ADR-016` п. 5), и `spare` их не вносит.
+
+    `spent` — успех: форма больше не нужна (сессия уже на шаге `'full'`, и повторить расход нечем),
+    а предупреждение §8.2 обязано остаться в том же ответе, где код был истрачен: редирект в
+    консоль выбросил бы его, а консоль в вехе M1 ещё не построена (§9.3 п. 3 держит предупреждение
+    именно на этой странице).
+    """
+    context = {
+        "page_title": "Резервный код входа",
+        "detail": detail,
+        "note": note,
+        "warning": warning,
+        "spare": spare,
+        "spent": spent,
+        "form": form,
+        "recovery_url": MFA_RECOVERY_PATH,
+        "code_url": TOTP_CODE_PATH,
+        "console_url": POST_CODE_REDIRECT,
+        "locked_url": locked_url,
+    } | csrf_context(principal)
+    response: HTMLResponse = request.app.state.templates.TemplateResponse(
+        request, "mfa_recovery.html", context, status_code=status_code
+    )
+    return response
+
+
+def _recovery_denied(
+    request: Request,
+    principal: Principal,
+    *,
+    detail: str,
+    until: datetime,
+    reason: str,
+    moment: datetime,
+    spare: int = 0,
+) -> HTMLResponse:
+    """Тот же отказ «вход закрыт до срока» на странице резервного кода: `429` + `Retry-After`.
+
+    Форма отказа общая со страницей кода и входа (`ADR-007`, ask `ba6a9076`): различие только в
+    разметке, потому что отдать вместо этой формы страницу кода означало бы предложить человеку
+    вводить код из генератора там, где генератор у него как раз и не работает.
+    """
+    response = _render_recovery(
+        request,
+        principal,
+        detail=detail,
+        status_code=429,
+        spare=spare,
+        locked_url=f"{LOCKED_PATH}?{REASON_QUERY}={reason}",
+    )
+    response.headers["Retry-After"] = str(retry_after_seconds(until, moment))
+    return response
+
+
+@router.get(MFA_RECOVERY_PATH, response_class=HTMLResponse)
+def recovery_page(request: Request, principal: CodeSession, store: StoreDep) -> Response:
+    """Страница резервного кода (§9.3 п. 3) — состояние, а не действие.
+
+    Порядок — как у страницы кода, и основания те же:
+
+    1. живая сессия шага `'password'`/`'totp'` — зависимостью `require_code_page_session`; полная
+       сессия уходит в консоль: расход кода и есть шаг полной аутентификации (`ADR-016` п. 9),
+       повторить его нечем;
+    2. подтверждённой привязки нет → редирект на `/mfa-enroll`: у учётной записи без привязки не
+       бывает выпущенной пачки, и предлагать форму с заведомо неверным ответом нельзя;
+    3. блокировка перебором → объяснение без `429` (тот же порядок, что у `GET /totp`: этот код
+        отвечает на запрос *войти*, а не на открытие страницы);
+    4. неиспользованных кодов нет → форма не показывается: вводить нечего, а состояние обязано
+       быть объяснено (§9), в том числе с принятым риском `ADR-016` п. 6;
+    5. счётчики частоты на `GET` не тратятся (§8.3 считает мутации).
+
+    Файл ключей здесь не читается намеренно: резервному коду нечего расшифровывать, и это его
+    смысл — путь остаётся работающим и тогда, когда страница кода отвечает `503` из-за недоступного
+    `kek.json` (`ADR-015` п. 7).
+    """
+    moment = utc_now()
+    user = store.user_of_id(principal.session.user_id)
+    if user is None:
+        return _account_gone()
+    enrollment = store.active_enrollment(user.id)
+    if enrollment is None or enrollment.confirmed_at is None:
+        raise SessionRedirect(MFA_ENROLL_PATH)
+    state = recovery_state(store.backup_code_rows(user.id), now=moment)
+    try:
+        ensure_login_allowed(user, now=moment)
+    except LoginLockedError as exc:
+        return _render_recovery(
+            request,
+            principal,
+            detail=_lock_explanation(exc.until),
+            status_code=200,
+            warning=_recovery_note(state),
+            spare=state.unused,
+            locked_url=f"{LOCKED_PATH}?{REASON_QUERY}={LOCK_REASON_ATTEMPTS}",
+        )
+    if state.unused == 0:
+        return _render_recovery(
+            request,
+            principal,
+            detail=NO_SPARE_CODE_DETAIL,
+            status_code=200,
+            warning=_recovery_note(state),
+            spare=0,
+            form=False,
+        )
+    return _render_recovery(
+        request,
+        principal,
+        detail="",
+        status_code=200,
+        warning=_recovery_note(state),
+        spare=state.unused,
+    )
+
+
+@router.post(MFA_RECOVERY_PATH, response_class=Response)
+async def recovery_submit(request: Request, principal: CodeMutation, store: StoreDep) -> Response:
+    """Расход резервного кода: канон, поиск среди неиспользованных, guarded-переход, `'full'`.
+
+    Начало порядка общее со страницей кода: токен и предел мутаций пользователя — зависимостью,
+    шаг страницы — последней зависимостью, затем активный бан адреса (§8.2), обе области лимита
+    кода (§8.3), блокировка учётной записи и состояние привязки. Основания для общих счётчиков —
+    `ADR-016` п. 8: §8.2 считает попытки **второго фактора**, а не поля формы, и раздельные
+    счётчики дали бы 5 + 5 попыток с обходом блокировки чередованием полей.
+
+    Дальше — сам расход, в порядке `ADR-016` п. 7:
+
+    1. пустая форма и отказ по формату — `400` **без** строки в ленте неудач: пустое поле и набор
+       знаков вне алфавита не являются попыткой угадать значение, и не должны приближать
+       блокировку (§8.2, `ADR-016` п. 5);
+    2. канон и хэш (`hash_backup_code` сам вызывает `normalize_backup_code`) — иначе «тот же код,
+       перенесённый из показа `ABCDE-FGHJK`» сжёг бы попытку (п. 4 там же);
+    3. поиск строго среди неиспользованных строк своей учётной записи
+       (`find_unused_backup_code`) — иначе страница различила бы «такого кода нет» и «такой код
+       уже потрачен», то есть стала бы оракулом для того, кто подсмотрел экран при выпуске пачки
+       (п. 3 и п. 5);
+    4. guarded-`UPDATE` расхода (`spend_backup_code`), успех только при `rowcount == 1` — «нашёл,
+       пометил» в двух запросах израсходовало бы один код дважды (п. 7; обязательная живая
+       `test_backup_code_single_use`). Отказ перехода неотличим для человека от «кода нет»,
+       различие уходит в лог (`found`);
+    5. перевод сессии на `'full'` — шаг полной аутентификации (§8.2 «расход кода = шаг полной
+       аутентификации», `ADR-016` п. 9), не промежуточное состояние: `password` → `full` допустим
+       прямо (`packages/identity/sessions.advance_auth_step`).
+
+    Просроченный семидневный срок здесь **не** блокирует запрос: блокировка живёт на переходе
+    «пароль + код 2FA» (`code_submit`), а резервный путь открыт ровно тогда, когда есть
+    неиспользованные строки, — это проверяет поиск на шаге 3, а не отдельный флаг (решение
+    заказчика от 2026-11-22, ask `2f6bab2b`, `ADR-016` п. 6).
+
+    Отдельно: счётчики `totp_session`/`totp_ip` — те же области, что у страницы кода. Новой
+    области в закрытом перечне схемы (`packages.storage.models.RATE_SCOPES`, CHECK `0003`) нет, и
+    заводить её под резервный код нельзя без новой ревизии и отдельного решения заказчика: §8.3
+    называет лимиты для `/totp`, а резервный код — та же попытка второго фактора (п. 8 того же
+    ADR), значит и частота общая.
+    """
+    fields = await form_fields(request)
+    raw = fields.get(FIELD_BACKUP_CODE, "").strip()[:MAX_BACKUP_CODE_CHARS]
+    moment = utc_now()
+    address = session_ip(request)
+
+    banned = ban_until(store, address, moment=moment)
+    if banned is not None:
+        return _recovery_denied(
+            request,
+            principal,
+            detail=_address_explanation(banned),
+            until=banned,
+            reason=LOCK_REASON_RATE,
+            moment=moment,
+        )
+    try:
+        enforce_scope(store, TOTP_SESSION_SCOPE, str(principal.session.id), moment=moment)
+        enforce_scope(store, TOTP_IP_SCOPE, address, moment=moment)
+    except RateLimitExceeded as exc:
+        return _recovery_denied(
+            request,
+            principal,
+            detail=_address_explanation(exc.until),
+            until=exc.until,
+            reason=LOCK_REASON_RATE,
+            moment=moment,
+        )
+
+    user = store.user_of_id(principal.session.user_id)
+    if user is None:
+        return _account_gone()
+    try:
+        ensure_login_allowed(user, now=moment)
+    except LoginLockedError as exc:
+        return _recovery_denied(
+            request,
+            principal,
+            detail=_lock_explanation(exc.until),
+            until=exc.until,
+            reason=LOCK_REASON_ATTEMPTS,
+            moment=moment,
+        )
+
+    enrollment = store.active_enrollment(user.id)
+    if enrollment is None or enrollment.confirmed_at is None:
+        raise SessionRedirect(MFA_ENROLL_PATH)
+
+    if not raw:
+        return _render_recovery(
+            request, principal, detail=EMPTY_BACKUP_CODE_DETAIL, status_code=400
+        )
+    try:
+        code_hash = hash_backup_code(raw)
+    except BackupCodeFormatError as exc:
+        # Значения в журнале нет: текст отказа их не содержит (`ADR-016` п. 4), а в лог уходит
+        # только причина.
+        log.info(
+            "backup_code_format_rejected",
+            path=request.url.path,
+            session_id=str(principal.session.id),
+            detail=str(exc),
+        )
+        return _render_recovery(request, principal, detail=RECOVERY_FORMAT_DETAIL, status_code=400)
+
+    # Снимок набора до расхода: он нужен и для объяснения страницы, и для честного остатка после
+    # guarded-`UPDATE` (после него строка в identity map не обновляется — см.
+    # `_recovery_warning_after_spend`).
+    spare = recovery_state(store.backup_code_rows(user.id), now=moment).unused
+
+    row = store.find_unused_backup_code(user_id=user.id, code_hash=code_hash)
+    spent = row is not None and store.spend_backup_code(code_id=row.id, user_id=user.id)
+    if not spent:
+        log.warning(
+            "backup_code_rejected",
+            path=request.url.path,
+            session_id=str(principal.session.id),
+            # `found=True` означает «неиспользованный найден, но guarded-переход отказал»: его
+            # израсходовали параллельно. Для человека это тот же отказ, для разбора — другая
+            # причина, и она не должна уезжать в ответ (§8.8).
+            found=row is not None,
+        )
+        return _rejection_answer(
+            store,
+            user,
+            address,
+            moment=moment,
+            render=lambda detail, status_code: _render_recovery(
+                request,
+                principal,
+                detail=detail,
+                status_code=status_code,
+                spare=spare,
+            ),
+            denied=lambda detail, until, reason: _recovery_denied(
+                request,
+                principal,
+                detail=detail,
+                until=until,
+                reason=reason,
+                moment=moment,
+                spare=spare,
+            ),
+            failure_detail=RECOVERY_FAILURE_DETAIL,
+        )
+
+    advance_auth_step(principal.session, step="full", now=moment)
+    touch_session(store, principal)
+    spare_left = max(spare - 1, 0)
+    log.info(
+        "backup_code_spent",
+        user_id=str(user.id),
+        session_id=str(principal.session.id),
+        spare_left=spare_left,
+    )
+    return _render_recovery(
+        request,
+        principal,
+        detail=RECOVERY_SPENT_DETAIL,
+        status_code=200,
+        warning=_recovery_warning_after_spend(spare_left, moment),
+        spare=spare_left,
+        spent=True,
+    )

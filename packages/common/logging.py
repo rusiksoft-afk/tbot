@@ -66,6 +66,11 @@ _MASK_KEYS: frozenset[str] = frozenset(
         "tg_bot_token",
         "tg_socks_password",
         "backup_codes",
+        # Имя поля формы резервного кода (`FIELD_BACKUP_CODE` в `routes/totp.py`): значение кода —
+        # секрет входа, оно живёт в HTTP-ответе ровно один показ (`ADR-016` п. 2) и обязано
+        # маскироваться, если попадёт в запись журнала. Множественное число `backup_codes` рядом
+        # держится на случай коллективной передачи пачки — маскируются обе формы имени.
+        "backup_code",
         "totp_secret",
     }
 )

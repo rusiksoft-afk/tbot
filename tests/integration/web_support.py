@@ -304,6 +304,26 @@ class MemoryStore:
                 count += 1
         return count
 
+    def backup_code_rows(self, user_id: UUID) -> tuple[BackupCode, ...]:
+        """Зеркало `SqlStore.backup_code_rows`: обе половины набора своей учётки.
+
+        Порядок перенесён осознанно (`created_at`, `id`), хотя в памяти он и так был бы
+        «порядком вставки»: без сортировки офлайновая половина читала бы другой набор, чем
+        боевой путь, и расхождение порядка строк не поймал бы ни один офлайновый тест. Живая
+        часть утверждения — в `tests/integration/test_backup_codes_db.py` (job `миграции`).
+
+        Чего память не доказывает: что даты пришли из `now()` базы. В памяти `created_at` и
+        `used_at` ставит процесс (`insert_backup_code_hashes` и `spend_backup_code`), поэтому
+        «пара дат из одних часов» здесь выполняется по построению, а на базе это отдельная
+        проверка живого файла.
+        """
+        return tuple(
+            sorted(
+                (row for row in self._backup_codes if row.user_id == user_id),
+                key=lambda row: (row.created_at, row.id),
+            )
+        )
+
     # ─── счётчик частоты запросов (срез `R3d`, `ADR-007`) ────────────────────────────
     #
     # Здесь хранятся те же окна, что и в `rate_buckets`, но без схемы: атомарность

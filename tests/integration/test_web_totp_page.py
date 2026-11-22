@@ -85,6 +85,7 @@ from apps.web.security.sessions import (
 )
 from packages.common.config import Settings
 from packages.common.logging import configure_logging
+from packages.identity.backup_codes import BACKUP_CODE_COUNT
 from packages.identity.totp import (
     TOTP_FAILURE_HORIZON,
     TOTP_MAX_FAILED_CODES,
@@ -120,6 +121,11 @@ CODE_SCOPES: Final = frozenset({TOTP_SESSION_SCOPE, TOTP_IP_SCOPE})
 
 META_TOKEN = re.compile(r'name="csrf-token" content="([^"]+)"')
 SECRET_BLOCK = re.compile(r"<code>([A-Z2-7]{16,128})</code>")
+#: Показные формы выпущенной пачки (`ABCDE-FGHJK`, `display_backup_code`). Разделители в канон не
+#: входят (`ADR-016` п. 4), поэтому проверка ловит форму, а не конкретный дефис: алфавит без `I`,
+#: `O`, `L`, `0`, `1` здесь намеренно упрощён до `[A-Z2-9]` — смысл проверки в том, что пачка
+#: показана целиком и значения в ответе настоящие, а не в том, какие именно буквы выпали.
+ISSUED_BLOCK = re.compile(r"<code>([A-Z2-9]{5}-[A-Z2-9]{5})</code>")
 
 
 class Clock:
@@ -283,7 +289,15 @@ def _пара(secret: str, moment: datetime) -> tuple[str, str]:
 def _подтвердить(
     client: TestClient, secret: str, clock: Clock, *, address: str = ADDRESS_A
 ) -> tuple[str, str]:
-    """Подтвердить привязку парой из соседних окон; вернуть эту пару."""
+    """Подтвердить привязку парой из соседних окон; вернуть эту пару.
+
+    Успешный ответ — `200` с пачкой резервных кодов, а не `302` (`ADR-016` п. 2 и п. 11, решение
+    заказчика от 2026-11-22, ask `2f6bab2b`): значения показываются ровно один раз и ровно в этом
+    ответе, поэтому редирект физически не смог бы их вынести — он либо выбросил бы значения, либо
+    унёс бы их в параметр адреса (след в access-логе прокси и в истории браузера). Отсюда и форма
+    проверки: `200` плюс все `BACKUP_CODE_COUNT` значений в ответе. Она ловит и возврат к редиректу,
+    и пропажу пачки, и её частичный показ.
+    """
     token = _токен(client)
     first, second = _пара(secret, clock())
     response = client.post(
@@ -292,8 +306,10 @@ def _подтвердить(
         headers=_headers(address=address),
         follow_redirects=False,
     )
-    assert response.status_code == 302, response.text
-    assert response.headers["location"] == TOTP_CODE_PATH
+    assert response.status_code == 200, response.text
+    assert (
+        len(ISSUED_BLOCK.findall(response.text)) == BACKUP_CODE_COUNT
+    ), f"ответ подтверждения не показал пачку резервных кодов целиком: {response.text[:600]}"
     return first, second
 
 
