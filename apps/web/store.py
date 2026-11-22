@@ -33,6 +33,14 @@
 `id` для вывода CSRF-токена, отметки для списка устройств). При значении по умолчанию каждое такое
 чтение ушло бы новым запросом, а после закрытия соединения — ошибкой.
 
+**Резервные коды (`T-104`, срез `R5b`).** Одноразовость — свойство перехода, а не значения
+(`ADR-016` п. 7), поэтому в слое доступа есть guarded-`UPDATE` расхода и аннулирования, а не
+«прочитали `used_at`, решили, записали». Момент расхода ставит **база** (`SET used_at = now()`),
+а не процесс: семидневный срок (`ADR-016` п. 6) считается по паре `created_at` / `used_at`, и если
+одну дату даёт база, а другую — часы контейнера, то при расхождении часов на несколько секунд
+перевыпуск пачки перестал бы сниматься с обязательства перевыпустить (новая строка оказалась бы
+«создана раньше расхода») — ровно та ничья, ради которой в `ADR-016` выбрано `>=`.
+
 **Движок живёт вместе с приложением.** Отдельного `dispose` нет: процесс `web` один на приложение и
 завершается вместе с ним (в составе — `restart` контейнера, а не пересоздание приложения).
 """
@@ -40,22 +48,30 @@
 from __future__ import annotations
 
 import secrets
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol, cast
 from uuid import UUID
 
 from fastapi import Request
-from sqlalchemy import create_engine, or_, select, update
+from sqlalchemy import create_engine, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.engine import CursorResult, Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from packages.common.config import Settings
 from packages.common.db import sqlalchemy_url
+from packages.identity.backup_codes import BackupCodeError, is_sha256_hex
 from packages.identity.passwords import hash_password, verify_password
-from packages.storage.models import RateBucket, TotpEnrollment, TotpFailure, User, UserSession
+from packages.storage.models import (
+    BackupCode,
+    RateBucket,
+    TotpEnrollment,
+    TotpFailure,
+    User,
+    UserSession,
+)
 
 #: Верхняя граница длины `user_agent`: значение приходит из заголовка, которое контролирует клиент,
 #: а колонка `sessions.user_agent` — `TEXT` без CHECK (при этом §8.3 показывает её пользователю в
@@ -218,6 +234,99 @@ class Store(Protocol):
         действующей привязкой»: различать их незачем, для вызывающего это один отказ `replay`.
         """
 
+    # ─── резервные коды (§8.2, `T-104`, срез `R5b`, `ADR-016` п. 7) ──────────────────────
+
+    def insert_backup_code_hashes(self, user_id: UUID, code_hashes: Sequence[str]) -> None:
+        """Вставить пачку хэшей резервных кодов учётной записи (§8.2: «10 шт.», «10 разных»).
+
+        Значений здесь нет и быть не может: метод принимает хэши, потому что открытое значение
+        живёт ровно один момент — между генерацией и показом человеку (`ADR-016` п. 2). Иначе
+        секрет входа уехал бы в связанные значения запроса (`pg_stat_statements`) и в журнал.
+
+        Пачка проверяется до обращения к базе, и обе проверки не косметика:
+
+        * форма хэша (`is_sha256_hex`) — та же, что у `CHECK ck_backup_codes_code_hash_sha256`.
+          Строка другой формы — «битая» запись, которую уже не отличить от «кода нет»
+          (`ADR-016` п. 7); отказ здесь виден как дефект кода, а не как `IntegrityError`
+          посреди HTTP-запроса;
+        * повторы внутри пачки — их держит и `uq_backup_codes_user_id_code_hash`, но ценой
+          `UniqueViolation` на половине вставленных строк: транзакт откатился бы целиком, а
+          человек увидел бы «коды выпущены» без единого кода.
+
+        Метод ничего не возвращает: он либо вставляет всю пачку, либо не вставляет ничего
+        (отказ — исключение до запроса). Сколько строк в таблице — проверяет живая проверка
+        запросом к таблице, а не числом из драйвера: `rowcount` у многострочного `INSERT` —
+        деталь реализации.
+
+        Порядок при повторной генерации: сначала `invalidate_unused_backup_codes`, потом этот
+        метод. Наоборот — нельзя, и это отдельная живая проверка: аннулирование идёт по
+        предикату `used_at IS NULL`, поэтому вызванное **после** вставки задевает и новую пачку,
+        то есть выпускает учётную запись без единого рабочего кода.
+        """
+
+    def find_unused_backup_code(self, *, user_id: UUID, code_hash: str) -> BackupCode | None:
+        """Неиспользованная строка кода по хэшу; `None`, если такой строки нет (§8.2).
+
+        Предикат `used_at IS NULL` — часть поиска, а не «нашли и проверили потом». Без него
+        страница резервного кода начала бы различать «такого кода нет» и «такой код уже
+        потрачен»: это бесплатный оракул для того, кто знает чужое значение (например подсмотрел
+        экран при выпуске пачки) — `ADR-016` п. 3 и п. 5.
+
+        Ограничение `user_id` стоит в самом запросе по той же причине, что у `session_of_user`
+        (§8.8: чужие данные → один отказ без утечки): поиск чужого значения не находит ничего и
+        ничего не меняет. Форма `WHERE user_id = … AND code_hash = … AND used_at IS NULL`
+        попадает в частичный индекс `ix_backup_codes_user_id_unused` (`WHERE used_at IS NULL`);
+        без предиката поиск выродился бы в чтение всех строк учётки, и «индекс есть» перестал бы
+        что-либо значить.
+
+        Строка возвращается как есть, со своим `code_hash`: решение «сверять» принимает домен
+        (`backup_code_matches`), а различие «хэш в строке битый» и «кода нет» остаётся
+        различимым (`is_sha256_hex`), а не прячется самим фактом неудачного поиска.
+        """
+
+    def spend_backup_code(self, *, code_id: UUID, user_id: UUID) -> bool:
+        """Израсходовать код: `True`, если строка ещё не была израсходована (`ADR-016` п. 7).
+
+        Один `UPDATE` с условием, а не «прочитать `used_at`, сравнить, записать»: два входа с
+        одним кодом прочитали бы одно и то же состояние и прошли бы оба, и правило §8.2
+        «одноразовые» перестало бы выполняться именно под параллельными входами — там, где оно и
+        нужно. Тот же дефект уже закрывался для TOTP-кода (`ADR-015` п. 5, `claim_totp_step`).
+
+        Состояние строки в условии здесь одно (`used_at IS NULL`): в отличие от
+        `claim_totp_step`, где между чтением привязки и записью шага привязку могут отозвать,
+        `user_id` строки резервного кода не меняется никогда. Он в условии всё равно стоит — по
+        той же причине, что у `session_of_user`: мутация ограничена учётной записью в самом
+        запросе, и ошибка вызывающего (id из формы) физически не может израсходовать чужой код.
+
+        Момент расхода ставит база (`now()`), а не часы процесса — иначе семидневный срок
+        `ADR-016` п. 6 считался бы по часам двух разных машин (подробности — в шапке модуля).
+
+        `False` означает и «код уже потрачен», и «такого кода у этой учётной записи нет»:
+        различать их нельзя намеренно (§8.8), для вызывающего это один и тот же отказ.
+        """
+
+    def invalidate_unused_backup_codes(self, user_id: UUID) -> int:
+        """Аннулировать неиспользованные остатки прежних пачек учётки (§8.2, срез `R5b`).
+
+        «Повторная генерация аннулирует прежние» — и аннулируются именно неиспользованные:
+        израсходованные строки не трогаются и не удаляются. В них держится `used_at` — единственный
+        след начала семидневного срока (`ADR-016` п. 6): удалив их, приложение молча сняло
+        бы обязательство перевыпустить и блокировку входа по просрочке. Аннулированные тоже
+        остаются: `DELETE` стёр бы сам факт выпуска пачки, а ретенция — задача `jobs` (`T-031`),
+        не слой входа.
+
+        Отдельного столбца «аннулирован» в `backup_codes` нет (схемы `0001`…`0004` его не
+        заводили, и новая ревизия под него означала бы два места одного правила — как в `ADR-016`
+        п. 6 про срок). `used_at` для аннулирования — осознанная замена: для `recovery_state`
+        «неиспользованных строк нет» и «расход был» — разные признаки, и обязательство перевыпуска
+        снимается выпуском новой пачки (`created_at >= max(used_at)`), который идёт в том же
+        переходе и том же транзакте, где `now()` у базы один на обе операции.
+
+        Возвращает число аннулированных строк — его обязан проверить тот, кто вызвал: «аннулировано
+        ноль» при повторной генерации означает, что вызывающий перепутал порядок (сначала надо
+        аннулировать, потом вставлять).
+        """
+
     def commit(self) -> None:
         """Зафиксировать изменения текущего запроса.
 
@@ -342,6 +451,77 @@ class SqlStore:
 
     def commit(self) -> None:
         self._session.commit()
+
+    # ─── резервные коды (§8.2, `T-104`, срез `R5b`) ───────────────────────────────────────
+    #
+    # Значений кодов здесь нет: в слой доступа приходят хэши. Что значение не уезжает ни в
+    # запросы, ни в связанные значения, ни в текст отказа, проверяет живой файл
+    # `tests/integration/test_backup_codes_db.py` (job `миграции`) — в памяти этой границы нет
+    # вообще, потому что там нет ни SQL, ни `pg_stat_statements`.
+
+    def insert_backup_code_hashes(self, user_id: UUID, code_hashes: Sequence[str]) -> None:
+        if not code_hashes:
+            raise BackupCodeError("пустая пачка резервных кодов: ни одного хэша")
+        seen: set[str] = set()
+        for position, code_hash in enumerate(code_hashes, start=1):
+            # Значение и сам хэш в текст отказа не подставляются: хэш резервного кода —
+            # проверочное значение входа (`ADR-016` п. 3), он не уходит в журнал.
+            if not is_sha256_hex(code_hash):
+                raise BackupCodeError(
+                    f"хэш №{position} в пачке не формы SHA-256 hex: битая строка в наборе"
+                )
+            if code_hash in seen:
+                raise BackupCodeError(
+                    f"хэш №{position} повторяется в пачке: коды обязаны быть разными"
+                )
+            seen.add(code_hash)
+
+        statement = insert(BackupCode).values(
+            [{"user_id": user_id, "code_hash": code_hash} for code_hash in code_hashes]
+        )
+        self._session.execute(statement)
+
+    def find_unused_backup_code(self, *, user_id: UUID, code_hash: str) -> BackupCode | None:
+        statement = select(BackupCode).where(
+            BackupCode.user_id == user_id,
+            BackupCode.code_hash == code_hash,
+            # Предикат живой строки — в запросе: иначе «израсходован» и «не существует»
+            # становятся разными ответами страницы (§8.8).
+            BackupCode.used_at.is_(None),
+        )
+        return self._session.execute(statement).scalar_one_or_none()
+
+    def spend_backup_code(self, *, code_id: UUID, user_id: UUID) -> bool:
+        statement = (
+            update(BackupCode)
+            .where(
+                BackupCode.id == code_id,
+                BackupCode.user_id == user_id,
+                BackupCode.used_at.is_(None),
+            )
+            .values(used_at=func.now())
+            # `synchronize_session=False` — как у `claim_totp_step`: объект, который вызывающий
+            # читал перед расходом, намеренно остаётся несинхронизированным, а лишний `SELECT`
+            # перед `UPDATE` только добавил бы окно между чтением и переходом.
+            .execution_options(synchronize_session=False)
+        )
+        result = cast("CursorResult[Any]", self._session.execute(statement))
+        return bool(result.rowcount == 1)
+
+    def invalidate_unused_backup_codes(self, user_id: UUID) -> int:
+        statement = (
+            update(BackupCode)
+            .where(
+                BackupCode.user_id == user_id,
+                # Только неиспользованные: израсходованные держат след начала семидневного
+                # срока (`ADR-016` п. 6 и п. 11), их аннулирование сняло бы блокировку входа.
+                BackupCode.used_at.is_(None),
+            )
+            .values(used_at=func.now())
+            .execution_options(synchronize_session=False)
+        )
+        result = cast("CursorResult[Any]", self._session.execute(statement))
+        return int(result.rowcount)
 
     def bump_rate_bucket(
         self,

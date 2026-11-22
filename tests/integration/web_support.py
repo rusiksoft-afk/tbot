@@ -18,6 +18,7 @@ CSRF-токена и объясняющих страниц должны запу
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Final, cast
@@ -35,10 +36,13 @@ from apps.web.security.sessions import (
     require_full_session,
 )
 from apps.web.store import BucketWindow, Store, get_store
+from packages.common.clock import utc_now
 from packages.common.config import Settings
+from packages.common.ids import uuid7
+from packages.identity.backup_codes import BackupCodeError, is_sha256_hex
 from packages.identity.sessions import IssuedSession, token_hash_of
 from packages.identity.users import new_user
-from packages.storage.models import TotpEnrollment, TotpFailure, User, UserSession
+from packages.storage.models import BackupCode, TotpEnrollment, TotpFailure, User, UserSession
 
 #: Пароль тестовой учётной записи: проходит §8.1 (длина, словарь, «пароль = логин/домен»), иначе
 #: `new_user` откажется создавать запись и проверка дойдёт до входа уже с другим пользователем.
@@ -65,6 +69,7 @@ class MemoryStore:
         self._buckets: dict[tuple[str, str, datetime], tuple[int, int]] = {}
         self._enrollments: dict[UUID, TotpEnrollment] = {}
         self._totp_failures: list[TotpFailure] = []
+        self._backup_codes: list[BackupCode] = []
         self.commits: int = 0
         self.hash_lookups: list[str] = []
 
@@ -201,6 +206,103 @@ class MemoryStore:
 
     def commit(self) -> None:
         self.commits += 1
+
+    # ─── резервные коды (§8.2, `T-104`, срез `R5b`, `ADR-016` п. 7) ──────────────────
+    #
+    # Зеркало `SqlStore`: те же предикаты и тот же порядок вызовов. Чего память не доказывает,
+    # и переносить это сюда нельзя: атомарность guarded-`UPDATE` (два «параллельных» входа в одном
+    # тесте физически не приходят, поэтому «нашёл — пометил» прошёл бы в памяти так же зелёно),
+    # наличие `used_at IS NULL` в тексте SQL и попадание в частичный индекс
+    # `ix_backup_codes_user_id_unused`, `CHECK ck_backup_codes_code_hash_sha256`,
+    # `uq_backup_codes_user_id_code_hash`, момент `now()` из базы и то, что значение кода не
+    # уезжает ни в запрос, ни в связанные значения. Всё это держит живой файл
+    # `tests/integration/test_backup_codes_db.py` (job `миграции`), включая обязательную
+    # `test_backup_code_single_use`.
+
+    def insert_backup_code_hashes(self, user_id: UUID, code_hashes: Sequence[str]) -> None:
+        """Зеркало `SqlStore.insert_backup_code_hashes`: пачка только из хэшей (§8.2).
+
+        Те же два отказа до «записи»: форма хэша и повторы внутри пачки. Их держат и `CHECK`, и
+        уникальный индекс на базе, но проверка здесь нужна, чтобы офлайновая половина слоя
+        видела тот же класс отказа, что и боевой путь, а не `IntegrityError`.
+        """
+        if not code_hashes:
+            raise BackupCodeError("пустая пачка резервных кодов: ни одного хэша")
+        seen: set[str] = set()
+        for position, code_hash in enumerate(code_hashes, start=1):
+            if not is_sha256_hex(code_hash):
+                raise BackupCodeError(
+                    f"хэш №{position} в пачке не формы SHA-256 hex: битая строка в наборе"
+                )
+            if code_hash in seen:
+                raise BackupCodeError(
+                    f"хэш №{position} повторяется в пачке: коды обязаны быть разными"
+                )
+            seen.add(code_hash)
+        for code_hash in code_hashes:
+            # `id` и `created_at` в памяти проставляются явно: на боевом пути их даёт база
+            # (`default=_new_uuid` и `server_default=now()` срабатывают только при флеше, а здесь
+            # флеша нет). Без этого `spend_backup_code(code_id=…)` в памяти не находил бы строк,
+            # а `recovery_state` спотыкался бы о `created_at is None`.
+            self._backup_codes.append(
+                BackupCode(
+                    id=uuid7(),
+                    user_id=user_id,
+                    code_hash=code_hash,
+                    used_at=None,
+                    created_at=utc_now(),
+                )
+            )
+
+    def find_unused_backup_code(self, *, user_id: UUID, code_hash: str) -> BackupCode | None:
+        """Зеркало `SqlStore.find_unused_backup_code`: поиск только среди неиспользованных.
+
+        Предикат скопирован побайтово (`user_id`, `code_hash`, `used_at is None`) — иначе
+        офлайн- и живая половины проверяли бы разные наборы, и «израсходованный код» в памяти стал
+        бы различим там, где на базе он даёт один и тот же отказ (§8.8).
+        """
+        return next(
+            (
+                row
+                for row in self._backup_codes
+                if row.user_id == user_id and row.code_hash == code_hash and row.used_at is None
+            ),
+            None,
+        )
+
+    def spend_backup_code(self, *, code_id: UUID, user_id: UUID) -> bool:
+        """Зеркало `SqlStore.spend_backup_code`: тот же предикат guarded-`UPDATE`.
+
+        Честная граница, как у `claim_totp_step`: здесь проверяется только форма предиката —
+        израсходованный код повторно не расходуется, чужой не находится и не меняется. Собственно
+        атомарность и `rowcount = 0` на второй попытке держит живая `test_backup_code_single_use`
+        (`tests/integration/test_backup_codes_db.py`, job `миграции`).
+        """
+        target = next(
+            (
+                row
+                for row in self._backup_codes
+                if row.id == code_id and row.user_id == user_id and row.used_at is None
+            ),
+            None,
+        )
+        if target is None:
+            return False
+        target.used_at = utc_now()
+        return True
+
+    def invalidate_unused_backup_codes(self, user_id: UUID) -> int:
+        """Зеркало `SqlStore.invalidate_unused_backup_codes`: только неиспользованные остатки.
+
+        Израсходованные не трогаются и не удаляются — по той же причине, что на базе: `used_at`
+        держит след начала семидневного срока (`ADR-016` п. 6).
+        """
+        count = 0
+        for row in self._backup_codes:
+            if row.user_id == user_id and row.used_at is None:
+                row.used_at = utc_now()
+                count += 1
+        return count
 
     # ─── счётчик частоты запросов (срез `R3d`, `ADR-007`) ────────────────────────────
     #
