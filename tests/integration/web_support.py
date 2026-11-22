@@ -75,14 +75,41 @@ class MemoryStore:
 
     # ─── наполнение ───────────────────────────────────────────────────────────────────────
 
-    def seed_user(self, *, login: str = TEST_LOGIN, password: str = TEST_PASSWORD) -> User:
-        user = new_user(login=login, password=password, role="operator", state="active")
+    def seed_user(
+        self,
+        *,
+        login: str = TEST_LOGIN,
+        password: str = TEST_PASSWORD,
+        role: str = "operator",
+    ) -> User:
+        """Учётная запись для проверок. Роль по умолчанию — `operator` (срез `R3a`).
+
+        Параметр `role` появился вместе с матрицей допуска (`T-106`, `R6`): проверке нужны три
+        учётные записи разных ролей, а не один пользователь с подменённым полем — иначе матрица
+        «маршрут × роль» проверяла бы поведение одного объекта, а не трёх разных. Значение по
+        умолчанию не менялось: все проверки `R3a`–`R5c` строят операторскую учётку, и смена роли
+        по умолчанию молча переписала бы их смысл. Само значение проходит доменную проверку
+        `new_user` → `ensure_role` (закрытый набор §1.1), так и должен проходит боевой путь.
+        """
+        user = new_user(login=login, password=password, role=role, state="active")
         self._users[login.casefold()] = user
         return user
 
     def seed_session(self, issued: IssuedSession) -> UserSession:
         self._sessions[issued.record.token_hash] = issued.record
         return issued.record
+
+    def drop_user(self, login_value: str) -> User | None:
+        """Снять учётную запись из репозитория — вспомогательное средство проверок (`T-106`).
+
+        Нужен ровно одному классу проверок: «сеанс живой, а строки учётной записи больше нет» —
+        состоянию, которое боевой путь получает из архивации учётной записи или из ручной правки
+        таблицы (`ADR-017` п. 4), а не из кода приложения. В памяти иначе не получить: у протокола
+        `Store` метода удаления нет, и заводить его в боевом протоколе ради проверки нельзя —
+        приложение не должно уметь удалять учётную запись (`users` не удаляется, §4.1: только
+        состояние `state='archived'`).
+        """
+        return self._users.pop(login_value.casefold(), None)
 
     # ─── протокол `Store` ─────────────────────────────────────────────────────────────────
 

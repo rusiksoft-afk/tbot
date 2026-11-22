@@ -20,10 +20,18 @@
   профиля из §9.3 п. 4 (имя, роль, e-mail, дата последнего входа) — `T-111`. Страница начинается с
   той половины, для которой домен готов.
 
-Зависимости охраны берутся из `routes/sessions.py` (`FullSession`, `FullMutation`), а не
-переписываются: цепочка «CSRF-токен → счётчик частоты → шаг `'full'`» обязана быть одной и той же
-для всех мутаций консоли, иначе порядок проверок начнёт расходиться между маршрутами, а контрактный
-тест сверяет именно имена зависимостей у каждого маршрутизатора пакета.
+Зависимости охраны берутся из `routes/sessions.py` (`ConsoleSession`, `ConsoleMutation`), а не
+переписываются: цепочка «CSRF-токен → счётчик частоты → шаг `'full'` → роль»
+обязана быть одной и той же для всех мутаций консоли, иначе порядок проверок
+начнёт расходиться между маршрутами, а контрактный тест сверяет именно имена
+зависимостей у каждого маршрутизатора пакета. Роль в эту цепочку поставил срез `R6`
+(`T-106`): раздел «Профиль и безопасность» карта §9.3 держит доступным любой роли, поэтому
+уровень — `CONSOLE_TIER`, а не `admin` (`docs/adr/ADR-017` п. 5).
+
+С этого же среза здесь нет отдельной ветки «учётной записи сеанса больше нет» (`404
+`account_not_found`): тот же случай отклоняет охрана роли — одним ответом, как и нехватка
+прав (`ADR-017` п. 4). Дву точек отказа на одно состояние быть не может, а учётную запись
+обработчик теперь получает из `load_account`, где `None` уже превращен в отказ.
 """
 
 from __future__ import annotations
@@ -32,10 +40,11 @@ from datetime import datetime
 from typing import Final
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from apps.web.forms import form_fields
-from apps.web.routes.sessions import FullMutation, FullSession
+from apps.web.routes.sessions import ConsoleMutation, ConsoleSession
+from apps.web.security.authorization import load_account
 from apps.web.security.csrf import csrf_context
 from apps.web.security.rate_limit import retry_after_seconds
 from apps.web.security.sessions import (
@@ -86,7 +95,6 @@ EMPTY_FORM_DETAIL: Final = "Нужно заполнить текущий пар�
 REPEAT_MISMATCH_DETAIL: Final = "Новый пароль и его повтор не совпадают. Пароль не изменён."
 WRONG_CURRENT_DETAIL: Final = "Текущий пароль не подошёл. Пароль не изменён."
 POLICY_DETAIL_PREFIX: Final = "Новый пароль не проходит правила: "
-ACCOUNT_GONE_DETAIL: Final = "account_not_found"
 
 
 def _lock_detail(until: datetime) -> str:
@@ -149,18 +157,15 @@ def _denied_locked(
     return response
 
 
-def _account_gone() -> JSONResponse:
-    """`404` без подробностей: учётной записи сессии больше нет в таблице."""
-    return JSONResponse({"status": ACCOUNT_GONE_DETAIL}, status_code=404)
-
-
 @router.get(SECURITY_PATH, response_class=HTMLResponse)
-def security_page(request: Request, principal: FullSession) -> HTMLResponse:
+def security_page(request: Request, principal: ConsoleSession) -> HTMLResponse:
     """Страница «Профиль и безопасность» (§9.3 п. 5).
 
-    Охрана — шаг `'full'` (§8.2), как у списка устройств (`R3e`): смена пароля — действие,
-    завершающее чужие входы, и доступ к нему с пароля без кода 2FA означал бы отказ в обслуживании
-    для владельца.
+    Охрана — шаг `'full'` (§8.2) и любая из трёх ролей (§1.1, §9.3 п. 5 «любая роль»), как у
+    списка устройств (`R3e`): смена пароля — действие, завершающее чужие входы, и доступ к
+    нему с пароля без кода 2FA означал бы отказ в обслуживании для владельца. Роль здесь
+    не различает роли по смыслу, но отвергает значение вне закрытого набора и сеанс
+    без строки учётной записи (`ADR-017` п. 2).
 
     Счётчик частоты на `GET` не тратится на тех же основаниях, что и у списка и подтверждения
     отзыва (§8.3 считает запросы-мутации; лимит на просмотр страницы дал бы способ устроить отказ
@@ -171,15 +176,16 @@ def security_page(request: Request, principal: FullSession) -> HTMLResponse:
 
 @router.post(SECURITY_PATH, response_class=Response)
 async def change_password_submit(
-    request: Request, principal: FullMutation, store: StoreDep
+    request: Request, principal: ConsoleMutation, store: StoreDep
 ) -> Response:
     """Сменить пароль так, как требуют §8.1 и §8.3.
 
     Порядок шагов закреплён за §8.1, §8.2, §8.3 и §8.8, и он не «как получилось»:
 
-    1. токен (`require_csrf`), счётчик частоты пользователя и шаг `'full'` — цепочкой зависимостей
-       (`ADR-008`, `ADR-007`, §8.2): отказ токена не должен стоить обращений в базу и расхода
-       лимита жертвы;
+    1. токен (`require_csrf`), счётчик частоты пользователя, шаг `'full'` и роль — цепочкой
+       зависимостей (`ADR-008`, `ADR-007`, §8.2, `ADR-017` п. 3): отказ токена не должен стоить
+       обращений в базу и расхода лимита жертвы, а роль проверяется последней — до
+       первого чтения объекта маршрута;
     2. пустая форма и несовпадение повтора — отказ до проверки текущего пароля: оба случая ничего
        не меняют и не должны тратить стоимость сравнения Argon2id;
     3. `ensure_login_allowed` **до** сравнения: пока блокировка активна, пароль не проверяется
@@ -213,9 +219,7 @@ async def change_password_submit(
     if new != repeat:
         return _render(request, principal, detail=REPEAT_MISMATCH_DETAIL, status_code=400)
 
-    user = store.user_of_id(principal.session.user_id)
-    if user is None:
-        return _account_gone()
+    user = load_account(store, principal)
 
     try:
         ensure_login_allowed(user, now=moment)

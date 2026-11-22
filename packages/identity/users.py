@@ -33,6 +33,7 @@ from datetime import datetime, timedelta
 from typing import Final
 
 from packages.common.clock import ensure_aware
+from packages.identity.authorization import ensure_role
 from packages.identity.passwords import check_password_policy, hash_password
 from packages.storage.models import User
 
@@ -86,11 +87,14 @@ def new_user(
     Пароль проходит §8.1 до создания объекта: политика применяется и здесь, и в
     `apply_new_password` — оба входа в домен обязаны её требовать.
 
-    `state` по умолчанию — `invited` (§1.2: приглашение принято, шага одобрения ещё нет). Домены
-    `role` и `state` сейчас ограничивает CHECK-ограничение схемы; доменная проверка появится вместе
-    с ролями (`T-106`) и приглашениями (`T-105`), и выдумывать её здесь раньше времени нельзя:
-    правильные значения — часть контракта этих задач.
+    `state` по умолчанию — `invited` (§1.2: приглашение принято, шага одобрения ещё нет). Домен
+    `role` проверяется здесь с `T-106` (`packages/identity/authorization.ensure_role`): ровно три
+    роли (§1.1), и проверка обязана наступить до `INSERT`, потому что CHECK схемы отклонил бы
+    значение только ценой `IntegrityError` посреди учётной операции. Домен `state` ограничивает
+    только CHECK схемы: правильные значения этого поля — часть контракта `T-105` (приглашения и
+    одобрение), и выдумывать доменное правило раньше времени нельзя.
     """
+    ensure_role(role)
     check_password_policy(password, login=login, email=email)
     return User(
         login=login,

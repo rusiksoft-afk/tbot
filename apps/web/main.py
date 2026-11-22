@@ -12,9 +12,11 @@
   везде»). Значение ставится явно, а не «как получится у шаблонизатора по умолчанию», потому что
   у Jinja2 по умолчанию экранирование **выключено**;
 * политика отказов слоя входа собрана в обработчиках исключений, а не размазана по маршрутам:
-  `SessionRedirect` → `302` на страницу состояния, отказ CSRF → `403` без подробностей, слишком
-  большое тело формы → `413`, нет адреса базы → `503`, повреждённый хэш пароля → `503`, предел
-  частоты по адресу и бан адреса → `429` с `Retry-After` (§8.2, §8.3), недоступный файл ключей KEK → `503` с объяснением (срез `R4c`, `ADR-014`). Один
+  `SessionRedirect` → `302` на страницу состояния, отказ CSRF → `403` без подробностей, отказ
+  допуска по роли (§1.1, срез `R6`) → `403` тем же фиксированным текстом без имён и счётчиков,
+  слишком большое тело формы → `413`, нет адреса базы → `503`, повреждённый хэш пароля → `503`,
+  предел частоты по адресу и бан адреса → `429` с `Retry-After` (§8.2, §8.3), недоступный файл
+  ключей KEK → `503` с объяснением (срез `R4c`, `ADR-014`). Один
   обработчик на случай нужен не для красоты: «отзыв отражается немедленно» (§8.3) и «CSRF
   обязателен для всех мутаций» (§8.8) теряются ровно тогда, когда каждый маршрут объясняет
   состояние по-своему.
@@ -36,10 +38,12 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from starlette.templating import Jinja2Templates
 
 from apps.web.forms import FormBodyTooLarge
+from apps.web.routes import admin_users as admin_routes
 from apps.web.routes import login as login_routes
 from apps.web.routes import profile as profile_routes
 from apps.web.routes import sessions as session_routes
 from apps.web.routes import totp as totp_routes
+from apps.web.security.authorization import handle_access_denied
 from apps.web.security.csrf import CsrfRejected, csrf_context
 from apps.web.security.headers import apply_security_headers
 from apps.web.security.keys import (
@@ -61,6 +65,7 @@ from packages.common.logging import (
     configure_logging,
     get_logger,
 )
+from packages.identity.authorization import AccessDeniedError
 from packages.identity.passwords import MalformedPasswordHashError
 
 log = get_logger("web")
@@ -143,6 +148,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(session_routes.router)
     app.include_router(profile_routes.router)
     app.include_router(totp_routes.router)
+    app.include_router(admin_routes.router)
 
     @app.middleware("http")
     async def _trace_middleware(request: Any, call_next: Any) -> Any:
@@ -205,6 +211,18 @@ def create_app(settings: Settings) -> FastAPI:
             {"status": "forbidden", "detail": "запрос отклонён"},
             status_code=status.HTTP_403_FORBIDDEN,
         )
+
+    @app.exception_handler(AccessDeniedError)
+    async def _access_denied(request: Request, exc: AccessDeniedError) -> JSONResponse:
+        """`403` единым текстом для любого отказа допуска (§1.1, §8.8, `ADR-017` п. 4).
+
+        Ответ не зависит ни от причины (роль ниже требуемой, роль вне закрытого набора, у сеанса
+        пропала строка учётной записи), ни от маршрута: `AC-identity-01` требует `403` без утечки
+        списка пользователей, а тот же принцип «не быть оракулом» уже принят для резервных кодов
+        (`ADR-016` п. 5). Обработчик один, потому что отказ поднимают зависимости охраны, а не
+        обработчики: иначе «забыли перехватить» появилось бы ровно там, где его не проверяли.
+        """
+        return handle_access_denied(request, exc)
 
     @app.exception_handler(FormBodyTooLarge)
     async def _form_too_large(_request: Request, exc: FormBodyTooLarge) -> JSONResponse:

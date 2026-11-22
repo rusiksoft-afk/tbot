@@ -33,6 +33,12 @@
 
 
 
+Срез `R6` (`T-106`) добавляет в цепочку профиля проверку роли: раздел «Профиль и безопасность»
+карта §9.3 держит как доступный **любой роли**, поэтому уровень допуска — `CONSOLE_TIER`, а не
+`admin`. Меняется не направление отказа (редиректы §8.2 остаются), а его источник: роль решает
+зависимость маршрута, а не разметка страницы (`REQ-identity-01`). Основание и перечень того, что
+ролями не решается, — `docs/adr/ADR-017`.
+
 Почему страница объясняет причину кодом из закрытого набора: §9 требует внятных состояний, а набор
 причин замкнут (`packages/identity/sessions.SESSION_REASON_CODES` плюс `unknown` уровня HTTP).
 Текст из параметра запроса на страницу не попадает никогда — иначе страница состояния стала бы
@@ -50,6 +56,10 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 
+from apps.web.security.authorization import (
+    enforce_role,
+    require_console_role,
+)
 from apps.web.security.csrf import csrf_context, require_csrf
 from apps.web.security.rate_limit import MUTATION_USER_SCOPE, enforce_scope
 from apps.web.security.sessions import (
@@ -74,6 +84,10 @@ from apps.web.security.sessions import (
 )
 from apps.web.store import Store
 from packages.common.clock import to_msk, utc_now
+from packages.identity.authorization import (
+    CONSOLE_TIER,
+    owner_matches,
+)
 from packages.identity.sessions import (
     SessionDescriptor,
     SessionRevokedError,
@@ -141,6 +155,26 @@ def require_full_mutation(principal: RateLimitedMutation) -> Principal:
 
 #: Мутация списка устройств: токен + счётчик + полный вход.
 FullMutation = Annotated[Principal, Depends(require_full_mutation)]
+
+
+def require_console_role_mutation(principal: FullMutation, store: StoreDep) -> Principal:
+    """Мутация раздела «Профиль и безопасность»: цепочка `FullMutation` + роль (§1.1, §9.3 п. 4–5).
+
+    Роль ставится последним шагом — сразу после шага `'full'` и перед любым чтением объектов
+    (`ADR-017` п. 3): отказ, вынесенный до поиска, не может сказать, существует ли объект. Отдельная
+    зависимость, а не `require_console_role` рядом с `FullMutation`: иначе живой сеанс проверялся бы
+    дважды (CSRF-цепочка и охрана роли), а два обращения к строке сеанса могли бы увидеть разное
+    состояние — отзыв другим входом между ними.
+    """
+    enforce_role(store, principal, required=CONSOLE_TIER)
+    return principal
+
+
+#: Мутация профиля: токен + счётчик + полный вход + любая из трёх ролей.
+ConsoleMutation = Annotated[Principal, Depends(require_console_role_mutation)]
+
+#: GET профиля и списка устройств: полный вход + любая из трёх ролей (§9.3 п. 4–5 «любая роль».
+ConsoleSession = Annotated[Principal, Depends(require_console_role)]
 
 #: Объяснения по закрытому набору причин. Формулировки адресованы человеку (TZ §9: состояния должны
 #: быть внятными), а не оператору: коды и числовые границы в текст не выносятся — страница,
@@ -232,6 +266,13 @@ def logout(
     store: StoreDep,
 ) -> Response:
     """Выйти: отозвать текущую сессию и стереть куку (§8.3).
+
+    Это единственный охраняемый маршрут без проверки роли, и он поименован в перечне
+    `_ROLE_EXEMPT` контрактной проверки (`ADR-017` п. 6). Основание: выход ничего не даёт
+    посетителю и ровно убирает доступ, поэтому требовать роль для «выйти» значило бы оставить
+    живой вход у того, кто просит его закрыть — при роли вне закрытого набора (§1.1) или при
+    удалённой строке учётной записи отказ в выходе был бы наказанием за испорченные данные.
+    Охрана остаётся полной: токен (§8.8), счётчик пользователя (§8.3) и живость сеанса.
 
     Отзыв — это запись в базу (`revoked_at`), а не только удаление куки: §8.3 требует немедленной
     видимости отзыва, и запрос с сохранённой копией куки обязан быть отклонён. Порядок «сначала
@@ -427,7 +468,7 @@ def _render_sessions(
 
 
 @router.get(SESSIONS_PATH, response_class=HTMLResponse)
-def sessions_page(request: Request, principal: FullSession, store: StoreDep) -> HTMLResponse:
+def sessions_page(request: Request, principal: ConsoleSession, store: StoreDep) -> HTMLResponse:
     """Список сессий пользователя (§8.3: «сессии видны пользователю»).
 
     `GET` счётчика частоты не имеет: §8.3 ограничивает мутации, а лимит на просмотр страницы дал бы
@@ -449,7 +490,9 @@ def sessions_page(request: Request, principal: FullSession, store: StoreDep) -> 
 
 
 @router.get(SESSIONS_REVOKE_ALL_PATH, response_class=HTMLResponse)
-def revoke_all_confirm(request: Request, principal: FullSession, store: StoreDep) -> HTMLResponse:
+def revoke_all_confirm(
+    request: Request, principal: ConsoleSession, store: StoreDep
+) -> HTMLResponse:
     """Подтверждение «отозвать все»: показывает, что именно будет отозвано (§9.1).
 
     Метод `GET` ничего не меняет. Это не формальность: ссылка подтверждения может быть открыта
@@ -477,14 +520,24 @@ def _owned_live_session(store: Store, principal: Principal, raw_id: str) -> User
     отвечает `422` с перечнем полей, и тогда «ввели мусор в адрес» отличался бы от «сессии нет»,
     а страница отзыва начала бы рассказывать про внутренности схемы параметров. Нужен один ответ на
     все четыре случая (§8.8).
+
+    Владение проверяется двумя контурами, и оба обязаны отвечать одинаково (`ADR-017` п. 4):
+    основной — предикат `user_id` внутри самого `SELECT` (`SqlStore.session_of_user`), он чужую
+    строку не найдёт; второй — `owner_matches` уже по найденной строке, на случай если предикат
+    репозитория когда-нибудь потеряется. Второй контур не имеет права ответить иначе, чем
+    «не нашлось»: §8.8 требует «`operator` к чужим данным → 403/404 без утечки», то есть ответ
+    не вправе сообщать, что объект существует, но чужой.
     """
     try:
         target = UUID(raw_id)
     except ValueError:
         return None
-    return store.session_of_user(
+    record = store.session_of_user(
         session_id=target, user_id=principal.session.user_id, not_expired_before=utc_now()
     )
+    if record is not None and not owner_matches(principal.session.user_id, record.user_id):
+        return None
+    return record
 
 
 def _session_gone() -> JSONResponse:
@@ -516,7 +569,7 @@ def _revoke_finished(*, current_ended: bool) -> Response:
 
 @router.get(SESSION_REVOKE_PATH, response_class=HTMLResponse)
 def revoke_confirm(
-    request: Request, session_id: str, principal: FullSession, store: StoreDep
+    request: Request, session_id: str, principal: ConsoleSession, store: StoreDep
 ) -> Response:
     """Страница подтверждения отзыва одной сессии (§9.1: подтверждение с указанием объекта).
 
@@ -548,11 +601,11 @@ def revoke_confirm(
 
 
 @router.post(SESSION_REVOKE_PATH, response_class=Response)
-def revoke_one(session_id: str, principal: FullMutation, store: StoreDep) -> Response:
+def revoke_one(session_id: str, principal: ConsoleMutation, store: StoreDep) -> Response:
     """Отозвать одну сессию (§8.3: «отзыв по одной»).
 
-    Порядок: токен (`require_csrf`) → счётчик частоты → шаг `'full'` → поиск с ограничением по
-    учётной записи → отзыв → `commit()` → ответ. Ограничение `user_id` в самом запросе — то, что
+    Порядок: токен (`require_csrf`) → счётчик частоты → шаг `'full'` → роль (`ADR-017` п. 3) →
+    поиск с ограничением по учётной записи → отзыв → `commit()` → ответ. Ограничение `user_id` в самом запросе — то, что
     делает отзыв чужой сессии невозможным, а не «нашли и сверили»: одна ошибка в сверке оставила бы
     дыру, а запрос её не оставит (§8.8).
 
@@ -572,7 +625,7 @@ def revoke_one(session_id: str, principal: FullMutation, store: StoreDep) -> Res
 
 
 @router.post(SESSIONS_REVOKE_ALL_PATH, response_class=Response)
-def revoke_all(principal: FullMutation, store: StoreDep) -> Response:
+def revoke_all(principal: ConsoleMutation, store: StoreDep) -> Response:
     """Отозвать все живые сессии учётной записи, включая текущую (§8.3: «отзыв по одной/всех»).
 
     «Все» включает текущую сессию осознанно: отзыв, который бережёт ровно тот вход, с которого его

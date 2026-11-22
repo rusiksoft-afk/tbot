@@ -255,6 +255,22 @@ def test_проверки_базы_отклоняют_недопустимые_�
 ) -> None:
     user_id = _insert_user(connection, "checks.user")
 
+    # `REQ-identity-01` (§1.1: ровно три роли) и `ADR-017` п. 1: четвёртая роль
+    # не может появиться раньше, чем о ней узнает сервис. Имя
+    # ограничения привязано не косметически: по нему разбирают отказ на
+    # площадке, и `ADR-017` опирается на то, что значения роли закрыты именно
+    # этим CHECK, а не договорённостью.
+    with pytest.raises(psycopg.errors.CheckViolation) as ошибка, connection.transaction():
+        connection.execute(
+            "INSERT INTO users (id, login, role, state, password_hash) "
+            "VALUES (%s, 'fourth.role', 'superuser', 'active', %s)",
+            (uuid.uuid4(), _ARGON2ID_SAMPLE),
+        )
+    assert ошибка.value.diag.constraint_name == "ck_users_role", (
+        "значение роли отклонено не тем ограничением: "
+        f"{ошибка.value.diag.constraint_name!r} вместо 'ck_users_role'"
+    )
+
     # §8.1: хэш обязан быть Argon2id — bcrypt (ниже) означает, что приложение сбило алгоритм.
     with pytest.raises(psycopg.errors.CheckViolation), connection.transaction():
         connection.execute(
