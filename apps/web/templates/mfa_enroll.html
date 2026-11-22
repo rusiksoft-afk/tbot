@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% block content %}
+{# Страница первичной привязки TOTP (§9.3 п. 3, срез `R4c`). Состояние выбирает обработчик
+   (`state`), а не запрос: позволить параметром выбрать объяснение означало бы попросить человека
+   нарисовать себе чужое состояние.
+
+   Секрет привязки выводится ровно здесь и ровно один раз (§8.2: «QR + ручной ввод секрета … в UI
+   больше не показывается»): непустым `secret` бывает только ответ `POST /mfa-enroll/start`. Поэтому
+   здесь нет повтора секрета для «забыли» — вместо него §8.2 разрешает только начать привязку заново
+   (предыдущая при этом отзывается), и это состояние описывает `stale`/`confirm` с объяснением.
+
+   QR-картинки нет: её собирает `R4d` из того же значения, которое показывает эта страница, а не из
+   повторного расшифровывания `secret_enc` (иначе точек вывода секрета стало бы две). #}
+<h1>{{ page_title }}</h1>
+{% if detail %}
+<p role="alert">{{ detail }}</p>
+{% endif %}
+<p>{{ window }}</p>
+{% if state == "start" %}
+<form method="post" action="{{ start_url }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p>
+    <button type="submit">Начать привязку генератора кодов</button>
+  </p>
+</form>
+{% if note %}
+<p>{{ note }}</p>
+{% endif %}
+{% elif state == "confirm" %}
+{% if secret %}
+<p>Секрет для ручного ввода в генераторе (показывается один раз):</p>
+<p><code>{{ secret }}</code></p>
+<p>В генераторе выберите «другое приложение» или «ввести ключ вручную» и введите этот набор.</p>
+{% endif %}
+{% if note %}
+<p>{{ note }}</p>
+{% endif %}
+<form method="post" action="{{ verify_url }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p>
+    <label for="first_code">Текущий код</label>
+    <input id="first_code" name="first_code" type="text" inputmode="numeric"
+           pattern="[0-9]{6}" maxlength="6" required>
+  </p>
+  <p>
+    <label for="second_code">Код следующего окна</label>
+    <input id="second_code" name="second_code" type="text" inputmode="numeric"
+           pattern="[0-9]{6}" maxlength="6" required>
+  </p>
+  <p><button type="submit">Подтвердить привязку</button></p>
+</form>
+{% elif state == "stale" %}
+<form method="post" action="{{ start_url }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p>
+    <button type="submit">Начать привязку заново</button>
+  </p>
+</form>
+{% elif state == "bound" %}
+<p><a href="{{ code_url }}">Ввести код подтверждения</a></p>
+{% endif %}
+{% if locked_url %}
+<p><a href="{{ locked_url }}">Почему вход временно заблокирован</a></p>
+{% endif %}
+{% endblock %}

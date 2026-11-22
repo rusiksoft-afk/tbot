@@ -14,7 +14,7 @@
 * политика отказов слоя входа собрана в обработчиках исключений, а не размазана по маршрутам:
   `SessionRedirect` → `302` на страницу состояния, отказ CSRF → `403` без подробностей, слишком
   большое тело формы → `413`, нет адреса базы → `503`, повреждённый хэш пароля → `503`, предел
-  частоты по адресу и бан адреса → `429` с `Retry-After` (§8.2, §8.3). Один
+  частоты по адресу и бан адреса → `429` с `Retry-After` (§8.2, §8.3), недоступный файл ключей KEK → `503` с объяснением (срез `R4c`, `ADR-014`). Один
   обработчик на случай нужен не для красоты: «отзыв отражается немедленно» (§8.3) и «CSRF
   обязателен для всех мутаций» (§8.8) теряются ровно тогда, когда каждый маршрут объясняет
   состояние по-своему.
@@ -39,8 +39,13 @@ from apps.web.forms import FormBodyTooLarge
 from apps.web.routes import login as login_routes
 from apps.web.routes import profile as profile_routes
 from apps.web.routes import sessions as session_routes
-from apps.web.security.csrf import CsrfRejected
+from apps.web.routes import totp as totp_routes
+from apps.web.security.csrf import CsrfRejected, csrf_context
 from apps.web.security.headers import apply_security_headers
+from apps.web.security.keys import (
+    TWO_FACTOR_UNAVAILABLE_DETAIL,
+    TwoFactorUnavailableError,
+)
 from apps.web.security.rate_limit import RateLimitExceeded
 from apps.web.security.sessions import REASON_QUERY, SessionRedirect, clear_session_cookie
 from apps.web.store import LoginTiming, StoreUnavailableError, build_session_factory
@@ -128,10 +133,16 @@ def create_app(settings: Settings) -> FastAPI:
     #: Стоимость Argon2id для ветки «логина нет»: держится приложением, а не глобалом, чтобы два
     #: приложения в одном процессе (например, в тестах) не делили состояние молча.
     app.state.login_timing = LoginTiming()
+    # Путь файла ключей KEK (§8.4, `ADR-014` п. 5): единственная настройка, которую читают
+    # маршруты кода и привязки. Имя атрибута держит константой `apps/web/security/keys.py`
+    # (`KEK_FILE_STATE`): набор ключей при каждом запросе открывает этот же модуль, а
+    # интеграционные проверки подменяют путь временным файлом.
+    app.state.kek_file = settings.kek_file
 
     app.include_router(login_routes.router)
     app.include_router(session_routes.router)
     app.include_router(profile_routes.router)
+    app.include_router(totp_routes.router)
 
     @app.middleware("http")
     async def _trace_middleware(request: Any, call_next: Any) -> Any:
@@ -264,6 +275,41 @@ def create_app(settings: Settings) -> FastAPI:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
+    @app.exception_handler(TwoFactorUnavailableError)
+    async def _two_factor_unavailable(request: Request, exc: TwoFactorUnavailableError) -> Response:
+        """`503`: файл ключей недоступен — страница кода и привязки не могут работать.
+
+        Три причины, по которым этот случай нельзя сводить к «неверный код» (`401`), к отказу доступа
+        (`403`) или к редиректу на страницу входа:
+
+        1. состояние площадки, а не пользователя: отсутствующий, нечитаемый или неразобранный
+           `/etc/tbot/keys/kek.json` означает, что шифровать и расшифровывать привязку нечем
+           (`ADR-014` п. 5, `docs/runbook/kek-keys.md`);
+        2. счётчик неудач (§8.2) при этом не двигается — и это проверка, а не случайность: учётная
+           запись не должна блокироваться из-за операционной поломки, и маршруты вызывают
+           `request_key_ring` **до** каких-либо записей о попытке;
+        3. вход по паролю остаётся живым (парольный шаг KEK не читает), поэтому формулировка обязана
+           говорить правду: доступ в консоль закрыт, а не «приложение упало».
+
+        Причина исключения (путь, режим файла, текст разбора) уходит в лог процесса в самом
+        `apps/web/security/keys.py`, в ответе — фиксированный текст без внутренней подробности
+        площадки (§8.4). Код `503`, а не `500`: процесс жив и отвечает, а недоступна одна возможность;
+        `/readyz` про файл ключей не врёт намеренно — проверка готовности остаётся про базу, а
+        пригодность файла проверяет `keys_setup.py --check` при деплое.
+        """
+        log.error("two_factor_unavailable", path=request.url.path, detail=str(exc))
+        page: Response = request.app.state.templates.TemplateResponse(
+            request,
+            "mfa_unavailable.html",
+            {
+                "page_title": "Двухфакторная проверка недоступна",
+                "detail": TWO_FACTOR_UNAVAILABLE_DETAIL,
+            }
+            | csrf_context(None),
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        )
+        return page
+
     @app.get("/healthz")
     def healthz() -> JSONResponse:
         """Liveness: процесс обслуживает запросы; внешних проверок здесь нет намеренно."""
@@ -295,11 +341,11 @@ def create_app(settings: Settings) -> FastAPI:
     def root() -> JSONResponse:
         """Служебная заглушка каркаса: интерфейс управления появится на вехе M1 (docs/tz/09).
 
-        Сюда же попадает пользователь после успешного парольного шага: страницы ввода кода 2FA ещё
-        нет (её вводит `T-103`), поэтому `POST_LOGIN_REDIRECT` ведёт на корневую страницу. Это
-        честное состояние «пароль принят, второго фактора ещё нет»: запись сессии остаётся на шаге
-        `'password'`, и охраняемые маршруты её не пустят (проверка —
-        `require_full_session` и параметризованная `test_route_requires_full_auth` из `T-103`).
+        Сюда попадает сессия полного входа (`POST_CODE_REDIRECT`): страниц вехи M1 ещё нет,
+        поэтому домашней остаётся корневая, и ответ её честно говорит про веху M1. Сессия шага
+        `'password'` сюда не попадает: парольный шаг ведёт на страницу кода
+        (`POST_LOGIN_REDIRECT`, §9.3 п. 1–2), а охраняемые маршруты консоли требуют шаг `'full'`
+        (`require_full_session` и параметризованная `test_route_requires_full_auth`, срез `R4c`).
         """
         return JSONResponse(
             {

@@ -43,19 +43,19 @@ import secrets
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Protocol
+from typing import Any, Protocol, cast
 from uuid import UUID
 
 from fastapi import Request
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
-from sqlalchemy.engine import Engine
+from sqlalchemy.engine import CursorResult, Engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from packages.common.config import Settings
 from packages.common.db import sqlalchemy_url
 from packages.identity.passwords import hash_password, verify_password
-from packages.storage.models import RateBucket, User, UserSession
+from packages.storage.models import RateBucket, TotpEnrollment, TotpFailure, User, UserSession
 
 #: Верхняя граница длины `user_agent`: значение приходит из заголовка, которое контролирует клиент,
 #: а колонка `sessions.user_agent` — `TEXT` без CHECK (при этом §8.3 показывает её пользователю в
@@ -135,7 +135,7 @@ class Store(Protocol):
         403/404 без утечки»). Ключ — `id` первичный, поэтому отдельного индекса не требуется.
         """
 
-    def add(self, obj: User | UserSession) -> None:
+    def add(self, obj: User | UserSession | TotpEnrollment | TotpFailure) -> None:
         """Поставить объект в транзакцию текущего запроса.
 
         `RateBucket` в перечне намеренно нет: счётчик двигается только через `bump_rate_bucket`, а
@@ -172,6 +172,50 @@ class Store(Protocol):
         Форма запроса повторяет первичный ключ счётчика («область + субъект + окна не старше
         границы») — ровно то, для чего составной PK и заведён. Состояние читается из базы, а не
         держится в памяти: отказ «адрес закрыт» обязан переживать рестарт контейнера (`ADR-007`).
+        """
+
+    def active_enrollment(self, user_id: UUID) -> TotpEnrollment | None:
+        """Неотозванная привязка учётной записи, если она есть (срез `R4c`, §8.2).
+
+        Одна на учётку, и это держит база, а не приложение: частичный уникальный индекс
+        `ix_totp_enrollments_user_active` (`WHERE revoked_at IS NULL`, ревизия `0002`) не даёт
+        второй неотозванной строки. Реализация на базе обязана искать именно по этому предикату
+        (`user_id` + `revoked_at IS NULL`) — иначе она не попадёт в индекс, а «привязка есть, но
+        приложение её не видит» превратится в вечный отказ привязки.
+
+        Подтверждена привязка или нет — решает домен (`enrollment_state`): здесь только строка.
+        Отзывать и подтверждать этот метод не может, и не должен: право менять `confirmed_at` и
+        `revoked_at` у `packages/identity/totp_enrollment.py`.
+        """
+
+    def totp_failures(self, user_id: UUID, *, not_before: datetime) -> tuple[TotpFailure, ...]:
+        """Неудачи кода учётной записи не раньше `not_before` (§8.2, лента `totp_failures`).
+
+        Граница окна обязана быть в запросе: индекс `ix_totp_failures_user_id_at` (ревизия `0002`)
+        построен ровно на пару `(user_id, at)`, и без неё страница кода читала бы всю ленту
+        учётной записи за всё время работы площадки, а порог «5 неудач подряд» (`TOTP_FAILURE_HORIZON`)
+        считался бы по значениям, которые база уже выбросила из окна.
+
+        Строки не удаляются при успехе — так решила схема (`ADR-013` п. 4), и это тот случай, где
+        память и база обязаны читаться одинаково: окно задаёт вызывающий.
+        """
+
+    def claim_totp_step(self, enrollment_id: UUID, *, step: int) -> bool:
+        """Занять шаг кода: `True`, если шаг ещё не был израсходован, иначе `False` (`ADR-013`).
+
+        Один `UPDATE` с условием, а не «прочитать `last_used_step`, сравнить, записать»: два
+        параллельных запроса с одним кодом прочитали бы одно и то же значение и прошли бы оба, и
+        правило §8.2 «коды принимаются один раз» перестало бы выполняться именно под нагрузкой —
+        там, где оно и нужно. Условие вида `(last_used_step IS NULL OR last_used_step < :step)`
+        переносит проверку в базу, где она атомарна относительно этой строки.
+
+        Условие держит и состояние строки (`revoked_at IS NULL AND confirmed_at IS NOT NULL`):
+        между чтением привязки маршрутом и этим `UPDATE` её могут отозвать, и шаг, занятый на
+        мёртвой строке, означал бы «доступ выдан по второму фактору, которого уже нет». Окно между
+        проверкой и записью закрывает именно то, что состояние стоит в том же `UPDATE`.
+
+        `False` означает и «этот шаг уже принят», и «принят более свежий», и «строка перестала быть
+        действующей привязкой»: различать их незачем, для вызывающего это один отказ `replay`.
         """
 
     def commit(self) -> None:
@@ -239,8 +283,62 @@ class SqlStore:
     def user_of_id(self, user_id: UUID) -> User | None:
         return self._session.execute(select(User).where(User.id == user_id)).scalar_one_or_none()
 
-    def add(self, obj: User | UserSession) -> None:
+    def add(self, obj: User | UserSession | TotpEnrollment | TotpFailure) -> None:
         self._session.add(obj)
+
+    def active_enrollment(self, user_id: UUID) -> TotpEnrollment | None:
+        statement = select(TotpEnrollment).where(
+            TotpEnrollment.user_id == user_id,
+            TotpEnrollment.revoked_at.is_(None),
+        )
+        # `scalar_one_or_none`, а не `first()`: двух неотозванных строк быть не может
+        # (`ix_totp_enrollments_user_active`), и появление второй — нарушение инварианта, которое
+        # обязано быть слышно, а не «молча выбрали первую попавшую»: выбор без порядка менялся бы от
+        # плана запроса, а вместе с ним и то, какой секрет реально действует.
+        return self._session.execute(statement).scalar_one_or_none()
+
+    def totp_failures(self, user_id: UUID, *, not_before: datetime) -> tuple[TotpFailure, ...]:
+        statement = (
+            select(TotpFailure)
+            .where(TotpFailure.user_id == user_id, TotpFailure.at > not_before)
+            .order_by(TotpFailure.at)
+        )
+        return tuple(self._session.execute(statement).scalars())
+
+    def claim_totp_step(self, enrollment_id: UUID, *, step: int) -> bool:
+        statement = (
+            update(TotpEnrollment)
+            .where(
+                TotpEnrollment.id == enrollment_id,
+                # Состояние строки — часть условия, а не «проверено же до запроса». Между чтением
+                # привязки и этим `UPDATE` привязку могли отозвать (сброс администратором, §8.2
+                # случай 2), и условие только по шагу приняло бы код из уже несуществующего второго
+                # фактора: шаг был бы израсходован на мёртвой строке, а сессия поднялась бы до 'full'.
+                # Один `UPDATE` закрывает и шаг, и состояние, поэтому между проверкой и записью
+                # не остаётся окна (живая проверка — `tests/integration/test_totp_enrollment_db.py`).
+                TotpEnrollment.revoked_at.is_(None),
+                TotpEnrollment.confirmed_at.is_not(None),
+                or_(
+                    TotpEnrollment.last_used_step.is_(None),
+                    TotpEnrollment.last_used_step < step,
+                ),
+            )
+            .values(last_used_step=step)
+            # `synchronize_session=False`: объект, из которого маршрут читал привязку, обновляет
+            # доменный слой (`verify_enrollment_code`), и делает это после успешного занятия шага.
+            # Иначе SQLAlchemy перед `UPDATE` сделала бы дополнительный `SELECT` по строке ради
+            # синхронизации identity map — лишний запрос на каждый код входа.
+            .execution_options(synchronize_session=False)
+        )
+        # `CursorResult`: `Session.execute` для DML типизирован как `Result`, а число затронутых
+        # строк живёт на уровне драйвера (`CursorResult`). Приведение здесь честнее, чем обход через
+        # `session.connection.execute`: запрос идёт в том же транзакте текущего запроса, и никакое
+        # «два соединения на один запрос» из этого не вырастает.
+        result = cast("CursorResult[Any]", self._session.execute(statement))
+        # `rowcount == 1` — единственный честный ответ: условие не выполнено, если шаг уже принят
+        # (или принят более свежий) либо если строка перестала быть действующей привязкой, и тогда
+        # затронутых строк ноль.
+        return bool(result.rowcount == 1)
 
     def commit(self) -> None:
         self._session.commit()
