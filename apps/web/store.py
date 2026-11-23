@@ -784,10 +784,10 @@ class SqlStore:
     # таких пар не отклоняет — частичный индекс исключает `NULL`).
     #
     # `ON CONFLICT DO NOTHING` здесь нет и появиться не может: такая конструкция вернулась бы без
-    # исключения при `rowcount == 0`, то есть молча потеряла бы событие, а разбор показал бы его
-    # как `broken_link` — как подделку содержимого (`ADR-025` п. 4; живая проверка
+    # исключения и без возвращённой строки, то есть молча потеряла бы событие, а разбор показал бы
+    # его как `broken_link` — как подделку содержимого (`ADR-025` п. 4; живая проверка
     # `test_обход_через_on_conflict_do_nothing_не_создаёт_строку`). Поэтому метод обязан смотреть
-    # на число затронутых строк.
+    # на число строк, а не только на отсутствие ошибки.
 
     def append_audit(
         self,
@@ -820,7 +820,11 @@ class SqlStore:
         try:
             result = cast(
                 "CursorResult[Any]",
-                self._session.execute(insert(AuditLogEntry).values(audit_row_values(linked))),
+                self._session.execute(
+                    insert(AuditLogEntry)
+                    .values(audit_row_values(linked))
+                    .returning(AuditLogEntry.id)
+                ),
             )
         except IntegrityError as error:
             # Откат целиком: «изменение зафиксировано, события нет» — ровно то состояние, из-за
@@ -832,10 +836,18 @@ class SqlStore:
                     "ix_audit_log_hash_prev_linked отклонил вставку (23505)"
                 ) from error
             raise
-        if result.rowcount != 1:
+        # Число строк считается по возвращённым идентификаторам, а не по `Result.rowcount`.
+        # Причина измерена первым прогоном этого среза (CI `45182752079`): то же выполнение через
+        # `Session` (ORM-путь, а не `Connection`) отдаёт `rowcount = -1`, и проверка «ровно одна
+        # строка» падала на корректной вставке. `RETURNING id` даёт то же число способом, не
+        # зависящим от посредника, и попутно подтверждает, что идентификатор выдала база (§4.1:
+        # `id` — identity, приложение его не назначает). Пустой список — это и есть тот случай
+        # «вставки нет без ошибки», ради которого требование о числе строк и вводилось.
+        inserted = result.scalars().all()
+        if len(inserted) != 1:
             self._session.rollback()
             raise AuditAppendError(
-                f"вставка в журнал затронула {result.rowcount} строк, ожидалась одна: "
+                f"вставка в журнал вернула {len(inserted)} идентификаторов вместо одного: "
                 f"событие {action} не записано"
             )
         if commit_now:
