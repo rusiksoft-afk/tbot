@@ -17,6 +17,11 @@ from typing import Final
 
 from sqlalchemy.engine import Engine
 
+from apps.jobs.integrity import (
+    INTEGRITY_CHECK_INTERVAL_S,
+    INTEGRITY_JOB_NAME,
+    run_integrity_check,
+)
 from apps.jobs.maintenance import (
     PURGE_JOB_NAME,
     RATE_BUCKET_PURGE_INTERVAL_S,
@@ -39,6 +44,10 @@ _BUILD = {"version": "0.0.0", "revision": "unknown", "build_time": "unknown"}
 #: Её регламент (раз в час, окна старше 24 часов) выбран заказчиком (ask `abb0151c`).
 PURGE_TASK: Final = "T-102"
 
+#: Ежедневная проверка целостности журнала (TZ §8.7): вторая исполненная задача процесса.
+#: Заодно — единственная задача, которая пишет в `audit_log` из этого процесса (`ADR-025` п. 9).
+INTEGRITY_TASK: Final = "T-109"
+
 
 @dataclass(frozen=True)
 class JobSpec:
@@ -52,12 +61,15 @@ class JobSpec:
 
 
 # Порядок и периодичность соответствуют docs/tz/12 §12.3; исполнители появляются по вехам.
-# Исключение из перечня §12.3 — `rate_bucket_purge`: её регламент задан `ADR-007` (ask
-# `abb0151c`), потому что без чистки «временные» строки счётчика остаются навсегда.
-# Объявление здесь декларативное (исполнителя нет): связь «задача ↔ веха ↔ интервал» обязана
-# быть видна без адреса базы, а реальные исполнители подключает `build_job_registry`.
+# Исключения из перечня §12.3 — две задачи M1, у которых регламент в других разделах ТЗ:
+# `rate_bucket_purge` (чистка окон счётчика, регламент — `ADR-007`, ask `abb0151c`) и
+# `integrity-check` (ежедневная сверка цепочки хэшей журнала и свободных мест, регламент —
+# §8.7, `ADR-025` п. 9). Объявление здесь декларативное (исполнителя нет): связь
+# «задача ↔ веха ↔ интервал» обязана быть видна без адреса базы, а реальные исполнители
+# подключает `build_job_registry`.
 JOB_REGISTRY: tuple[JobSpec, ...] = (
     JobSpec(PURGE_JOB_NAME, RATE_BUCKET_PURGE_INTERVAL_S, "M1", PURGE_TASK),
+    JobSpec(INTEGRITY_JOB_NAME, INTEGRITY_CHECK_INTERVAL_S, "M1", INTEGRITY_TASK),
     JobSpec("history_load", 300, "M2", "T-201"),
     JobSpec("instrument_catalog_sync", 21600, "M2", "T-210"),
     JobSpec("digest_report", 86400, "M3", "T-311"),
@@ -70,6 +82,18 @@ def _purge_rate_buckets(engine: Engine) -> str:
     """Исполнитель чистки окон счётчика: одна операция раз в регламентированный час."""
     deleted = purge_expired_rate_buckets(engine)
     return f"окон счётчика удалено: {deleted}"
+
+
+def _integrity_check(engine: Engine) -> str:
+    """Исполнитель ежедневной `integrity-check`: разбор цепочки, замер места, строка журнала.
+
+    Текст возвращает итог прогона: `run_job` пишет его в `job_done`, поэтому «цепочка цела» и
+    «цепочка нарушена — находок 3» различимы в журнале процесса, а не только в `audit_log`.
+    Провал (база недоступна, схема не развёрнута) остаётся исключением: `run_job` пишет
+    `job_failed`, и в журнале не появляется запись о «целом» журнале (`ADR-025` п. 7).
+    """
+    outcome = run_integrity_check(engine, app=APP_NAME)
+    return outcome.summary()
 
 
 def build_job_registry(engine: Engine | None) -> tuple[JobSpec, ...]:
@@ -91,6 +115,7 @@ def build_job_registry(engine: Engine | None) -> tuple[JobSpec, ...]:
     handlers: dict[str, Callable[[], str]] = {}
     if engine is not None:
         handlers[PURGE_JOB_NAME] = partial(_purge_rate_buckets, engine)
+        handlers[INTEGRITY_JOB_NAME] = partial(_integrity_check, engine)
     declared: list[JobSpec] = []
     for job in JOB_REGISTRY:
         handler = handlers.get(job.name)

@@ -45,21 +45,20 @@ from datetime import UTC, datetime
 from typing import IO, Final
 
 from _bootstrap import ensure_repo_root_on_path
-from sqlalchemy import Engine, create_engine, select
+from sqlalchemy import Engine, create_engine
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from packages.common.config import ConfigError, load_settings
 from packages.common.db import sqlalchemy_url
 from packages.identity.audit import (
-    ChainIssue,
     ChainReport,
-    IssueKind,
     StoredRecord,
-    read_stored_record,
+    findings_of,
+    informational_of,
     verify_chain,
 )
-from packages.storage.models import AuditLogEntry
+from packages.storage.audit_store import read_audit_journal
 
 ROOT = ensure_repo_root_on_path()
 
@@ -76,13 +75,10 @@ EXIT_UNEXPECTED: Final = 4
 
 # ─── коды находок ─────────────────────────────────────────────────────────────────────────────
 
-#: Находки, делающие вердикт «цепочка нарушена».
-FINDING_KINDS: Final[frozenset[IssueKind]] = frozenset(
-    {"content_mismatch", "broken_link", "duplicate_parent"}
-)
-#: Находка, которая печатается, но вердикт не меняет: отсутствие прочитанного начала цепи —
-#: норма после уборки по §2.8 и для любой ограниченной выборки (`ADR-025` п. 7, п. 8).
-INFORMATIONAL_KINDS: Final[frozenset[IssueKind]] = frozenset({"missing_prefix"})
+# Наборы кодов (`FINDING_KINDS`, `INFORMATIONAL_KINDS`) и две функции вердикта с среза `R3.2`
+# определены в общем слое — `packages.identity.audit`. Здесь они только импортируются: их читает
+# и эта команда, и ежедневная `integrity-check` процесса `jobs`, а два перечня «что делает
+# вердикт нарушенным» разошлись бы при первой же правке (`ADR-025` п. 7).
 
 # Формы, в которых адрес базы может просочиться в текст исключения драйвера. Строка подключения
 # с паролем не имеет права появиться ни в выводе, ни в журнале cron.
@@ -202,61 +198,26 @@ def build_bounds(
 def read_journal(session: Session, bounds: Bounds) -> list[StoredRecord]:
     """Прочитать строки журнала колонками §4.1 в порядке `id`.
 
+    Запрос один на двоих с ежедневной `integrity-check`: читает общий слой
+    (`packages.storage.audit_store:read_audit_journal`). Ручная сверка копии дампа и
+    автоматическая проверка обязаны видеть ровно тот же набор колонок и ровно тот же порядок,
+    иначе «проверка сказала „цело“, а команда — „нарушено“» на одних и тех же строках
+    (`ADR-025` п. 7).
+
     Порядок задаёт `id`, а не `at`: моменты двух процессов могут прийти вразнобой, а хэш
     считается без `id` (колонку база выдаёт уже после расчёта), поэтому переставить чтение по
     `at` — значит получить ложные `broken_link`.
     """
-    stmt = select(
-        AuditLogEntry.id,
-        AuditLogEntry.at,
-        AuditLogEntry.action,
-        AuditLogEntry.actor,
-        AuditLogEntry.entity,
-        AuditLogEntry.entity_id,
-        AuditLogEntry.details,
-        AuditLogEntry.ip,
-        AuditLogEntry.request_id,
-        AuditLogEntry.hash_prev,
-        AuditLogEntry.hash,
-    ).order_by(AuditLogEntry.id)
-    if bounds.since is not None:
-        stmt = stmt.where(AuditLogEntry.at >= bounds.since)
-    if bounds.until is not None:
-        stmt = stmt.where(AuditLogEntry.at <= bounds.until)
-    if bounds.from_id is not None:
-        stmt = stmt.where(AuditLogEntry.id >= bounds.from_id)
-    if bounds.to_id is not None:
-        stmt = stmt.where(AuditLogEntry.id <= bounds.to_id)
-    rows = session.execute(stmt).all()
-    return [
-        read_stored_record(
-            row_id=row.id,
-            at=row.at,
-            action=row.action,
-            actor=row.actor,
-            entity=row.entity,
-            entity_id=row.entity_id,
-            details=row.details,
-            ip=row.ip,
-            request_id=row.request_id,
-            hash_prev=row.hash_prev,
-            stored_hash=row.hash,
-        )
-        for row in rows
-    ]
+    return read_audit_journal(
+        session,
+        since=bounds.since,
+        until=bounds.until,
+        from_id=bounds.from_id,
+        to_id=bounds.to_id,
+    )
 
 
 # ─── вердикт ─────────────────────────────────────────────────────────────────────────────────
-
-
-def findings_of(report: ChainReport) -> tuple[ChainIssue, ...]:
-    """Находки, которые делают вердикт «цепочка нарушена» (`ADR-025` п. 7)."""
-    return tuple(issue for issue in report.issues if issue.kind in FINDING_KINDS)
-
-
-def informational_of(report: ChainReport) -> tuple[ChainIssue, ...]:
-    """Находки, не влияющие на вердикт: сейчас это только `missing_prefix`."""
-    return tuple(issue for issue in report.issues if issue.kind in INFORMATIONAL_KINDS)
 
 
 def print_report(report: ChainReport, bounds: Bounds, out: IO[str]) -> None:

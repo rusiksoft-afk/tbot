@@ -570,6 +570,31 @@ def _audit_calls(path: pathlib.Path) -> int:
     )
 
 
+def _function_source(path: pathlib.Path, *, name: str) -> str:
+    """Исходник одной модульной функции: соседние функции и комментарии к ней не входят.
+
+    Нужен с среза `R3.2` задачи `T-109`: протокол добавления записи журнала больше не живёт внутри
+    метода `SqlStore`, он исполняется одной функцией общего слоя, потому что писателей журнала два
+    процесса (`web` и ежедневная `integrity-check` в `jobs`), а процессам запрещено импортировать
+    друг друга (`ADR-025` п. 6 и п. 9). Проверка обязана смотреть на код функции, а не на её
+    обоснование: рядом стоит разбор того, почему `ON CONFLICT` запрещён.
+    """
+    source = path.read_text(encoding="utf-8")
+    for узел in ast.walk(ast.parse(source)):
+        if isinstance(узел, ast.FunctionDef | ast.AsyncFunctionDef) and узел.name == name:
+            отрезок = ast.get_source_segment(source, узел)
+            assert отрезок is not None, f"{path.name}: не удалось выделить {name}"
+            # Докстринг функции отсекается: объяснение («почему `ON CONFLICT` на журнале запрещён»)
+            # живёт внутри функции, а проверка обязана касаться кода, иначе текст обоснования
+            # ловился бы как нарушение того же запрета.
+            if узел.body and isinstance(узел.body[0], ast.Expr):
+                докстринг = ast.get_source_segment(source, узел.body[0])
+                if докстринг is not None:
+                    отрезок = отрезок.replace(докстринг, "", 1)
+            return отрезок
+    raise AssertionError(f"в {path.name} нет функции {name}")
+
+
 def _method_source(path: pathlib.Path, *, klass: str, name: str) -> str:
     """Исходник одного метода одного класса: комментарий рядом с ним и соседние методы не входят.
 
@@ -618,8 +643,10 @@ def test_события_журнала_пишет_протокол_а_их_то�
     * в слое безопасности вызовов ровно по одному на каждое место, где причина решается: лимиты
       (отказ частоты и бан адреса — два разных события), CSRF, отказ допуска (одна точка на обе
       причины, иначе «учётной записи нет» записывается дважды);
-    * `apps/web/store.py` держит признаки протокола внутри самой функции `append_audit` — вызов
-      блокировки хвоста `_lock_audit_chain` до вставки, чтение хвоста (`hash` последней строки),
+    * признаки протокола держат внутри **одной** функции общего слоя —
+      `packages/storage/audit_store.py::append_audit_record` (срез `R3.2` задачи `T-109`):
+      блокировка хвоста берётся до его чтения, хвост читается как `hash` последней строки в
+      порядке `id`,
       отличие конфликта цепочки по **коду состояния**, а не по тексту сообщения, откат и проверка
       числа вставленных строк по `RETURNING`, а не по `Result.rowcount`, потому что вставка без
       ошибки и без строки — это молча потерянное событие (`ADR-025` п. 6, замеры прогонов
@@ -654,21 +681,36 @@ def test_события_журнала_пишет_протокол_а_их_то�
     )
 
     store_path = _ROOT / "apps" / "web" / "store.py"
-    protocol = _method_source(store_path, klass="SqlStore", name="append_audit")
-    assert "_lock_audit_chain()" in protocol, (
+    journal_path = _ROOT / "packages" / "storage" / "audit_store.py"
+    protocol = _function_source(journal_path, name="append_audit_record")
+    assert "lock_audit_chain(session)" in protocol, (
         "из протокола исчезла блокировка хвоста: два писателя прочитают один хвост, а индекс-страж "
         "`ix_audit_log_hash_prev_linked` отклонит вторую запись (`ADR-025` п. 6)"
     )
-    assert "select(AuditLogEntry.hash)" in protocol, (
+    assert "tail_hash(session)" in protocol, (
         "протокол перестал читать хвост цепочки: запись ушла бы без `hash_prev`, и цепочка "
         "распалась бы на независимые ветки"
     )
-    # Порядок внутри метода зафиксирован и значит больше стиля: `FOR UPDATE` последней строки на
+    # Порядок внутри функции зафиксирован и значит больше стиля: `FOR UPDATE` последней строки на
     # пустой таблице ничего не держит, а advisory-замок, взятый после чтения хвоста, защищает уже
     # прочитанное значение — то есть ровно ту гонку, из-за которой он и введён.
-    assert protocol.index("_lock_audit_chain()") < protocol.index(
-        "select(AuditLogEntry.hash)"
+    assert protocol.index("lock_audit_chain(session)") < protocol.index(
+        "tail_hash(session)"
     ), "замок цепочки обязан браться до чтения хвоста (`ADR-025` п. 6)"
+    locking = _function_source(journal_path, name="lock_audit_chain")
+    assert "pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)" in locking, (
+        "замок перестал быть advisory-транзакционным по ключу журнала: два процесса с разными"
+        " замками пишут в одну цепочку (`ADR-025` п. 6)"
+    )
+    tail = _function_source(journal_path, name="tail_hash")
+    assert "select(AuditLogEntry.hash)" in tail, (
+        "хвост цепочки больше не читается из колонки `hash`: привязка строки перестала бы быть"
+        " частью протокола"
+    )
+    assert "AuditLogEntry.id.desc()" in tail, (
+        "хвост читается не по `id`: порядок задаёт колонка, которую выдаёт база (§4.1), а не `at`"
+        " — моменты двух процессов могут прийти вразнобой"
+    )
     assert "sqlstate" in protocol, (
         "конфликт цепочки снова определяется по тексту сообщения: psycopg в сообщении код "
         "`23505` не дублирует (прогон `45165930936`)"
@@ -689,6 +731,38 @@ def test_события_журнала_пишет_протокол_а_их_то�
     for form in ("on_conflict_do_nothing", "on_conflict_do_update"):
         assert form not in protocol, f"форма {form} на журнале запрещена (`ADR-025` п. 4)"
     assert "ON CONFLICT" not in protocol, "прямая форма ON CONFLICT на журнале запрещена (п. 4)"
+
+    # Писатели журнала — два процесса, протокол один. Проверка держит именно форму вызова:
+    # второй слой, который сам берёт замок и сам читает хвост, разошёлся бы с первым при первой
+    # же правке, а следом разошёлся бы и ключ замка (`ADR-025` п. 6 и п. 9).
+    web_writer = _method_source(store_path, klass="SqlStore", name="append_audit")
+    assert "append_audit_record(self._session, record)" in web_writer, (
+        "слой входа `web` перестал вызывать общий протокол: у него появилась собственная копия"
+        " добавления записи"
+    )
+    jobs_writer = (_ROOT / "apps" / "jobs" / "integrity.py").read_text(encoding="utf-8")
+    assert "append_audit_record(writer, record)" in jobs_writer, (
+        "ежедневная `integrity-check` перестала вызывать общий протокол: вторая реализация порядка"
+        " «замок → хвост → вставка» — это будущий `broken_link` в журнале (`ADR-025` п. 9)"
+    )
+    for own_copy in ("pg_advisory_xact_lock(", "AUDIT_CHAIN_LOCK_KEY", "hash_prev="):
+        assert own_copy not in web_writer, (
+            f"в слое входа `web` появилась копия протокола ({own_copy}):"
+            " замок и хвост обязана читать одна функция общего слоя"
+        )
+        assert own_copy not in jobs_writer, (
+            f"в процессе `jobs` появилась копия протокола ({own_copy}):"
+            " порядок «замок → хвост → вставка» держит одна функция общего слоя"
+        )
+    key_files = sorted(
+        str(p.relative_to(_ROOT))
+        for p in (_ROOT / "apps").rglob("*.py")
+        if "AUDIT_CHAIN_LOCK_KEY: Final" in p.read_text(encoding="utf-8")
+    )
+    assert key_files == [], (
+        f"ключ замка цепочки определён в слое приложения ({key_files}): у двух процессов обязаны"
+        " быть один и тот же ключ (`ADR-025` п. 6)"
+    )
 
 
 #: Число вызовов протокола добавления журнала в каждом маршрутном модуле. Перечень закрыт и

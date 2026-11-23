@@ -41,6 +41,21 @@ TG_PROBE_LAST_SUCCESS_TS = Gauge(
 TG_EGRESS_EXIT = Info("tg_egress_exit", "Адрес выхода, который видит Telegram (замер)")
 TG_TUNNEL_UP = Gauge("tg_tunnel_up", "Локальный туннель-клиент отвечает (SOCKS-порт открыт)")
 
+# Свободное место: нужна алерту §12.4 (`tbot_disk_free_bytes < 15%` / `< 8%` → `SYSTEM`) и
+# ежедневной `integrity-check` §8.7 («проверка свободных мест», `ADR-025` п. 9, `T-109` `R3.2`).
+# Порог §12.4 задан процентами, поэтому рядом заведена ёмкость: Prometheus считает долю из пары
+# метрик, а не из одной.
+DISK_FREE_BYTES = Gauge(
+    "tbot_disk_free_bytes",
+    "Свободное место на файловой системе процесса (байты)",
+    labelnames=("app",),
+)
+DISK_TOTAL_BYTES = Gauge(
+    "tbot_disk_total_bytes",
+    "Полный объём файловой системы процесса (байты)",
+    labelnames=("app",),
+)
+
 
 def set_build_info(*, version: str, revision: str, build_time: str) -> None:
     """Заполнить `tbot_build_info`. Значения передаёт сборочный скрипт/образ, не конфиг."""

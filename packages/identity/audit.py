@@ -536,6 +536,22 @@ def _read_details(value: object, *, row_id: int) -> Mapping[str, Any] | None:
 #: в обход блокировки хвоста» (или дамп собран из двух копий).
 IssueKind = Literal["content_mismatch", "broken_link", "missing_prefix", "duplicate_parent"]
 
+#: Находки, делающие вердикт «цепочка нарушена» (`ADR-025` п. 7). Определение переехало сюда из
+#: `scripts/audit_verify.py` срезом `R3.2`: его читают и ручная команда, и ежедневная
+#: `integrity-check` процесса `jobs`. Два набора кодов разошлись бы при первой же правке, и
+#: тогда автоматическая проверка стала бы ругаться на то, что ручная считает нормой (или
+#: наоборот): расхождение кодов находок — тот же класс поломки, что и разные ключи замка.
+#:
+#: Объединение двух наборов обязано оставлять ровно четыре признака `IssueKind` — это держит
+#: проверка `tests/integration/test_audit_verify.py`: появится пятый код, и проверка потребует
+#: решить, меняет ли он вердикт.
+FINDING_KINDS: Final[frozenset[IssueKind]] = frozenset(
+    {"content_mismatch", "broken_link", "duplicate_parent"}
+)
+#: Находки, которые печатаются, но вердикт не меняют: начало цепи отсутствует после законной
+#: уборки по §2.8 и у любой ограниченной выборки (`ADR-025` п. 7 и п. 8).
+INFORMATIONAL_KINDS: Final[frozenset[IssueKind]] = frozenset({"missing_prefix"})
+
 _ISSUE_TEXT: Final[dict[IssueKind, str]] = {
     "content_mismatch": "хэш строки не совпадает с её содержимым — строку меняли",
     "broken_link": "hash_prev строки не равен хэшу предыдущей строки — разрыв, вставка или развилка",
@@ -659,6 +675,25 @@ def verify_chain(records: Sequence[StoredRecord], *, expect_genesis: bool = True
     return ChainReport(
         rows=len(records), first_row_id=first, last_row_id=last, issues=tuple(issues)
     )
+
+
+def findings_of(report: ChainReport) -> tuple[ChainIssue, ...]:
+    """Находки, которые делают вердикт «цепочка нарушена» (`ADR-025` п. 7).
+
+    Сам текст вердикта формулирует вызывающий, а не `ChainReport.summary()`: библиотека считает
+    любое обращение нарушением цепочки, а `missing_prefix` находкой вердикта не является, поэтому
+    общий текст дал бы «цепочка нарушена» рядом с кодом `0` (разбор — `ADR-025` п. 7).
+    """
+    return tuple(issue for issue in report.issues if issue.kind in FINDING_KINDS)
+
+
+def informational_of(report: ChainReport) -> tuple[ChainIssue, ...]:
+    """Находки, не влияющие на вердикт: сейчас это только `missing_prefix`.
+
+    Отдельная функция нужна затем, чтобы вызывающий печатал их, не превращая в нарушение: у
+    ежедневной проверки и у ручной команды общий случай — «цепочка цела, но начала не видно».
+    """
+    return tuple(issue for issue in report.issues if issue.kind in INFORMATIONAL_KINDS)
 
 
 def chain_from_drafts(drafts: Iterable[AuditRecord]) -> list[StoredRecord]:

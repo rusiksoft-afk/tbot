@@ -13,6 +13,12 @@
 Срез `R3d` (`T-102`, `docs/adr/ADR-007`) принёс первую исполненную задачу — `rate_bucket_purge`
 (раз в час, окна старше 24 часа, ask `abb0151c`): без неё «временные» строки счётчика остаются
 навсегда, поэтому регламент проверяется здесь, а не комментарием.
+
+Срез `R3.2` (`T-109`, `ADR-025` п. 9 с поправками
+`docs/adr/ADR-026-integrity-check-jobs.md`) принёс вторую исполненную задачу — `integrity-check`
+(ежедневная сверка цепочки хэшей журнала и свободных мест, TZ §8.7). Она интересна реестру другим:
+это единственная задача процесса, которая пишет в `audit_log`, поэтому её имя и регламент
+проверяются тем же механизмом, что и у чистки окон, — планирование видно из кода и из `/readyz`.
 """
 
 from __future__ import annotations
@@ -24,8 +30,13 @@ from pydantic import SecretStr
 from sqlalchemy.engine import Engine
 
 import apps.jobs.main as jobs_main
+from apps.jobs.integrity import (
+    INTEGRITY_CHECK_INTERVAL_S,
+    INTEGRITY_JOB_NAME,
+)
 from apps.jobs.main import (
     APP_NAME,
+    INTEGRITY_TASK,
     JOB_REGISTRY,
     JobSpec,
     build_job_registry,
@@ -49,6 +60,11 @@ MAX_INTERVAL_S = 7 * 24 * 3600.0
 #: Адрес базы «без подключения»: `create_engine` соединение не открывает, поэтому проверка
 #: появления исполнителя не требует живой базы (живая чистка окон — в job `migrations`).
 _DSN = "postgresql+psycopg://tbot:ci-only@127.0.0.1:5432/tbot_jobs_check"
+
+#: Задачи, у которых исполнитель уже есть. Новая исполненная задача обязана попасть и сюда:
+#: проверки ниже сводят «исполнители есть» и «остальные ждут своей вехи» в один список, и
+#: расхождение выглядит как пропавшая из готовности задача.
+_IMPLEMENTED = frozenset({PURGE_JOB_NAME, INTEGRITY_JOB_NAME})
 
 
 def _registry_with_db(settings: Settings) -> tuple[JobSpec, ...]:
@@ -130,7 +146,9 @@ def test_исполнитель_чистки_появляется_только_�
     handlers = {job.name: job.handler for job in _registry_with_db(with_db)}
     assert handlers[PURGE_JOB_NAME] is not None, "чистка окон не подключена при настроенном адресе"
     for name, handler in handlers.items():
-        if name != PURGE_JOB_NAME:
+        if name in _IMPLEMENTED:
+            assert handler is not None, f"{name}: исполнитель пропал при настроенном адресе"
+        else:
             assert handler is None, f"{name}: исполнитель раньше своей вехи"
 
 
@@ -150,10 +168,11 @@ def test_готовость_становится_истинной_с_первы�
         secrets_dir=settings.secrets_dir, instance_name="test", db_url=SecretStr(_DSN)
     )
     ok, detail = dict(readiness_checks(with_db, _registry_with_db(with_db)))["job_executors"]()
-    assert ok is True, f"исполнитель чистки окон не отражён в готовности: {detail}"
-    assert PURGE_JOB_NAME in detail
+    assert ok is True, f"исполнители задач не отражены в готовности: {detail}"
+    for name in sorted(_IMPLEMENTED):
+        assert name in detail, f"{name}: исполнитель не виден в готовности"
     for job in JOB_REGISTRY:
-        if job.name != PURGE_JOB_NAME:
+        if job.name not in _IMPLEMENTED:
             assert f"{job.name}@{job.milestone}" in detail, "остальные вехи пропали из готовности"
 
 
@@ -259,3 +278,53 @@ def test_исполнитель_чистки_сообщает_число_уда�
 
 def test_имя_процесса_совпадает_с_именем_в_compose() -> None:
     assert APP_NAME == "jobs"
+
+
+def test_ежедневная_сверка_журнала_объявлена_с_регламентом_8_7() -> None:
+    """§8.7 называет задачу `integrity-check` и требует ежедневности: интервал — сутки.
+
+    Имя держится с дефисом, как в ТЗ: `/readyz` и логи печатают именно его, и «похожее» имя
+    (`integrity_check`) разрушило бы сопоставление с перечнем §12.3 и с формулировками приёмки.
+    Задача относится к вехе M1: журнал с цепочкой хэшей живёт с `T-109`, а не с более поздними
+    вехами, и откладывать ежедневную проверку некуда — с неё начинается разбор подделки.
+    """
+    check = next(job for job in JOB_REGISTRY if job.name == INTEGRITY_JOB_NAME)
+    assert (
+        check.interval_s == INTEGRITY_CHECK_INTERVAL_S == 86_400.0
+    ), f"регламент ежедневной сверки: {check.interval_s} с, решено — сутки"
+    assert check.milestone == "M1"
+    assert check.task == INTEGRITY_TASK == "T-109"
+
+
+def test_исполнитель_сверки_возвращает_текст_итога(
+    settings: Settings, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Исполнитель возвращает вердикт прогона: «цепочка цела» и «находок 3» различимы в `job_done`.
+
+    Сама сверка на живой базе — `tests/integration/test_jobs_integrity_db.py` (job `migrations`);
+    здесь проверяется связка «реестр ↔ исполнитель ↔ текст» без сети и без базы: движок строится
+    лениво, а сам прогон подменён.
+    """
+    monkeypatch.setattr(
+        jobs_main,
+        "run_integrity_check",
+        lambda _engine, *, app, **_kwargs: _FakeOutcome(verdict="findings", app=app),
+    )
+    with_db = Settings(
+        secrets_dir=settings.secrets_dir, instance_name="test", db_url=SecretStr(_DSN)
+    )
+    handlers = {job.name: job.handler for job in _registry_with_db(with_db)}
+    handler = handlers[INTEGRITY_JOB_NAME]
+    assert handler is not None
+    assert handler() == "вердикт: findings (jobs)"
+
+
+class _FakeOutcome:
+    """Заготовка итога прогона: у исполнителя важна только строка `summary()`."""
+
+    def __init__(self, *, verdict: str, app: str) -> None:
+        self.verdict = verdict
+        self.app = app
+
+    def summary(self) -> str:
+        return f"вердикт: {self.verdict} ({self.app})"

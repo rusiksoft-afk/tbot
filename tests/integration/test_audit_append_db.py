@@ -60,16 +60,12 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from apps.web.security.rate_limit import LOGIN_IP_SCOPE
-from apps.web.store import (
-    AUDIT_CHAIN_LOCK_KEY,
-    AuditChainConflictError,
-    JournalContext,
-    SqlStore,
-)
+from apps.web.store import JournalContext, SqlStore
 from packages.common.clock import utc_now
 from packages.common.db import sqlalchemy_url
 from packages.common.ids import uuid7
 from packages.identity.audit import AuditRecordError, record_of_entry
+from packages.storage.audit_store import AUDIT_CHAIN_LOCK_KEY, AuditChainConflictError
 from packages.storage.models import RATE_WINDOW_SECONDS, AuditLogEntry, RateBucket
 
 # Читается до аутофикстуры `clean_tbot_env`: на уровне модуля решается, идти ли в группу целиком.

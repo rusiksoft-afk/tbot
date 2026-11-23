@@ -43,12 +43,12 @@ from uuid import uuid4
 import pytest
 from fastapi.testclient import TestClient
 
-from apps.web.store import AuditAppendError
 from packages.common.clock import utc_now
 from packages.common.config import Settings
 from packages.identity.audit import AuditRecordError
 from packages.identity.authorization import ADMIN_TIER, DENIAL_NO_ACCOUNT, DENIAL_ROLE
 from packages.identity.sessions import advance_auth_step
+from packages.storage.audit_store import AuditAppendError
 from packages.storage.models import AuditLogEntry
 from tests.integration.web_support import (
     TEST_LOGIN,

@@ -43,6 +43,8 @@ from sqlalchemy.orm import Session
 
 from packages.identity.audit import (
     AUDIT_ACTIONS,
+    FINDING_KINDS,
+    INFORMATIONAL_KINDS,
     AuditRecord,
     IssueKind,
     StoredRecord,
@@ -193,12 +195,17 @@ def test_развилка_цепочки_даёт_единицу() -> None:
 
 
 def test_признаки_находок_разделены_явно() -> None:
-    """Каждый признак находки отнесён явно: пятого кода, «не замеченного молча», не бывает."""
+    """Каждый признак находки отнесён явно: пятого кода, «не замеченного молча», не бывает.
+
+    Наборы читаются из общего слоя (`packages.identity.audit`), а не из инструмента: срез `R3.2`
+    сделал их общими для ручной команды и для ежедневной `integrity-check`, и проверка обязана
+    чинить тот источник, который правят, а не его копию.
+    """
     kinds: frozenset[IssueKind] = frozenset(
         {"content_mismatch", "broken_link", "missing_prefix", "duplicate_parent"}
     )
-    assert kinds == audit_verify.FINDING_KINDS | audit_verify.INFORMATIONAL_KINDS
-    assert not (audit_verify.FINDING_KINDS & audit_verify.INFORMATIONAL_KINDS)
+    assert kinds == FINDING_KINDS | INFORMATIONAL_KINDS
+    assert not (FINDING_KINDS & INFORMATIONAL_KINDS)
 
 
 # ─── `missing_prefix`: печатается, но вердикт не меняет ──────────────────────────────────────

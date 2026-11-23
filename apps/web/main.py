@@ -53,12 +53,7 @@ from apps.web.security.keys import (
 )
 from apps.web.security.rate_limit import RateLimitExceeded
 from apps.web.security.sessions import REASON_QUERY, SessionRedirect, clear_session_cookie
-from apps.web.store import (
-    AuditAppendError,
-    LoginTiming,
-    StoreUnavailableError,
-    build_session_factory,
-)
+from apps.web.store import LoginTiming, StoreUnavailableError, build_session_factory
 from packages.common import metrics
 from packages.common.clock import utc_now
 from packages.common.config import ConfigError, Settings, load_settings
@@ -74,6 +69,7 @@ from packages.common.logging import (
 from packages.identity.authorization import AccessDeniedError
 from packages.identity.passwords import MalformedPasswordHashError
 from packages.identity.users import AccountAccessError
+from packages.storage.audit_store import AuditAppendError
 
 log = get_logger("web")
 
