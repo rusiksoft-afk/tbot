@@ -12,13 +12,23 @@
   (`ADR-025` п. 2), иначе разбор цепочки был бы непрерывным потоком ложных находок;
 * **адрес возвращается объектом `ipaddress`**, а не строкой, которую подавали: канонический текст
   обязан совпасть с записанным (замер `ADR-009`, та же форма, что и в списке сеансов);
-* **развилку цепочки закрывает база** (`ix_audit_log_hash_prev_linked`, ревизия `0007`):
-  вторая строка на того же предка отклоняется `23505` — и для роли-владельца схемы тоже, в
-  отличие от append-only прав из `deploy/postgres/roles.sql`, которые у владельца не действуют;
+* **развилку цепочки закрывает база** (`ix_audit_log_hash_prev_linked`, ревизия `0007`): вторая
+  строка на того же предка отклоняется `23505` — и для роли-владельца схемы тоже, в отличие от
+  append-only прав из `deploy/postgres/roles.sql`, которые у владельца не действуют. Развилка —
+  это две строки с **одним и тем же** `hash_prev`: строка с `NULL` и её единственный потомок
+  конфликтом не являются (замер прогона CI `45163930282`: первая версия проверки вставляла
+  законную пару «родитель → потомок» и, разумеется, не получала отказа);
+* **обход через `ON CONFLICT DO NOTHING` не создаёт строку** — поэтому он на журнале запрещён
+  (`ADR-025` п. 4): потерянное событие разбор показывает как `broken_link`, то есть как подделку;
 * **ручную правку и вырез строки разбор находит** — вторая половина `AC-identity-04` («изменённая
   вручную копия дампа → найден разрыв»). Правим и вырезаем мы именно ролью-владельцем: у роли
   приложения `UPDATE`/`DELETE` на журнале отозваны (первая половина той же приёмки — шаг
   «append-only права роли приложения», `tests/integration/test_postgres_roles.py`).
+
+Ещё одно требование к этим проверкам, тоже из замера (`CI 45163930282`): **читать после правки
+обязано другое соединение**. Сессия, которая сама выполнила `UPDATE`, возвращает из identity map
+прежние атрибуты, и разбор по ней показал бы целую цепочку на испорченной строке. Так же читает и
+`make audit-verify`: отдельным прогоном, поверх зафиксированного состояния.
 
 Запуск: `TBOT_DB_URL` на базу, развёрнутую до `upgrade head` (так и стоит в job'е `миграции`).
 Без переменной группа пропускается целиком (на dev-машине базы нет), при заданной, но недоступной
@@ -36,7 +46,7 @@ from datetime import datetime
 from typing import Any, Final
 
 import pytest
-from sqlalchemy import Engine, create_engine, delete, select, text
+from sqlalchemy import Connection, Engine, create_engine, delete, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -113,7 +123,9 @@ def _insert(
 
     `hash_prev` передаётся явно (а не читается «хвостом» таблицы): тест строит свою ветку, и
     чужие строки других шагов job'а на неё влиять не должны. Протокол с блокировкой хвоста
-    (`ADR-025` п. 6) — часть слоя доступа, срез `R2` этой же задачи.
+    (`ADR-025` п. 6) — часть слоя доступа, срез `R2` этой же задачи. `flush()` — внутри
+    помощника: отказ уникальности обязан приходить на строке вызова, а не отдельным оператором
+    внутри `pytest.raises` (`PT012`).
     """
     record = make_record(
         action=action,
@@ -156,6 +168,19 @@ def _read(session: Session, marker: str) -> list[AuditLogEntry]:
         .order_by(AuditLogEntry.id)
     )
     return list(session.scalars(statement).all())
+
+
+def _read_fresh(bind: Engine | Connection, marker: str) -> list[AuditLogEntry]:
+    """Прочитать строки маркера новым соединением.
+
+    Нужно после прямой правки или выреза: та же сессия вернула бы из identity map прежние
+    атрибуты, и разбор показал бы целую цепочку на испорченной строке (замер `CI 45163930282`).
+    """
+    fresh = sessionmaker(bind=bind, expire_on_commit=False)()
+    try:
+        return _read(fresh, marker)
+    finally:
+        fresh.close()
 
 
 # ─── пересчёт по живой таблице ──────────────────────────────────────────────────────────────
@@ -214,7 +239,7 @@ def test_значения_после_чтения_из_базы_остаются
     session.commit()
     stored_hash = entry.hash
 
-    fresh = _read(session, marker)
+    fresh = _read_fresh(session.get_bind(), marker)
     assert len(fresh) == 1
     row = fresh[0]
     assert row.at == at, "колонка `timestamptz` вернула другой момент — хэш не совпадёт"
@@ -245,25 +270,28 @@ def test_значения_после_чтения_из_базы_остаются
 # ─── развилку держит база ───────────────────────────────────────────────────────────────────
 
 
-def test_вторую_запись_на_того_же_предка_база_отклоняет(session: Session) -> None:
+def test_второй_записи_на_того_же_предка_база_отклоняет(session: Session) -> None:
     """`ix_audit_log_hash_prev_linked` (ревизия `0007`) — страж, а не договорённость.
 
-    Без него два процесса, прочитавшие один и тот же хвост, молча открыли бы две ветки:
-    развилка не видна ни в одной колонке, и «разрыв цепочки» перестал бы быть признаком правки.
-    Отклонение ждёт именно `23505` (нарушение уникальности), а не «какую-нибудь ошибку»: по коду
-    слоя доступа в срезе `R2` отличат конфликт цепочки от прочего и решат, повторять ли
-    транзакцию.
+    Развилка — это две строки с одним и тем же `hash_prev`, поэтому проверка строит родителя, его
+    законного потомка и **вторую** попытку того же потомка. Без индекса два процесса, прочитавшие
+    один хвост, молча открыли бы две ветки: развилка не видна ни в одной колонке, и «разрыв
+    цепочки» перестал бы быть признаком правки.
 
-    Индекс действует и для роли-владельца схемы — в отличие от append-only прав, которые у
-    владельца не работают (`deploy/postgres/roles.sql`, п. 2.1). Поэтому страж выбран индексом,
-    а не только правами.
+    Отклонение ждёт именно `23505` (нарушение уникальности), а не «какую-нибудь ошибку»: по коду
+    слой доступа в срезе `R2` отличит конфликт цепочки от прочего и решит, повторять ли
+    транзакцию. Индекс действует и для роли-владельца схемы — в отличие от append-only прав,
+    которые у владельца не работают (`deploy/postgres/roles.sql`, п. 2.1). Поэтому страж выбран
+    индексом, а не только правами.
     """
     marker = _marker()
-    first = _insert(session, marker=marker, index=1, hash_prev=None)
+    parent = _insert(session, marker=marker, index=1, hash_prev=None)
+    parent_hash = parent.hash
+    _insert(session, marker=marker, index=2, hash_prev=parent_hash)
     session.commit()
 
     with pytest.raises(IntegrityError) as captured:
-        _insert(session, marker=marker, index=2, hash_prev=first.hash)
+        _insert(session, marker=marker, index=3, hash_prev=parent_hash)
     error = captured.value
     assert _UNIQUE_VIOLATION in str(error.orig) or _UNIQUE_VIOLATION in str(
         error
@@ -273,32 +301,99 @@ def test_вторую_запись_на_того_же_предка_база_от
     ), f"отклонить обязан именно индекс {_FORK_INDEX}, а не случайное ограничение: {error}"
     session.rollback()
 
-    rows = _read(session, marker)
-    assert len(rows) == 1, "неудачная вставка оставила строку — транзакт откатился не целиком"
+    survivors = _read_fresh(session.get_bind(), marker)
+    assert len(survivors) == 2, "неудачная вставка оставила строку — транзакт откатился не целиком"
+    report = verify_chain([record_of_entry(row) for row in survivors], expect_genesis=False)
+    assert report.intact, f"отклонённая развилка попалась в разбор: {report.summary()}"
+    assert survivors[1].hash_prev == parent_hash
 
 
-def test_двухстрочную_ветку_от_одного_предка_база_тоже_отклоняет(session: Session) -> None:
-    """Дублирование записи на том же месте цепочки — тот же отказ.
+def test_повтор_одной_и_той_же_записи_база_тоже_отклоняет(session: Session) -> None:
+    """Повторная вставка того же события (retry «не думая») — та же развилка и тот же отказ.
 
-    Копия строки с тем же `hash_prev` — это не «правка содержимого», а именно развилка: тот же
-    самый предок, тот же уровень. Проверка нужна, потому что «продублировать строку журнала»
-    — самый дешёвый способ сбить пересчёт по количеству строк.
+    Самый дешёвый способ сбить пересчёт по количеству строк — записать событие дважды, например
+    после таймаута соединения. Пока вторая строка ссылается на того же предка, индекс не даёт ни
+    развилки, ни дубля, поэтому повтор обязан кончиться отказом, а не «ещё одной строкой журнала».
     """
     marker = _marker()
-    first = _insert(session, marker=marker, index=1, hash_prev=None)
-    _insert(session, marker=marker, index=2, hash_prev=first.hash)
+    parent = _insert(session, marker=marker, index=1, hash_prev=None)
+    parent_hash = parent.hash
+    _insert(
+        session,
+        marker=marker,
+        index=2,
+        hash_prev=parent_hash,
+        action="backup_code.spent",
+        details={"кодов_осталось": 9},
+    )
     session.commit()
 
     with pytest.raises(IntegrityError) as captured:
-        _insert(session, marker=marker, index=3, hash_prev=first.hash)
+        _insert(
+            session,
+            marker=marker,
+            index=3,
+            hash_prev=parent_hash,
+            action="backup_code.spent",
+            details={"кодов_осталось": 9},
+        )
     assert _FORK_INDEX in str(captured.value)
     session.rollback()
+    assert len(_read_fresh(session.get_bind(), marker)) == 2
 
-    survivors = _read(session, marker)
-    assert len(survivors) == 2, "откат должен снять только что начатую вставку"
-    report = verify_chain([record_of_entry(row) for row in survivors], expect_genesis=False)
-    assert report.intact, f"отклонённая развилка попала в разбор: {report.summary()}"
-    assert survivors[1].hash_prev == first.hash
+
+def test_обход_через_on_conflict_do_nothing_не_создаёт_строку(session: Session) -> None:
+    """Наивный «upsert» журнал не спасает, а молча теряет запись — поэтому он запрещён.
+
+    `ADR-025` п. 4 запрещает `ON CONFLICT DO NOTHING` на журнале: без индекса (`0007`) такая
+    конструкция не infer-ится ни на какой объект и не работала бы вовсе, а с индексом — тихо
+    выбрасывает строку, и потерянное событие становится дырой, которую разбор показывает как
+    `broken_link`, то есть как подделку содержимого. Проверка фиксирует обе половинки: вывод
+    `ON CONFLICT (hash_prev) WHERE hash_prev IS NOT NULL` опирается именно на частичный индекс
+    `0007`, и строка не появляется — значит слой доступа (`R2`) обязан смотреть на число
+    затронутых строк, а не на отсутствие ошибки.
+    """
+    marker = _marker()
+    parent = _insert(session, marker=marker, index=1, hash_prev=None)
+    session.commit()
+    record = make_record(
+        action="session.login",
+        at=utc_now(),
+        entity="session",
+        entity_id=f"{marker}-obhod",
+        hash_prev=parent.hash,
+    )
+
+    # `session.connection()` вместо `session.execute()`: описания SQLAlchemy возвращают
+    # `CursorResult` только у соединения, а нам нужен `rowcount` — по нему слой доступа (`R2`)
+    # обязан отличать «конфликт цепочки подавлен индексом» от «запись вставлена».
+    result = session.connection().execute(
+        text(
+            "INSERT INTO audit_log (at, action, actor, entity, entity_id, details, ip, hash, "
+            "hash_prev, request_id) VALUES (:at, :action, NULL, :entity, :entity_id, NULL, NULL, "
+            ":hash, :hash_prev, NULL) "
+            "ON CONFLICT (hash_prev) WHERE hash_prev IS NOT NULL DO NOTHING"
+        ),
+        {
+            "at": record.at,
+            "action": record.action,
+            "entity": record.entity,
+            "entity_id": record.entity_id,
+            "hash": record.content_hash(),
+            "hash_prev": record.hash_prev,
+        },
+    )
+    session.commit()
+
+    assert result.rowcount == 0, (
+        "вставка на занятого предка обязана быть подавлена индексом "
+        f"{_FORK_INDEX}; прошла строка — значит ON CONFLICT вывел бы не тот объект"
+    )
+    survivors = _read_fresh(session.get_bind(), marker)
+    assert len(survivors) == 1, "`DO NOTHING` оставил вторую строку — индекс работает неверно"
+    assert verify_chain(
+        [record_of_entry(row) for row in survivors], expect_genesis=False
+    ).intact, "молча потерянная строка уже сломала цепочку"
 
 
 # ─── ручная правка и вырез ──────────────────────────────────────────────────────────────────
@@ -310,8 +405,8 @@ def test_правка_строки_ролью_владельца_находит�
     Правим прямым `UPDATE` ролью-владельцем: у роли приложения такого права нет
     (`REQ-identity-04`), значит остаётся ровно путь «человек с правами базы» — именно он и
     моделируется. Колонку `hash` при этом не трогают: пересчитать новый хэш подделыватель тоже
-    не обязан (и не может, не зная содержимого соседних строк — но именно для этого цепочку и
-    проверяют по всей длине, `ADR-025` п. 7).
+    не обязан. Чтение — новым соединением (`_read_fresh`): та же сессия вернула бы из identity
+    map прежние атрибуты, и проверка прошла бы на целой цепочке, ничего не проверив.
     """
     marker = _marker()
     rows = _build_chain(session, marker, count=3)
@@ -324,7 +419,10 @@ def test_правка_строки_ролью_владельца_находит�
     )
     session.commit()
 
-    after = _read(session, marker)
+    after = _read_fresh(session.get_bind(), marker)
+    assert [row.action for row in after][
+        1
+    ] == "session.logout", "правка не дошла до базы — проверять было нечего"
     report = verify_chain([record_of_entry(row) for row in after], expect_genesis=False)
     kinds = {issue.kind for issue in report.issues}
     assert kinds == {"content_mismatch"}, report.summary()
@@ -339,7 +437,7 @@ def test_вырез_строки_ролью_владельца_находитс�
     Отдельный код важен: «журнал стал короче на одну строку» и «строку вырезали из середины» —
     разные события для разбора инцидента (ср. `docs/HANDOFF.md §1.60` п. 7: инициатора отзыва
     строки 08:19:08 UTC восстановить нечем, и «недостающая строка» — ровно то, что журнал обязан
-    показать).
+    показать). Чтение — новым соединением, как в проверке выше.
     """
     marker = _marker()
     rows = _build_chain(session, marker, count=4)
@@ -348,7 +446,7 @@ def test_вырез_строки_ролью_владельца_находитс�
     session.execute(text("DELETE FROM audit_log WHERE id = :id"), {"id": removed})
     session.commit()
 
-    after = _read(session, marker)
+    after = _read_fresh(session.get_bind(), marker)
     assert len(after) == 3
     report = verify_chain([record_of_entry(row) for row in after], expect_genesis=False)
     kinds = {issue.kind for issue in report.issues}
@@ -367,11 +465,7 @@ def test_цепочку_читают_по_другому_соединению_б
     _build_chain(session, marker, count=3)
 
     first_view = _read(session, marker)
-    second = sessionmaker(bind=session.get_bind(), expire_on_commit=False)()
-    try:
-        second_view = _read(second, marker)
-    finally:
-        second.close()
+    second_view = _read_fresh(session.get_bind(), marker)
     assert [row.id for row in first_view] == [row.id for row in second_view]
     assert [row.hash for row in first_view] == [row.hash for row in second_view]
     report = verify_chain([record_of_entry(row) for row in second_view], expect_genesis=False)
@@ -398,7 +492,7 @@ def test_материал_хэша_живёт_в_колонках_а_не_в_п�
     )
     session.commit()
 
-    row = _read(session, marker)[0]
+    row = _read_fresh(session.get_bind(), marker)[0]
     manual = AuditRecord(
         at=row.at,
         action=row.action,
