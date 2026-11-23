@@ -189,8 +189,8 @@ def _fabricated(session: Session, *, marker: str) -> int:
     row = session.execute(
         text(
             "INSERT INTO audit_log (at, action, entity, entity_id, details, hash_prev, hash) "
-            "VALUES (:at, 'session.login', 'session', :entity_id, :details::jsonb, NULL, :hash) "
-            "RETURNING id"
+            "VALUES (:at, 'session.login', 'session', :entity_id, CAST(:details AS jsonb), "
+            "NULL, :hash) RETURNING id"
         ),
         {
             "at": _AT + timedelta(microseconds=900_000),
@@ -353,6 +353,11 @@ def test_строка_вставленная_сырым_sql_тоже_наход�
     Строка вставляется сырым SQL ролью владельца схемы с законным по формату, но выдуманным
     `hash`: `CHECK hash_sha256` её пропускает, поэтому ловить обязан именно пересчёт, а не
     ограничение схемы.
+
+    Приведение типа пишется функцией `CAST`, а не оператором `::`: в `text()` два двоеточия
+    подряд читаются как экранированный двоеточный символ, и параметр `:details` остаётся
+    неподвязанным (замер `CI 45215955227`: `psycopg.errors.SyntaxError: syntax error at or
+    near ":"`).
     """
     marker = _marker()
     forged = _fabricated(writer, marker=marker)
