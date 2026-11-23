@@ -99,6 +99,11 @@ def session(engine: Engine) -> Iterator[Session]:
     """
     opened = sessionmaker(bind=engine, expire_on_commit=False)()
     yield opened
+    # Откат перед чисткой: если проверка упала ассертом внутри блока `pytest.raises(IntegrityError)`,
+    # транзакция сессии остаётся в состоянии «откатить», и финализор выдал бы
+    # PendingRollbackError вместо настоящего сообщения об ошибке (замер `CI 45165930936`:
+    # так «1 failed» превратилось в «1 failed + 1 error»).
+    opened.rollback()
     opened.execute(delete(AuditLogEntry).where(AuditLogEntry.entity_id.like(f"{_MARKER_PREFIX}%")))
     opened.commit()
     opened.close()
@@ -293,9 +298,14 @@ def test_второй_записи_на_того_же_предка_база_от
     with pytest.raises(IntegrityError) as captured:
         _insert(session, marker=marker, index=3, hash_prev=parent_hash)
     error = captured.value
-    assert _UNIQUE_VIOLATION in str(error.orig) or _UNIQUE_VIOLATION in str(
-        error
-    ), f"ожидался отказ уникальности {_UNIQUE_VIOLATION}, получено: {error}"
+    # Код состояния берём из атрибута `sqlstate`, а не из текста: psycopg3 поднимает
+    # `psycopg.errors.UniqueViolation`, и в его сообщении кода `23505` нет (замер
+    # `CI 45165930936`: проверка искала подстроку в тексте и не находила, хотя отказ был ровно
+    # тот, что нужен).
+    sqlstate = str(getattr(error.orig, "sqlstate", ""))
+    assert (
+        sqlstate == _UNIQUE_VIOLATION
+    ), f"ожидался отказ уникальности {_UNIQUE_VIOLATION}, получено: {sqlstate!r} ({error.orig!r})"
     assert _FORK_INDEX in str(
         error
     ), f"отклонить обязан именно индекс {_FORK_INDEX}, а не случайное ограничение: {error}"
@@ -352,9 +362,14 @@ def test_обход_через_on_conflict_do_nothing_не_создаёт_стр
     `ON CONFLICT (hash_prev) WHERE hash_prev IS NOT NULL` опирается именно на частичный индекс
     `0007`, и строка не появляется — значит слой доступа (`R2`) обязан смотреть на число
     затронутых строк, а не на отсутствие ошибки.
+
+    Порядок строк обязателен: конфликт бывает только у предка, у которого **уже есть** потомок.
+    Первая версия проверки вставляла одного родителя и получала `rowcount == 1` — не потому, что
+    индекс не работает, а потому, что конфликтовать было не с чем (замер `CI 45165930936`).
     """
     marker = _marker()
     parent = _insert(session, marker=marker, index=1, hash_prev=None)
+    _insert(session, marker=marker, index=2, hash_prev=parent.hash)
     session.commit()
     record = make_record(
         action="session.login",
@@ -390,7 +405,10 @@ def test_обход_через_on_conflict_do_nothing_не_создаёт_стр
         f"{_FORK_INDEX}; прошла строка — значит ON CONFLICT вывел бы не тот объект"
     )
     survivors = _read_fresh(session.get_bind(), marker)
-    assert len(survivors) == 1, "`DO NOTHING` оставил вторую строку — индекс работает неверно"
+    assert len(survivors) == 2, (
+        "`DO NOTHING` оставил лишнюю строку или съел законную — ожидались родитель и его "
+        f"потомок, найдено {len(survivors)}"
+    )
     assert verify_chain(
         [record_of_entry(row) for row in survivors], expect_genesis=False
     ).intact, "молча потерянная строка уже сломала цепочку"

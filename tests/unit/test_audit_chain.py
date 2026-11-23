@@ -35,7 +35,7 @@ from uuid import UUID
 
 import pytest
 
-from packages.common.clock import MSK_TZ
+from packages.common.clock import MSK_TZ, utc_now
 from packages.identity.audit import (
     AUDIT_ACTIONS,
     AuditRecord,
@@ -127,12 +127,37 @@ def test_порядок_ключей_хэш_не_меняет() -> None:
     """`jsonb` порядок ключей не сохраняет — канонический вывод обязан его не различать.
 
     Иначе пересчёт ломался бы на строках, где ключи вернулись в другом порядке, и «разрыв
-    цепочки» стал бы обычным шумом.
+    цепочки» стал бы обычным шумом. Время держим явным: без `at` каждая запись получает свою
+    метку (`test_без_явного_времени_запись_получает_текущее`), и сравнение хэшей сравнивало бы часы.
     """
-    first = make_record(action="session.login", details={"b": 1, "a": {"y": 2, "x": [1, 2]}})
-    second = make_record(action="session.login", details={"a": {"x": [1, 2], "y": 2}, "b": 1})
+    first = make_record(
+        action="session.login", at=VECTOR_AT, details={"b": 1, "a": {"y": 2, "x": [1, 2]}}
+    )
+    second = make_record(
+        action="session.login", at=VECTOR_AT, details={"a": {"x": [1, 2], "y": 2}, "b": 1}
+    )
     assert first.canonical_json() == second.canonical_json()
     assert first.content_hash() == second.content_hash()
+
+
+def test_без_явного_времени_запись_получает_текущее() -> None:
+    """Метка по умолчанию — «сейчас»; сравнения хэшей обязаны передавать `at` явно.
+
+    Причина не теоретическая: первое сравнение хэшей в этом файле строилось на записях без `at`
+    и проходило на dev-машине (ход часов ~1 мс, две метки совпали), а в CI на Linux упало — там
+    соседние вызовы различаются микросекундами. Отсюда правило для теста и для слоя доступа `R2`:
+    время снимается один раз и передаётся явно, иначе одна попытка даёт две разные записи.
+    """
+    now = utc_now()
+    implicit = make_record(action="session.login")
+    assert abs((implicit.at - now).total_seconds()) < 5, "по умолчанию должно быть текущее время"
+    assert implicit.at.microsecond >= 0
+
+    explicit = make_record(action="session.login", at=VECTOR_AT)
+    assert explicit.at == VECTOR_AT
+    assert (
+        explicit.content_hash() == make_record(action="session.login", at=VECTOR_AT).content_hash()
+    )
 
 
 def test_форма_адреса_хэш_не_меняет_а_разный_адрес_меняет() -> None:
@@ -140,7 +165,7 @@ def test_форма_адреса_хэш_не_меняет_а_разный_адр
 
     Ведущие нули, прописные буквы и IPv4-mapped форма — один и тот же адрес: база хранит его в
     своей форме, и хэш обязан сходиться с чтением. Нормализация идемпотентна: канонический текст
-    второго прохода даёт себя же.
+    второго прохода даёт себя же. Время — явное (см. `test_без_явного_времени_запись_получает_текущее`).
     """
     assert canonical_ip("2001:0DB8:0000::0007") == "2001:db8::7"
     assert canonical_ip("2001:db8::7") == "2001:db8::7"
@@ -150,11 +175,12 @@ def test_форма_адреса_хэш_не_меняет_а_разный_адр
     assert canonical_ip(ipaddress.IPv4Address("127.0.0.1")) == "127.0.0.1"
 
     hashes = {
-        make_record(action="auth.rate_limited", ip=form).content_hash()
+        make_record(action="auth.rate_limited", at=VECTOR_AT, ip=form).content_hash()
         for form in ("2001:0DB8::7", "2001:db8::7")
     }
     assert len(hashes) == 1, "разная текстовая форма одного адреса дала разные хэши"
-    assert make_record(action="auth.rate_limited", ip="2001:db8::8").content_hash() not in hashes
+    other = make_record(action="auth.rate_limited", at=VECTOR_AT, ip="2001:db8::8")
+    assert other.content_hash() not in hashes
 
     for bad in ("не-адрес", "2001:db8::7/64", "localhost"):
         with pytest.raises(AuditRecordError):
