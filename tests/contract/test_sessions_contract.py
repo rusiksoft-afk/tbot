@@ -17,6 +17,7 @@ from typing import Final, cast
 from sqlalchemy import Table
 from sqlalchemy.schema import CheckConstraint, UniqueConstraint
 
+from apps.web.routes.sessions import LAST_ACTIVITY_UNRECORDED
 from packages.identity import sessions
 from packages.identity.sessions import (
     ABSOLUTE_TIMEOUT,
@@ -33,6 +34,9 @@ from packages.storage.models import UserSession
 ROOT = Path(__file__).resolve().parents[2]
 TZ_SECURITY: Final = ROOT / "docs" / "tz" / "08-security-auth-2fa.md"
 MODULE_PATH: Final = ROOT / "packages" / "identity" / "sessions.py"
+#: Страница «мои устройства» — единственное место, где доменное описание сеанса становится
+#: колонкой с временем, поэтому правка отображения относится к нему, а не к модели.
+CONSOLE_ROUTE: Final = ROOT / "apps" / "web" / "routes" / "sessions.py"
 
 #: Уровень домена не имеет права знать ни про HTTP, ни про шаблонизатор, ни про драйвер базы:
 #: куки/CSRF/CSP — `apps/web` (следующий срез `T-102`), транзакции — вызывающий слой.
@@ -187,6 +191,53 @@ def test_описание_сессии_не_содержит_материала_
         "user_agent",
     ):
         assert required in names, f"в описании нет поля {required!r}, которое требует §8.3"
+
+
+def test_колонка_активности_не_рисует_перестёртанную_отметку_последнего_запроса() -> None:
+    """«Последняя активность» не имеет права брать время из `last_seen_at` у отозванной строки.
+
+    Решение заказчика от 2026-11-23 (ask `81d7a432`) и замер приёмки
+    (`docs/acceptance/prod-accept-t106-auth-half.md` §7.3): общий `onupdate=now()` поднимает
+    `last_seen_at` тем же `UPDATE`, которым ставится `revoked_at` (13 из 13 отозванных строк
+    площадки), поэтому время отзыва под подписью «последняя активность» было бы утверждением,
+    что сеансом работали в минуту его закрытия.
+
+    Правка — отображение, а не модель и не история: `last_seen_at` остаётся отметкой
+    idle-продления (§8.3), а домен отвечает отдельным полем `last_activity_at`, у отозванной
+    строки пустым. Проверка держит обе половины: что домен различает два факта и что страница
+    читает именно различение, а не сырую колонку. Та же граница относится к журналу (§8.7):
+    `last_seen_at` отозванной строки не уходит в детали события (`ADR-025`).
+    """
+    fields = set(SessionDescriptor.__dataclass_fields__)
+    assert {"last_seen_at", "last_activity_at"} <= fields, (
+        "из описания сеанса исчезло различение «отметка последнего запроса» и «когда сеансом "
+        "действительно пользовались»"
+    )
+
+    domain = MODULE_PATH.read_text(encoding="utf-8")
+    assert "None if session.revoked_at is not None else seen_at" in domain, (
+        "домен перестал отличать отозванную строку: у всех отозванных записей активность "
+        "совпала бы с самим отзывом"
+    )
+
+    console = CONSOLE_ROUTE.read_text(encoding="utf-8")
+    assert "descriptor.last_activity_at" in console, (
+        "страница «мои устройства» больше не читает last_activity_at: колонка снова показывает "
+        "момент отзыва под подписью о последней активности"
+    )
+    assert "descriptor.last_seen_at" not in console, (
+        "колонка активности снова обращается к last_seen_at — к перестёртанной колонке (замер "
+        "§7.3); если поле понадобилось для другой колонки, её подпись обязана называть другой "
+        "факт"
+    )
+    assert LAST_ACTIVITY_UNRECORDED.count("не сохранилась") == 1, (
+        "пустота колонки обязана быть объяснена текстом, а не прочерком: человек обязан понять, "
+        "что второе время просто совпало бы с моментом отзыва"
+    )
+    assert "перезаписана отзывом" in LAST_ACTIVITY_UNRECORDED, (
+        "в подписи пропало название причины: «не сохранилась» читается как «сеансом не "
+        "пользовались»"
+    )
 
 
 def test_sessions_не_тянет_http_шаблонизатор_или_базу() -> None:

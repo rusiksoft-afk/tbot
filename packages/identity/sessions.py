@@ -472,11 +472,28 @@ class SessionDescriptor:
 
     Ни значения куки, ни `token_hash` сюда не попадают: на странице, которую рендерит
     шаблонизатор, нужны устройство и срок, а не материал сессии.
+
+    `last_seen_at` и `last_activity_at` — два разных факта, и путать их нельзя. Первая колонка
+    ведётся `onupdate=now()` (`ADR-017`, сноска к модели `packages/storage/models.py`): её
+    поднимает **любой** `UPDATE` строки, поэтому отзыв (`SET revoked_at = now()`) оставляет
+    `last_seen_at == revoked_at`. Замер площадки 2026-11-23: на 13 из 13 отозванных строк значения
+    совпадают (`docs/acceptance/prod-accept-t106-auth-half.md` §7.3). Вторая колонка — ответ на
+    вопрос «когда этим сеансом действительно пользовались в последний раз»: у живой строки это и
+    есть `last_seen_at`, у отозванной — `None`, потому что прежняя отметка затёрта самим отзывом и
+    восстановить её из этой строки нельзя. Показывать время отзыва под подписью «последняя
+    активность» — значит утверждать, что сеансом пользовались в ту минуту, когда его закрыли.
+
+    Модель при этом не меняется намеренно: `last_seen_at` остаётся отметкой idle-продления (§8.3),
+    а не историческим фактом, и «починка» вида ценой правки модели или пересчёта `revoked_at`
+    означала бы переписывание истории сеансов (§2.4). Попутное следствие для журнала (§8.7): у
+    отозванной строки `last_seen_at` в детали события писать нельзя — решение зафиксировано
+    `ADR-025` в перечне того, что уходит в срез `R2`.
     """
 
     id: UUID
     created_at: datetime
     last_seen_at: datetime
+    last_activity_at: datetime | None
     expires_at: datetime
     auth_step: str
     ip: str | None
@@ -494,10 +511,15 @@ def describe_session(
 ) -> SessionDescriptor:
     """Описать сессию для страницы «мои устройства» (§8.3)."""
     moment = ensure_aware(now)
+    seen_at = _aware(session.last_seen_at, "last_seen_at")
     return SessionDescriptor(
         id=session.id,
         created_at=_aware(session.created_at, "created_at"),
-        last_seen_at=_aware(session.last_seen_at, "last_seen_at"),
+        last_seen_at=seen_at,
+        # Отозванный сеанс остаётся без ответа про активность: см. докстринг `SessionDescriptor`
+        # и сноску к `last_activity_at`. `None` здесь — не пропущенное значение, а зафиксированный
+        # факт «прежняя отметка перезаписана отзывом».
+        last_activity_at=None if session.revoked_at is not None else seen_at,
         expires_at=_aware(session.expires_at, "expires_at"),
         auth_step=session.auth_step,
         ip=session.ip,
@@ -528,5 +550,8 @@ def describe_sessions(
         rows = [row for row in rows if row.is_active]
     # активные — выше; внутри группы по убыванию последней активности. Ключ именно
     # `(is_active, last_seen_at)`: «не активна» — это True, и при reverse=True она ушла бы наверх.
+    # Порядок держит `last_seen_at`, а не `last_activity_at`: у отозванных строк второй колонки
+    # нет, а хронология списка от этого не меняется — строка отзыва всё равно идёт по моменту,
+    # которым она закрыта.
     rows.sort(key=lambda row: (row.is_active, row.last_seen_at), reverse=True)
     return tuple(rows)

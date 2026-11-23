@@ -361,6 +361,13 @@ class SessionRow:
     revoke_url: str
 
 
+#: Подпись вместо времени в колонке «Последняя активность». Значение формулирует причину пустоты,
+#: а не ставит прочерк: человек, видящий «отозван в 07:56:40» и «последняя активность — не
+#: сохранилась», понимает, что второе время просто совпало бы с первым (замер §7.3 приёмки
+#: `docs/acceptance/prod-accept-t106-auth-half.md`), а не что сеансом не пользовались вовсе.
+LAST_ACTIVITY_UNRECORDED: Final = "не сохранилась (отметка перезаписана отзывом)"
+
+
 def _human_moment(moment: datetime) -> str:
     """Мгновение для человека: `ДД.ММ.ГГГГ ЧЧ:ММ` и подпись часового пояса (§9.1).
 
@@ -381,12 +388,21 @@ def _to_row(descriptor: SessionDescriptor) -> SessionRow:
     Адрес берётся из `str(...)`: живой PostgreSQL читает колонку `INET` объектом `ipaddress`
     (`ADR-009`), а наружу обязан уходить канонический текст — ровно та форма, которая является
     значением колонки и ключом счётчика лимитов.
+
+    Колонка активности читает `last_activity_at`, а не `last_seen_at`: у отозванной строки вторая
+    колонка — момент отзыва, а не момент последней работы (`ADR-025`, «что из этого следует»;
+    замер §7.3 приёмки). Модель не правится, правится только вывод — решение заказчика от
+    2026-11-23 (ask `81d7a432`).
     """
     return SessionRow(
         device=descriptor.user_agent or UNKNOWN_DEVICE_LABEL,
         address=str(descriptor.ip) if descriptor.ip is not None else UNKNOWN_ADDRESS_LABEL,
         started=_human_moment(descriptor.created_at),
-        last_seen=_human_moment(descriptor.last_seen_at),
+        last_seen=(
+            _human_moment(descriptor.last_activity_at)
+            if descriptor.last_activity_at is not None
+            else LAST_ACTIVITY_UNRECORDED
+        ),
         expires_at=_human_moment(descriptor.expires_at),
         is_current=descriptor.is_current,
         revoke_url=f"{SESSIONS_PATH}/{descriptor.id}/revoke",
@@ -613,8 +629,9 @@ def revoke_one(session_id: str, principal: ConsoleMutation, store: StoreDep) -> 
     меняет: `revoked_at` уже заполнен, строка больше не попадает в перечень живых — ответ будет
     `404`, а момент первого отзыва не перетрётся.
 
-    Запись `audit_log` о отзыве (§8.7) здесь не пишется: имена событий и цепочка хэшей — `T-109`,
-    перенос зафиксирован `ADR-009`.
+    Запись `audit_log` о отзыве (§8.7, события `session.revoke` и `session.revoke_all`) здесь не
+    пишется: реестр имён и протокол добавления сделаны срезами `R1` и `R2` задачи `T-109`, а вызов
+    для мутаций маршрута остаётся её остатком (перенос зафиксирован `ADR-009`).
     """
     record = _owned_live_session(store, principal, session_id)
     if record is None:

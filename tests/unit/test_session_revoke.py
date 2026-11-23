@@ -158,6 +158,57 @@ def test_описание_просроченной_сессии_отличает
     assert revoked_row.revoked_at == NOW + timedelta(minutes=1)
 
 
+def test_активность_отозванной_сессии_не_выдаётся_за_отметку_последнего_запроса() -> None:
+    """Отзыв не имеет права называть момент закрытия «последней активностью».
+
+    Основание — решение заказчика от 2026-11-23 (ask `81d7a432`, разбор `docs/HANDOFF.md §1.60`
+    п. 5г) и замер приёмки (`docs/acceptance/prod-accept-t106-auth-half.md` §7.3): общий
+    `onupdate=now()` поднимает `last_seen_at` тем же `UPDATE`, которым ставится `revoked_at`, и на
+    13 из 13 отозванных строк площадки значения совпали. Настоящая последняя активность такой
+    строки из неё не читается вовсе.
+
+    Модель не правится намеренно: `last_seen_at` остаётся отметкой idle-продления (§8.3), и
+    «починка» ценой правки модели или пересчёта `revoked_at` переписала бы историю сеансов (§2.4).
+    Поэтому домен отвечает отдельным полем: у отозванной строки оно пустое — это зафиксированный
+    факт «прежняя отметка перезаписана отзывом», а не пропущенное значение. То же ограничение
+    относится к журналу (§8.7): `last_seen_at` отозванной строки в детали события не попадает
+    (`ADR-025`).
+    """
+    live = _session(created_at=NOW - timedelta(minutes=20))
+    register_session_activity(live, now=NOW - timedelta(minutes=3))
+
+    revoked = _session(created_at=NOW - timedelta(minutes=40))
+    register_session_activity(revoked, now=NOW - timedelta(minutes=15))
+    revoke_moment = NOW - timedelta(minutes=2)
+    revoke_session(revoked, now=revoke_moment)
+    # так ведёт себя база: `UPDATE` отзыва поднимает `last_seen_at` тем же механизмом `onupdate`.
+    # В юните базы нет, поэтому значение проставляет проверка — иначе она проверяла бы не тот
+    # случай, который измерен на площадке (иная предпосылка, иной вывод).
+    revoked.last_seen_at = revoke_moment
+
+    live_row = describe_session(live, now=NOW)
+    revoked_row = describe_session(revoked, now=NOW)
+
+    assert live_row.last_activity_at == live_row.last_seen_at == NOW - timedelta(minutes=3)
+    assert revoked_row.last_seen_at == revoke_moment, (
+        "проверка потеряла предпосылку замера §7.3: на отозванной строке отметка последнего "
+        "запроса равна моменту отзыва"
+    )
+    assert revoked_row.last_activity_at is None, (
+        "отзыв выдал перестёртанное значение за последнюю активность: у всех отозванных записей "
+        "она совпадёт с самим отзывом, а разбор прочтёт закрытие сеанса как работу в ту минуту"
+    )
+
+    # Просроченная, но не отозванная строка активность теряет по сроку, а не по отзыву: поле у неё
+    # заполнено — иначе страница «мои устройства» потеряла бы время там, где оно честно.
+    stale = _session(created_at=NOW - timedelta(minutes=45))
+    register_session_activity(stale, now=NOW - timedelta(minutes=31))
+    stale_row = describe_session(stale, now=NOW)
+    assert stale_row.revoked_at is None
+    assert stale_row.is_active is False
+    assert stale_row.last_activity_at == stale_row.last_seen_at == NOW - timedelta(minutes=31)
+
+
 def test_наивное_время_в_отзыве_и_в_описании_отвергается() -> None:
     """§2.7: наивное время невозможно ни в отзыве, ни в описании."""
     session = _session()
