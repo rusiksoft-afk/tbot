@@ -493,8 +493,7 @@ Argon2id, таблица переходов `STATE_TRANSITIONS` и отметк�
 подняты (`deploy/tbot.prod.env`, пара «прогон → коммит» — `AGENTS.md`, `docs/runbook/ghcr-pull.md §2`):
 
 ```bash
-cd /opt/tbot
-git rev-parse HEAD
+sudo git -C /opt/tbot rev-parse HEAD   # cd под rusiksoft недоступен: /opt/tbot — 750 root:root
 # с dev-машины: какой прогон Image дал поднятые дайджесты
 gh run list --workflow Image.yml --branch main --limit 3
 gh run view <image-run-id> --json headSha
@@ -506,8 +505,12 @@ gh run view <image-run-id> --json headSha
 **Шаг 1 — черновой прогон: код выхода `3`, запись не выполнялась.**
 
 ```bash
-cd /opt/tbot
-COMPOSE="sudo docker compose -f deploy/compose.yaml -f deploy/compose.prod.yaml --env-file deploy/tbot.prod.env"
+# /opt/tbot — 750 root:root: под rusiksoft нет ни cd, ни ls/grep по путям внутри, поэтому
+# форма — sudo и абсолютные пути (замер 2026-11-23, протокол
+# docs/acceptance/prod-deploy-t112-first-account.md §7). Вывод compose run в неинтерактивном
+# канале теряется: он пишется в файл, код берётся из $?
+COMPOSE="sudo docker compose -f /opt/tbot/deploy/compose.yaml -f /opt/tbot/deploy/compose.prod.yaml --env-file /opt/tbot/deploy/tbot.prod.env"
+# запуск: … < /dev/null > /tmp/t112-dry.txt 2>&1; rc=$?; cat /tmp/t112-dry.txt; sudo rm -f /tmp/t112-dry.txt
 $COMPOSE run --rm -v /opt/tbot/scripts:/srv/tbot/scripts:ro web python3 scripts/first_account.py
 ```
 
@@ -527,6 +530,15 @@ $COMPOSE run --rm -v /opt/tbot/scripts:/srv/tbot/scripts:ro web python3 scripts/
 # логин: ivan.petrov
 # e-mail: ivan@example.test
 ```
+
+**Кто запускает шаг 2.** Значение пароля существует только в том терминале, где запущена
+команда: второго показа, файла и журнала процесса у скрипта нет (`ADR-023`). Если завод
+выполняется через канал агента (ssh с перехватом вывода), значение попадает в журнал этого
+канала — то есть нарушается `ADR-004`. Поэтому штатный порядок: интерактивная сессия
+оператора (`ssh -t -i <ключ> -o IdentitiesOnly=yes rusiksoft@153.51.172.30`) и запуск
+команды в ней; агент после этого сверяет состояние базы запросами ниже и не видит значений.
+Тот же смысл у запрета оборачивать запуск в `script`, `tee` или лог tmux: прокрутка терминала
+остаётся у оператора, а копия в журнале — уже лишний носитель.
 
 Коды выхода: `0` — заведено и значение показано; `2` — аргументы или формат значения (в том числе
 переданный аргументами `--login`/`--email`: их скрипт не принимает); `3` — черновой прогон; `4` —
@@ -551,6 +563,9 @@ $COMPOSE run --rm -v /opt/tbot/scripts:/srv/tbot/scripts:ro web python3 scripts/
 **Сверка после операции** (без DSN в argv и без значений паролей — тот же приём, что в приёмках):
 
 ```bash
+# в неинтерактивном сценарии (ssh "bash -s" <<EOF) к каждому exec нужен < /dev/null:
+# иначе первый же exec забирает остаток сценария как stdin контейнера и команды дальше
+# молча не выполняются (замер 2026-11-23, протокол §7 п. 1)
 $COMPOSE exec -T postgres psql -U tbot -d tbot -At -c \
   "select login, role, state, (approved_by = id) as bootstrap, approved_at is not null as approved \
    from users order by login;"
