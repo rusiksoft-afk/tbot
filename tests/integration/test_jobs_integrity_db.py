@@ -14,7 +14,9 @@
   в таблице к этому шагу уже лежат строки других живых проверок, часть из них намеренно порчена
   (шаг «разбор цепочки инструментом»), поэтому полная выборка давала бы находки по чужим строкам.
   Границы по `id` — тот же механизм выборки, что у `make audit-verify` при разборе копии дампа, и
-  он же показывает `missing_prefix` пометкой, а не находкой;
+  он же показывает `missing_prefix` пометкой, а не находкой (детерминированный случай — окно, у
+  первой строки которого ненулевой `hash_prev`); содержимое журнала между шагами job'а меняться
+  не должно, но проверять по нему ничего нельзя: часть шагов убирает свои строки;
 * **строка проверки обязана продолжать цепочку**: `hash_prev` новой строки равен `hash`
   предшественницы, иначе ежедневная проверка сама создала бы `broken_link` и `duplicate_parent`, а
   страж `ix_audit_log_hash_prev_linked` отклонил бы второй прогон с `23505`;
@@ -182,6 +184,12 @@ def _hash_of(engine: Engine, row_id: int) -> str | None:
         return session.scalar(select(AuditLogEntry.hash).where(AuditLogEntry.id == row_id))
 
 
+def _hash_prev_of(engine: Engine, row_id: int) -> str | None:
+    """`hash_prev` строки: по нему сверяется, обязана ли выборка показать `missing_prefix`."""
+    with Session(engine) as session:
+        return session.scalar(select(AuditLogEntry.hash_prev).where(AuditLogEntry.id == row_id))
+
+
 def _details_of(engine: Engine, row_id: int) -> dict[str, object]:
     """`details` прочитанной строки: psycopg отдаёт `jsonb` словарём, форма проверяется как есть."""
     with Session(engine) as session:
@@ -243,12 +251,49 @@ def test_прогон_дописывает_строку_в_хвост_цепоч
         assert details["run_id"] == run_id
         assert details["verdict"] == VERDICT_INTACT
         assert details["rows"] == 3
-        assert details["missing_prefix"] == 1, "начало выборки помечается, но вердикт не меняет"
+        # Число `missing_prefix` — вопрос состояния журнала, а не проверки: первая строка окна
+        # может быть и началом цепи (`hash_prev IS NULL`), и серединой. Ожидание выводится из
+        # колонки, а не выбирается наперёд: иначе проверка зависла бы от того, убрал ли
+        # предыдущий шаг живого job'а свои строки.
+        expected_no_head = 0 if _hash_prev_of(engine, lo) is None else 1
+        assert (
+            details["missing_prefix"] == expected_no_head
+        ), "пометка о непрочитанном начале обязана совпадать с колонкой `hash_prev`"
         assert details["content_mismatch"] == 0
         assert details["broken_link"] == 0
         assert details["duplicate_parent"] == 0
         assert details["disk_state"] == DISK_OK
         assert details["issue_row_ids"] == []
+    finally:
+        _cleanup(engine, marker, (run_id,))
+
+
+def test_окно_без_начала_цепчки_помечается_и_не_меняет_вердикт(engine: Engine) -> None:
+    """Выборка, у первой строки которой есть `hash_prev`, обязана остаться `intact`.
+
+    Это ровно тот случай, из-за которого `ADR-025` п. 7 оставил `missing_prefix` пометкой: у
+    выборки «за интервал `id`» (и у журнала после законной уборки по §2.8) начала цепи в выборке
+    нет физически, и ежедневная проверка не имеет права становиться из-за этого постоянно красной.
+    Случай детерминирован: окно начинается со второй посеянной строки, поэтому её `hash_prev`
+    ненулевой при любом состоянии журнала — в отличие от окна, начинающегося с первой.
+    """
+    marker = _marker()
+    run_id = f"{marker}-window"
+    ids = _seed(engine, marker, 3)
+    lo, hi = ids[1], max(ids)
+    try:
+        _run(engine, lo=lo, hi=hi, run_id=run_id)
+        rows = _check_rows(engine, run_id)
+        assert len(rows) == 1, "прогон обязан оставить ровно одну строку"
+        details = _details_of(engine, int(rows[0].id))
+        assert details["verdict"] == VERDICT_INTACT, "пометка не имеет права менять вердикт"
+        assert details["rows"] == len(ids) - 1
+        assert (
+            details["missing_prefix"] == 1
+        ), "у первой строки окна ненулевой `hash_prev` — пометка обязана появиться"
+        assert (
+            details["issue_row_ids"] == []
+        ), "пометка — не находка, в список затронутых строк она не попадает"
     finally:
         _cleanup(engine, marker, (run_id,))
 
