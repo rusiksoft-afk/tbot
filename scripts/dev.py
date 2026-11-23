@@ -140,6 +140,17 @@ def cmd_suppressions(_args: Sequence[str]) -> int:
     return run([sys.executable, str(ROOT / "scripts" / "count_suppressions.py"), "--list"])
 
 
+def cmd_audit_verify(args: Sequence[str]) -> int:
+    """Разбор цепочки хэшей журнала (TZ §8.7, `AC-identity-04`, `ADR-025` п. 7, `T-109`).
+
+    Код возврата скрипта передаётся без изменений: `0` — находок нет, `1` — цепочка нарушена,
+    `2`/`3` — неверная выборка или недоступная база. Единица занята находками намеренно,
+    поэтому «проверка не исполнилась» обязана иметь другой код — иначе ежедневная
+    `integrity-check` молчала бы при сломанном чекере.
+    """
+    return run([sys.executable, str(ROOT / "scripts" / "audit_verify.py"), *args])
+
+
 def cmd_deploy(_args: Sequence[str]) -> int:
     print(
         "Боевой деплой выполняется вручную по docs/runbook/deploy.md (TZ §12.7): образы только "
@@ -209,6 +220,10 @@ COMMANDS: dict[str, tuple[Handler, str]] = {
     "history-load": (_gated("history-load"), "загрузчик истории с бюджетом"),
     "backtest": (_gated("backtest"), "прогон бэктеста по конфигу"),
     "deploy-check": (cmd_deploy_check, "проверка площадки перед боевым контуром"),
+    "audit-verify": (
+        cmd_audit_verify,
+        "разбор цепочки хэшей журнала (код 1 — находки, AC-identity-04)",
+    ),
     "suppressions": (cmd_suppressions, "посчитать подавления проверок (noqa/nosec/pragma)"),
     "backup": (_gated("backup"), "pg_dump + чек-сумма"),
     "restore-verify": (_gated("restore-verify"), "восстановление дампа и сверка"),

@@ -26,6 +26,7 @@ $verbMap = @{
     'history-load'   = 'history-load'
     'backtest'       = 'backtest'
     'deploy-check'   = 'deploy-check'
+    'audit-verify'   = 'audit-verify'
     'backup'         = 'backup'
     'restore-verify' = 'restore-verify'
     'deploy'         = 'deploy'

@@ -58,6 +58,46 @@ def test_цели_makefile_соответствуют_обязательным_�
         assert f"'{verb}'" in wrapper, f"в make.ps1 нет команды {verb}"
 
 
+def test_audit_verify_существует_и_не_является_заглушкой() -> None:
+    """`make audit-verify` обязана существовать и исполняться (`AC-identity-04`, `T-109`).
+
+    В `TZ_VERBS` её нет намеренно: перечень выше — это команды ТЗ §4, и правится он только вместе
+    с ТЗ. Команда приходит из приёмки `AC-identity-04` («изменённую вручную копию дампа найти по
+    цепочке хэшей») и из `tasks/todo.md` (`T-109`, файлы: `packages/identity/audit.py`,
+    `scripts/audit_verify.py`). Разрыв «приёмка требует команду, а обёртки её не знают» — ровно
+    тот вид недоделки, который иначе всплывает только на площадке: проверка держит и CLI, и
+    обе обёртки, и сам скрипт.
+
+    Заглушкой она быть не может: `GATED` — это перечень команд, которые обязаны возвращать `2`
+    до своей вехи, а разбор журнала нужен уже сейчас (на площадке `audit_log` пишется с `R2b`, и
+    `integrity-check` §8.7 обязан опираться на тот же разбор, что и ручной прогон).
+    """
+    module = _load_dev_cli()
+    assert "audit-verify" in module.COMMANDS, "в dev-CLI нет команды audit-verify"
+    assert "audit-verify" not in module.GATED, "разбор журнала не может быть gated-заглушкой"
+
+    makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+    assert "audit-verify:" in makefile, "в Makefile нет цели audit-verify"
+    lines = makefile.splitlines()
+    start = next(index for index, line in enumerate(lines) if line.startswith(".PHONY:"))
+    declared = " ".join(lines[start : start + 2])
+    assert "audit-verify:" in makefile, "в Makefile нет цели audit-verify"
+    assert "audit-verify" in declared, "цель audit-verify не объявлена в .PHONY"
+    wrapper = (ROOT / "make.ps1").read_text(encoding="utf-8")
+    assert "'audit-verify'" in wrapper, "в make.ps1 нет команды audit-verify"
+
+    script = ROOT / "scripts" / "audit_verify.py"
+    assert script.is_file(), "скрипт разбора журнала обязателен (AC-identity-04, T-109)"
+    completed = subprocess.run(
+        [sys.executable, str(script), "--help"], capture_output=True, text=True, check=False
+    )
+    assert completed.returncode == 0, completed.stderr
+    # Коды возврата — часть контракта (`ADR-025` п. 7): разбор обязан объяснять их сам,
+    # иначе «1 = находки» и «1 = проверка упала» невозможно различить в cron.
+    assert "0 — находок нет" in completed.stdout, completed.stdout
+    assert "1 — цепочка нарушена" in completed.stdout, completed.stdout
+
+
 @pytest.mark.parametrize(
     "verb", ["seed-dev", "history-load", "backtest", "e2e", "backup", "restore-verify"]
 )
