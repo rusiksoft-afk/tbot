@@ -224,10 +224,11 @@ services:
     networks:
       - tbot-backend
     healthcheck:
-      # Liveness, а не readiness: на M0 у `jobs` нет ни одного исполнителя задач, и `executors_check`
-      # честно отвечает «не готово» (это охрана от того, чтобы `/readyz` врал о готовности).
-      # Готовность задач проверяется отдельно — шагами CI и `/readyz` после появления исполнителей
-      # (M2 и далее, см. docs/tz/12 §12.3).
+      # Liveness, а не readiness: состав не должен зависеть от готовности задач, а `executors_check`
+      # честно отвечает «не готово», пока хоть один исполнитель не создан (это охрана от того, чтобы
+      # `/readyz` врал о готовности). Исполнители есть с `T-109` `R3.2` (`rate_bucket_purge` и
+      # `integrity-check`), но liveness остаётся liveness'ом: готовность задач проверяется отдельно —
+      # шагами CI и `/readyz` (ранбук `docs/runbook/audit-chain-check.md` §2, `docs/tz/12` §12.3).
       test:
         - CMD
         - python

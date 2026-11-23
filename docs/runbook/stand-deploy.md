@@ -598,3 +598,31 @@ $COMPOSE exec -T postgres psql -U tbot -d tbot -c \
 нет, отозвать показанное значение, не входя в консоль, нельзя. Всё это следует из того же,
 что и запрет на ручную запись в таблицу: путь один, и он проходит через домен.
 
+## 13. Ежедневная проверка цепочки журнала: порядок без поднятого `jobs` (`T-109`, `R3.2`)
+
+§8.7 техзадания требует ежедневную задачу `integrity-check` — сверку цепочки хэшей `audit_log` и
+проверку свободных мест, с уведомлением администратора о находке. Исполняет её процесс `jobs`
+(`apps/jobs/integrity.py`, запись в реестре задач), а на живой ВМ `jobs` не поднят: поднимались
+`postgres`, `web`, `migrate` и `caddy` (`docs/acceptance/prod-deploy-t112-first-account.md`,
+остаток — `T-714`). Требование §8.7 при этом действует, поэтому до подъёма `jobs` остаток дня
+закрывается ручным прогоном того же разбора из клона площадки:
+
+```bash
+# форма — sudo и абсолютные пути (§0, замеры §12). `scripts/` в образ не входят (deploy/Dockerfile),
+# каталог монтируется read-only; адрес базы и роль приложения (SELECT на audit_log) берёт состав
+COMPOSE="sudo docker compose -f /opt/tbot/deploy/compose.yaml -f /opt/tbot/deploy/compose.prod.yaml --env-file /opt/tbot/deploy/tbot.prod.env"
+$COMPOSE run --rm -v /opt/tbot/scripts:/srv/tbot/scripts:ro web python3 scripts/audit_verify.py \
+  < /dev/null > /tmp/audit-verify.txt 2>&1; rc=$?; cat /tmp/audit-verify.txt; echo "rc=$rc"; sudo rm -f /tmp/audit-verify.txt
+```
+
+Код возврата `0` — находок нет, `1` — находки (`content_mismatch`/`broken_link`/`duplicate_parent`),
+`2` — неверная выборка, `3` — база недоступна или схема не развёрнута, `4` — прочее (`ADR-025` п. 7).
+Ручной прогон ничего в журнал не дописывает: строку `integrity.audit_chain` создаёт только задача,
+поэтому ручной прогон и ежедневный не спорят о счётчиках. Периодичность выбирает оператор:
+планировщик на ВМ (cron, systemd-таймер) агент не заводит — это отдельное решение (`ADR-003`).
+
+После подъёма `jobs` (`T-714`) проверять надо две вещи, а не одну: что readiness процесса показывает
+исполнителя `integrity-check` и что в журнале есть строки `integrity.audit_chain` за последние сутки.
+Их отсутствие — это не «цепочка целая», а «проверка не запускалась». Разбор результата, запросы к
+журналу и порядок действий при находке — `docs/runbook/audit-chain-check.md`; оформление решений —
+`docs/adr/ADR-026-integrity-check-jobs.md`.
