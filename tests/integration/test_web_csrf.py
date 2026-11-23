@@ -12,6 +12,9 @@
 * токен другой сессии не подходит; вывод меняется вместе с сессией, поэтому `rotate_session`
   делает старый токен недействительным без всякого «пересчёта CSRF»;
 * `Origin`/`Sec-Fetch-Site` — второй слой: при чужом источнике отказ, а при отсутствии заголовков
+* схема источника за TLS-терминатором (`T-117`, `ADR-024`): если ASGI-схема `http`, а браузер
+  приносит `Origin: https://…`, источник сверяется с `X-Forwarded-Proto`, который поставил
+  наш Caddy, — иначе вход в бою был бы закрыт для всех браузеров;
   отказ всё равно наступает по токену (проверка источника не заменяет токен);
 * отказ `403` не различает причины: по разным ответам подбором находилось бы, где живёт запрошенный
   контур (ADR-008);
@@ -27,11 +30,12 @@
 
 from __future__ import annotations
 
+from typing import Final
 from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
-from httpx import Response
+from httpx import URL, Response
 
 from apps.web.security.csrf import (
     CSRF_FORM_FIELD,
@@ -368,3 +372,127 @@ def test_мета_и_поле_для_активной_сессии_содерж�
     context = csrf_context(principal)
     assert context == {"csrf_token": expected_token(principal)}
     assert csrf_context(None) == {"csrf_token": ""}
+
+
+# ─── схема источника за TLS-терминатором (`T-117`, `ADR-024`) ────────────────────────────────
+
+FORWARDED_PROTO: Final = "X-Forwarded-Proto"
+CSRF_DENIAL: Final = "запрос отклонён"
+
+
+def _клиент_за_терминатором(store: MemoryStore, settings: Settings) -> TestClient:
+    """Клиент, у которого ASGI-схема `http`, а наружный адрес — `https`.
+
+    Так выглядит боевой стенд до починки: `web` принимает соединение от контейнера `caddy`,
+    uvicorn не доверяет `X-Forwarded-Proto` (пира нет в `forwarded_allow_ips`), и ASGI-схема
+    остаётся `http`. Замер на площадке 2026-11-23 —
+    `docs/acceptance/prod-deploy-t112-first-account.md §8`. Куку `Secure` такой клиент не
+    сохраняет, поэтому здесь сверяются только коды решения по источнику, а не состояние сессии.
+    """
+    plain = build_client(store, settings)
+    plain.base_url = URL("http://testserver")
+    return plain
+
+
+def _вход_с_источником(client: TestClient, headers: dict[str, str]) -> Response:
+    """`POST /login` с пустой формой: источник уже разобран, форма — нет.
+
+    Пустая форма даёт `400` (объясняющая страница входа), а отказ по источнику — `403`. Разница
+    и есть ответ на вопрос «прошёл ли запрос проверку источника», и она не требует ни токена,
+    ни сессии, ни значений пароля.
+    """
+    response: Response = client.post(
+        "/login", data={"login": "", "password": ""}, headers=headers, follow_redirects=False
+    )
+    return response
+
+
+def test_браузерный_origin_за_терминатором_принимается_по_forwarded_proto(
+    store: MemoryStore, settings: Settings
+) -> None:
+    """ASGI-схема `http`, браузер приносит `Origin: https://…` и Caddy ставит `https`.
+
+    Ожидание — не `403`: источник совпал по схеме из `X-Forwarded-Proto`, и запрос доходит до
+    разбора формы (`400`). Это и есть приёмка `T-117`: до починки здесь был `403`
+    «запрос отклонён», то есть вход из браузера в бою был закрыт.
+    """
+    plain = _клиент_за_терминатором(store, settings)
+    response = _вход_с_источником(
+        plain, {"Origin": ORIGIN_OURS, FORWARDED_PROTO: "https", "Sec-Fetch-Site": "same-origin"}
+    )
+    assert response.status_code == 400, response.text
+    assert CSRF_DENIAL not in response.text
+
+
+def test_без_forwarded_proto_несовпадение_схем_даёт_403(
+    store: MemoryStore, settings: Settings
+) -> None:
+    """Если заголовка нет, вызывающий остаётся на честной ASGI-схеме: `403` как раньше.
+
+    Проверка не «чинится доверием ко всему подряд»: без подтверждения от прокси несовпадение
+    схемы остаётся отказом.
+    """
+    plain = _клиент_за_терминатором(store, settings)
+    response = _вход_с_источником(plain, {"Origin": ORIGIN_OURS, "Sec-Fetch-Site": "same-origin"})
+    assert response.status_code == 403, response.text
+    assert CSRF_DENIAL in response.text
+
+
+@pytest.mark.parametrize(
+    ("header_value", "expected"),
+    [
+        ("https", 400),  # штатное значение от Caddy
+        ("HTTPS", 400),  # регистр не значим
+        ("http, https", 400),  # правый элемент — тот, что добавил наш прокси (ADR-007)
+        ("wss", 400),  # вебсокетная схема приводит к https
+        ("http", 403),  # прокси говорит «http» — значит https-Origin действительно чужой
+        ("https, kwa", 403),  # правый элемент неразборим → схема не подставляется
+        ("", 403),  # пустое значение — как отсутствие заголовка
+    ],
+    ids=["https", "регистр", "правый_элемент", "wss", "http", "мусор_справа", "пустое"],
+)
+def test_разбор_forwarded_proto_по_правилу_правого_элемента(
+    store: MemoryStore, settings: Settings, header_value: str, expected: int
+) -> None:
+    """Значение берётся справа, неизвестное значение не подставляется, а не превращается в отказ.
+
+    Строка `"https, kwa"` обязана дать `403`, а не `400`: доверять надо правому элементу, а не
+    «любому совпадению в списке», иначе левый элемент, пришедший от клиента, становился бы
+    основанием для приёма источника (`ADR-007`, `ADR-024`).
+    """
+    plain = _клиент_за_терминатором(store, settings)
+    response = _вход_с_источником(plain, {"Origin": ORIGIN_OURS, FORWARDED_PROTO: header_value})
+    assert response.status_code == expected, response.text
+
+
+def test_чужой_источник_отклоняется_несмотря_на_forwarded_proto(
+    store: MemoryStore, settings: Settings
+) -> None:
+    """`Sec-Fetch-Site: cross-site` остаётся отказом: починка не ослабляет слои проверки."""
+    client = build_client(store, settings)
+    response = _вход_с_источником(
+        client, {"Origin": ORIGIN_OURS, FORWARDED_PROTO: "https", "Sec-Fetch-Site": "cross-site"}
+    )
+    assert response.status_code == 403, response.text
+    assert CSRF_DENIAL in response.text
+
+
+def test_несовпадение_хоста_не_чинится_схемой(store: MemoryStore, settings: Settings) -> None:
+    """Согласование по схеме не превращает проверку в сравнение «только по схеме»."""
+    plain = _клиент_за_терминатором(store, settings)
+    response = _вход_с_источником(
+        plain, {"Origin": "https://other.example", FORWARDED_PROTO: "https"}
+    )
+    assert response.status_code == 403, response.text
+    assert CSRF_DENIAL in response.text
+
+
+def test_порт_по_умолчанию_схемы_не_мешает_совпадению(
+    store: MemoryStore, settings: Settings
+) -> None:
+    """`https://host:443` и `https://host` — один источник и с `X-Forwarded-Proto`."""
+    plain = _клиент_за_терминатором(store, settings)
+    response = _вход_с_источником(
+        plain, {"Origin": "https://testserver:443", FORWARDED_PROTO: "https"}
+    )
+    assert response.status_code == 400, response.text

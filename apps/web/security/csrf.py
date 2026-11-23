@@ -51,6 +51,7 @@ from uuid import UUID
 from fastapi import Request
 
 from apps.web.forms import form_fields
+from apps.web.security.clients import forwarded_scheme
 from apps.web.security.sessions import Principal, SessionRedirect, StoreDep, authenticate
 from packages.identity.sessions import ensure_token_syntax
 
@@ -183,8 +184,18 @@ def _normalize_origin(value: str) -> tuple[str, str, int | None]:
 
 
 def _request_origin(request: Request) -> tuple[str, str, int | None]:
-    """Источник самого запроса — из него, а не из заголовков, которые проверяются."""
-    return _normalize_origin(f"{request.url.scheme}://{request.url.netloc}")
+    """Источник самого запроса, увиденный со стороны наружного TLS.
+
+    Схема берётся из `X-Forwarded-Proto` (правый элемент, который поставил наш Caddy,
+    `clients.forwarded_scheme`), а если заголовка нет или значение неразборимо — из
+    ASGI-схемы. Без этого `web` за Caddy видит схему `http`: uvicorn правит ASGI-схему
+    только для пира из `forwarded_allow_ips` (умолчание `127.0.0.1`, а пир — контейнер
+    `caddy`), и браузерный `Origin: https://…` отвергался бы на каждой мутации. Замер
+    2026-11-23 на площадке: `docs/acceptance/prod-deploy-t112-first-account.md §8`,
+    `docs/adr/ADR-024-proxy-forwarded-proto.md` (`T-117`).
+    """
+    scheme = forwarded_scheme(request) or request.url.scheme
+    return _normalize_origin(f"{scheme}://{request.url.netloc}")
 
 
 async def presented_token(request: Request) -> str | None:
