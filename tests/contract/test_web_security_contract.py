@@ -59,6 +59,7 @@ from apps.web.security.sessions import (
 )
 from apps.web.store import USER_AGENT_MAX_LEN
 from packages.common.config import Settings
+from packages.identity.audit import AUDIT_ACTIONS
 from packages.identity.sessions import ABSOLUTE_TIMEOUT, IDLE_TIMEOUT
 
 _ROOT: Final = pathlib.Path(__file__).resolve().parents[2]
@@ -593,7 +594,7 @@ def _method_source(path: pathlib.Path, *, klass: str, name: str) -> str:
     raise AssertionError(f"в {path.name} нет метода {klass}.{name}")
 
 
-def test_журнал_добавляется_из_одной_точки_протокола_а_не_из_маршрутов() -> None:
+def test_события_журнала_пишет_протокол_а_их_точки_в_маршрутах_закрыты() -> None:
     """Точка добавления журнала — слой доступа; маршруты журнала не касаются (`ADR-025` п. 6).
 
     Опасность ровно одна, и по одному ответу её не видно: строка, записанная мимо протокола,
@@ -601,9 +602,19 @@ def test_журнал_добавляется_из_одной_точки_прот
     способен только разбор (`make audit-verify` — срез `R3`), да и то после того, как событие
     легло в неизменяемую таблицу. Поэтому проверяется форма слоя, а не один ответ:
 
-    * ни один маршрутный модуль `append_audit` не вызывает: событие пишет тот слой, где известна
-      причина отказа (лимиты частоты, CSRF, допуск), а не обработчик ответа — к моменту,
-      когда `apps/web/main.py` получает `403`/`429`, слой доступа запроса уже закрыт;
+    * события мутаций добавляют маршруты — и это не обход протокола: у них нет точки в слое
+    безопасности, потому что причину перехода решает обработчик (чьё решение привело к переходу,
+    какое состояние было до него, сколько сеансов закрыл `suspend`). Срез `R2b` задачи `T-109`
+    перенёс эти события из «остатка задачи» в обработчики и оформил `ADR-025` п. 6; число точек
+    держится закрытым перечнем ниже, поэтому новая точка в маршруте требует правки проверки;
+    * ни один маршрутный модуль **не строит строку журнала сам**: `AuditLogEntry`,
+    `build_audit_entry`, `make_record` и `audit_row_values` в маршрутах не вызываются. Строка,
+    собранная мимо `Store.append_audit`, лишена `hash_prev` из хвоста и блокировки хвоста, и весь
+    журнал перестаёт быть доказательством — найти разрыв способен только разбор (`R3`), да и то
+    после того, как событие легло в неизменяемую таблицу;
+    * события отказов по-прежнему пишутся в слое безопасности, где решается причина (лимиты
+    частоты, бан адреса, CSRF, отказ допуска): к моменту, когда `apps/web/main.py` получает
+    `403`/`429`, слой доступа запроса уже закрыт;
     * в слое безопасности вызовов ровно по одному на каждое место, где причина решается: лимиты
       (отказ частоты и бан адреса — два разных события), CSRF, отказ допуска (одна точка на обе
       причины, иначе «учётной записи нет» записывается дважды);
@@ -617,10 +628,20 @@ def test_журнал_добавляется_из_одной_точки_прот
       событие, превращая его в `broken_link` (`ADR-025` п. 4).
     """
     routes = _ROOT / "apps" / "web" / "routes"
-    written = {path.name: _audit_calls(path) for path in sorted(routes.glob("*.py"))}
-    assert not any(
-        written.values()
-    ), f"маршруты пишут журнал сами ({written}): точка добавления одна — протокол слоя доступа"
+    modules = [path for path in sorted(routes.glob("*.py")) if path.name != "__init__.py"]
+    written = {path.name: _audit_calls(path) for path in modules}
+    assert written == ROUTE_AUDIT_CALLS, (
+        "число точек добавления журнала в маршрутах разошлось с закрытым перечнем: "
+        f"ожидалось {ROUTE_AUDIT_CALLS}, получено {written}. Одна точка на событие — часть "
+        "`ADR-025` п. 6: вторая копия события искажает счётчик при разборе, а удалённая точка "
+        "означает событие §8.7 без носителя (перечень меняется только вместе с правкой ADR)",
+    )
+    builders = {path.name: _journal_row_builders(path) for path in modules}
+    assert not any(builders.values()), (
+        f"маршрут строит строку журнала в обход протокола ({builders}): точку имеет "
+        "`Store.append_audit` — только она читает хвост цепочки и берёт блокировку (`ADR-025` "
+        "п. 6)",
+    )
 
     security = _ROOT / "apps" / "web" / "security"
     assert (
@@ -668,6 +689,119 @@ def test_журнал_добавляется_из_одной_точки_прот
     for form in ("on_conflict_do_nothing", "on_conflict_do_update"):
         assert form not in protocol, f"форма {form} на журнале запрещена (`ADR-025` п. 4)"
     assert "ON CONFLICT" not in protocol, "прямая форма ON CONFLICT на журнале запрещена (п. 4)"
+
+
+#: Число вызовов протокола добавления журнала в каждом маршрутном модуле. Перечень закрыт и
+#: назван по модулям: «одна точка на событие» (`ADR-025` п. 6) без перечня не проверялась бы
+#: ничем, а удвоенное событие искажает счётчик при разборе так же, как отсутствующее.
+#:
+#: `admin_users.py` — выпуск и отзыв приглашения, одобрение, закрытие доступа (`suspend`/
+#: `archive`) и снятие блокировки; `invitations.py` — принятая ссылка, созданная по ней учётная
+#: запись и отказ приёма; `login.py` — выпуск сеанса и два отказа входа; `profile.py` — смена
+#: пароля; `sessions.py` — выход, отзыв сеанса и отзыв всех сеансов; `totp.py` — привязка,
+#: подтверждение, выпуск и аннулирование пачки, расход кода, неудачная попытка кода и два
+#: перехода на шаг `full`.
+ROUTE_AUDIT_CALLS: Final[dict[str, int]] = {
+    "admin_users.py": 5,
+    "invitations.py": 3,
+    "login.py": 3,
+    "profile.py": 1,
+    "sessions.py": 3,
+    "totp.py": 9,
+}
+
+#: Имена событий раздела identity, у которых пока нет производителя: маршрут, обязанный их
+#: писать, не построен. Перечень закрыт и назван с причиной — иначе «имя в реестре есть, а
+#: события нет» превращается в тихую дыру §8.7, и следующий срез не узнает, что уже сделано.
+#:
+#: * `account.role_changed` — маршрут смены роли (`T-111`, §9.3 п. 5);
+#: * `totp.revoked` — сброс второго фактора администратором (`T-103`, §8.2 случай 2, §9.3 п. 6).
+#:
+#: Прочие имена групп `session`/`account`/`invitation`/`totp`/`backup_code`/`auth` производителя
+#: имеют, и проверка это держит.
+IDENTITY_EVENTS_WITHOUT_PRODUCER: Final[frozenset[str]] = frozenset(
+    {
+        "account.role_changed",
+        "totp.revoked",
+    }
+)
+
+#: Группы имён, относящиеся к разделу identity. Остальные (`token` — `T-108`, `risk` — M3,
+#: `strategy` — M4, `ip_allowlist` — `T-110`, отчёты и деплой) к этому срезу не относятся и не
+#: сверяются: требовать их производителя значило бы писать события будущих срезов сейчас.
+IDENTITY_EVENT_PREFIXES: Final[tuple[str, ...]] = (
+    "session.",
+    "account.",
+    "invitation.",
+    "totp.",
+    "backup_code",
+    "auth.",
+)
+
+
+def _audit_actions(path: pathlib.Path) -> list[str]:
+    """Значения `action=` у вызовов `append_audit` в файле (по AST, только литералы).
+
+    Нужен литерал, а не переменная: проверка обязана видеть, **какое** имя порождает файл, а не
+    только то, что вызов был.
+    """
+    дерево = ast.parse(path.read_text(encoding="utf-8"))
+    имена: list[str] = []
+    for узел in ast.walk(дерево):
+        if not (
+            isinstance(узел, ast.Call)
+            and isinstance(узел.func, ast.Attribute)
+            and узел.func.attr == "append_audit"
+        ):
+            continue
+        for кт in узел.keywords:
+            if кт.arg == "action" and isinstance(кт.value, ast.Constant):
+                имена.append(str(кт.value.value))
+    return имена
+
+
+def _journal_row_builders(path: pathlib.Path) -> int:
+    """Число попыток собрать строку журнала мимо протокола (`AuditLogEntry` и функции сборки)."""
+    строители = {"AuditLogEntry", "build_audit_entry", "make_record", "audit_row_values"}
+    дерево = ast.parse(path.read_text(encoding="utf-8"))
+    return sum(
+        1
+        for узел in ast.walk(дерево)
+        if isinstance(узел, ast.Call)
+        and (
+            (isinstance(узел.func, ast.Name) and узел.func.id in строители)
+            or (isinstance(узел.func, ast.Attribute) and узел.func.attr in строители)
+        )
+    )
+
+
+def test_имена_событий_identity_группы_имеют_производителя() -> None:
+    """Каждое имя реестра identity-группы порождается кодом, кроме названных с причиной.
+
+    Реестр `AUDIT_ACTIONS` закрыт за §8.7 (`ADR-025` п. 2), и «имя есть» само по себе ничего не
+    значит: событие §8.7 выполнено, только когда у него есть носитель. Без этой проверки
+    недоделанная половина перечня выглядит сделанной — ровно та ошибка, из-за которой
+    `REQ-identity-03` и переносили в `T-109`.
+    """
+    слой = _ROOT / "apps" / "web"
+    порождаемые: set[str] = set()
+    for подкаталог in ("routes", "security"):
+        for путь in sorted((слой / подкаталог).glob("*.py")):
+            if путь.name == "__init__.py":
+                continue
+            порождаемые.update(_audit_actions(путь))
+
+    assert (
+        порождаемые <= AUDIT_ACTIONS
+    ), f"код порождает имена вне закрытого реестра §8.7: {sorted(порождаемые - AUDIT_ACTIONS)}"
+
+    группа = {имя for имя in AUDIT_ACTIONS if имя.startswith(IDENTITY_EVENT_PREFIXES)}
+    ожидаемое = группа - IDENTITY_EVENTS_WITHOUT_PRODUCER
+    assert порождаемые == ожидаемое, (
+        "набор порождаемых событий identity разошёлся с реестром: "
+        f"не порождается {sorted(ожидаемое - порождаемые)}, "
+        f"порождается сверх ожидаемого {sorted(порождаемые - ожидаемое)}"
+    )
 
 
 def test_страницы_состояний_из_9_остаются_в_приложении(app: FastAPI) -> None:

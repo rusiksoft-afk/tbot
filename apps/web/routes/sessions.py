@@ -282,10 +282,20 @@ def logout(
     Повторный выход (сессия уже отозвана) ничего не меняет: `revoke_session` возвращает `False` и
     момент первого отзыва не перетирается — по нему разбирают инцидент (`T-109`).
 
-    Запись `audit_log` о выходе (§8.7) здесь ещё не пишется: имена событий и цепочка хэшей — задача
-    `T-109`, перенос зафиксирован `ADR-009` (ask `c53daa01`).
+    Запись `audit_log` о выходе пишется здесь же (§8.7, `session.logout`, срез `R2b` `T-109`):
+    событие принадлежит этому маршруту, потому что здесь решён факт «человек закрыл свой вход»;
+    в той же транзакции, что и `revoked_at` (свойством `commit_now` такой факт не фиксируется).
     """
-    revoke_session(principal.session, now=utc_now())
+    moment = utc_now()
+    revoke_session(principal.session, now=moment)
+    store.append_audit(
+        action="session.logout",
+        at=moment,
+        actor=principal.session.user_id,
+        entity="session",
+        entity_id=principal.session.id,
+        details={"auth_step": principal.session.auth_step},
+    )
     store.commit()
     response = RedirectResponse(LOGIN_PATH, status_code=302)
     clear_session_cookie(response)
@@ -629,14 +639,23 @@ def revoke_one(session_id: str, principal: ConsoleMutation, store: StoreDep) -> 
     меняет: `revoked_at` уже заполнен, строка больше не попадает в перечень живых — ответ будет
     `404`, а момент первого отзыва не перетрётся.
 
-    Запись `audit_log` о отзыве (§8.7, события `session.revoke` и `session.revoke_all`) здесь не
-    пишется: реестр имён и протокол добавления сделаны срезами `R1` и `R2` задачи `T-109`, а вызов
-    для мутаций маршрута остаётся её остатком (перенос зафиксирован `ADR-009`).
+    Запись `audit_log` (§8.7, `session.revoke`, срез `R2b` `T-109`) добавляется этим маршрутом до
+    `commit()`: событие и `revoked_at` фиксируются одной транзакцией, поэтому отзыв не может
+    зафиксироваться без события (§8.5 «отзыв токена» для разбора требует инициатора).
     """
     record = _owned_live_session(store, principal, session_id)
     if record is None:
         return _session_gone()
-    revoke_session(record, now=utc_now())
+    moment = utc_now()
+    revoke_session(record, now=moment)
+    store.append_audit(
+        action="session.revoke",
+        at=moment,
+        actor=principal.session.user_id,
+        entity="session",
+        entity_id=record.id,
+        details={"is_current": "yes" if record.id == principal.session.id else "no"},
+    )
     store.commit()
     return _revoke_finished(current_ended=record.id == principal.session.id)
 
@@ -660,9 +679,27 @@ def revoke_all(principal: ConsoleMutation, store: StoreDep) -> Response:
     Текущая сессия входит в набор по построению: охрана маршрута только что продлила её. Проверка
     `any(...)` держит это как факт кода, а не как догадку: если набор окажется без текущей сессии,
     пользователь должен остаться внутри, а не получить редирект «вы отозваны».
+
+    Журнал (§8.7, `session.revoke_all`): одна строка на решение, с числом закрытых сеансов в
+    `details`. Имя реестра под этим действием одно, а набор закрытых строк восстанавливается по
+    `revoked_at` самих записей `sessions` — построчный дубль сделал бы событие удвоенным. Если
+    отзываемых строк нет, события нет: запись «отозвано ноль» утверждала бы о состоявшемся
+    факте, которого не было.
     """
     moment = utc_now()
     candidates = store.user_sessions(principal.session.user_id, not_expired_before=moment)
     revoked = revoke_sessions(candidates, now=moment)
+    if revoked:
+        # Одна строка на решение, а не по строке на каждую сессию: имя реестра одно
+        # (`session.revoke_all`), а набор закрытых строк восстанавливается по `revoked_at` самих
+        # записей сеансов — дублировать его в журнале значило бы удвоить событие (§8.7).
+        store.append_audit(
+            action="session.revoke_all",
+            at=moment,
+            actor=principal.session.user_id,
+            entity="user",
+            entity_id=principal.session.user_id,
+            details={"count": len(revoked)},
+        )
     store.commit()
     return _revoke_finished(current_ended=any(row.id == principal.session.id for row in revoked))

@@ -43,14 +43,22 @@
    мутации, поэтому «забыть охрану» в этом файле невозможно без падения контрактной проверки
    покрытия (`tests/contract/test_web_roles_contract.py`).
 
-Чего здесь нет специально. Ни записей в `audit_log`: реестр имён и протокол добавления — срезы
-`R1` и `R2` задачи `T-109`, а вызовы для действий раздела (`account.approved`, `account.created`,
-`account.state_changed`, `account.role_changed`) — её остаток (перенос зафиксирован `ADR-009`);
-сейчас факт действия несёт только строка журнала процесса. Ни колонки «последний вход», ни колонок 2FA и Telegram (§9.3 п. 6) — это данные
+Чего здесь нет специально. Ни смены роли: `account.role_changed` в реестре §8.7 есть, а маршрута
+смены роли в M0 нет (он появится вместе с разделом профиля `T-111`), поэтому и события такого в
+разделе не бывает. Ни колонку «последний вход», ни колонок 2FA и Telegram (§9.3 п. 6) — это данные
 `T-109`, `T-103` и `T-409`, и выдумывать их источник означало бы решить эти задачи молча. Ни
 сброса 2FA администратором (`T-103`): у действия нет доменной половины, а завести маршрут без неё
 нельзя. Ни приглашения «по выбору администратора» без адресата: §1.2 требует e-mail или логин, и
 это держит домен (`InvitationTargetError`), а не форма.
+
+Срез `R2b` задачи `T-109` добавляет в раздел записи `audit_log` о состоявшихся действиях
+(§8.7, `ADR-025` п. 6): `invitation.issued`, `invitation.revoked`, `account.approved` и
+`account.state_changed`. Точка вызова — сам обработчик: он знает, чьё решение привело к переходу
+(`actor` — администратор, а не автор приглашения), какое состояние было до перехода и сколько
+сеансов закрыл `suspend`/`archive`. Все эти события идут той же транзакцией, что и переход
+(свойство `commit_now` у них не ставится): «состояние изменилось, а события нет» — ровно то
+состояние, из-за которого журнал перестаёт быть доказательством. Значений адресата (§1.2: e-mail
+или логин) в журнале нет — как и в журнале процесса (§8.4).
 """
 
 from __future__ import annotations
@@ -131,9 +139,11 @@ ADMIN_ACCOUNT_SUSPEND_PATH: Final = f"{ADMIN_USERS_PATH}/{{{USER_ID_PARAM}}}/sus
 ADMIN_ACCOUNT_UNSUSPEND_PATH: Final = f"{ADMIN_USERS_PATH}/{{{USER_ID_PARAM}}}/unsuspend"
 ADMIN_ACCOUNT_ARCHIVE_PATH: Final = f"{ADMIN_USERS_PATH}/{{{USER_ID_PARAM}}}/archive"
 
-#: Имена действий: они же — сегменты адресов выше, они же — ключи выбора доменного действия.
-#: Один список на оба употребления, иначе адрес и действие разошлись бы при добавлении перехода.
+#: Имена действий: они же — сегменты адресов выше, они же — ключи выбора доменного действия, они
+#: же — код действия в деталях `audit_log` (§8.7). Один список на все употребления, иначе адрес,
+#: действие и журнал разошлись бы при добавлении перехода.
 ACTION_SUSPEND: Final = "suspend"
+ACTION_UNSUSPEND: Final = "unsuspend"
 ACTION_ARCHIVE: Final = "archive"
 
 # ─── охрана ────────────────────────────────────────────────────────────────────────────────────
@@ -616,6 +626,17 @@ async def issue_invitation(request: Request, principal: AdminMutation, store: St
         )
 
     store.add(issued.record)
+    # `audit_log` (§8.7): событие принадлежит этому обработчику — здесь решено, какой роли и на
+    # какой срок выпуск открывается. Добавляется до `commit()` и одной транзакцией с строкой
+    # `invitations`. Адресата в деталях нет по той же причине, что и в журнале процесса (§8.4).
+    store.append_audit(
+        action="invitation.issued",
+        at=moment,
+        actor=principal.session.user_id,
+        entity="invitation",
+        entity_id=issued.record.id,
+        details={"role": issued.record.role},
+    )
     store.commit()
     # В журнал — `id` выпуска, роль и срок: `id` достаточно, чтобы соотнести строку с таблицей
     # `invitations`, а адресат (§1.2: e-mail или логин) в журнал не пишется (§8.4).
@@ -687,6 +708,7 @@ def revoke_invitation_submit(
     record = _invitation_or_none(store, invitation_id)
     if record is None:
         return object_gone_response()
+    moment = utc_now()
 
     outcome = revocation_outcome(record)
     if outcome == "already_revoked":
@@ -710,6 +732,13 @@ def revoke_invitation_submit(
             return _redirect("invitation_used")
         return _redirect("invitation_refused")
 
+    store.append_audit(
+        action="invitation.revoked",
+        at=moment,
+        actor=principal.session.user_id,
+        entity="invitation",
+        entity_id=record.id,
+    )
     store.commit()
     log.info(
         "invitation_revoked",
@@ -737,11 +766,21 @@ def approve_account_submit(user_id: str, principal: AdminMutation, store: StoreD
     target = _account_or_none(store, user_id)
     if target is None:
         return object_gone_response()
+    state_before = target.state
+    moment = utc_now()
     try:
-        approve_account(target, approved_by=principal.session.user_id, now=utc_now())
+        approve_account(target, approved_by=principal.session.user_id, now=moment)
     except AccountStateError as exc:
         log.info("account_approve_refused", user_id=str(target.id), detail=str(exc))
         return _redirect("refused_transition")
+    store.append_audit(
+        action="account.approved",
+        at=moment,
+        actor=principal.session.user_id,
+        entity="user",
+        entity_id=target.id,
+        details={"from": state_before, "to": target.state, "role": target.role},
+    )
     store.commit()
     log.info(
         "account_approved",
@@ -772,7 +811,11 @@ def _close_access(
        консоли до истечения сеанса. Второй контур — `ensure_console_access` внутри `enforce_role`
        (`ADR-020` п. 6), он держит ответ на случай, если отзыв не случился;
     4. один `commit()` на всё: переход состояния и отзыв сеансов — одно решение, и полураспавшееся
-       состояние («заблокирована, но ходит») недопустимо.
+       состояние («заблокирована, но ходит») недопустимо. Строка `audit_log`
+       (`account.state_changed`, §8.7) добавляется прямо перед этой фиксацией и той же транзакцией:
+       событие описывает то же решение, что и переход, и включает число закрытых сеансов в детали —
+       отдельного `session.revoke` на каждую закрытую строку здесь нет намеренно (реестр §8.7 даёт
+       под действием одно имя, а закрытые строки различаются по `revoked_at` в `sessions`).
 
     `action` выбирает доменное действие: `suspend` — временная мера, `archive` — конец жизни
     записи. Оба требуют тех же четырёх шагов, и вторая копия порядка в двух обработчиках
@@ -780,6 +823,7 @@ def _close_access(
     `AccountStateError`: первый является вторым, и порядок `except` здесь определяет, получит ли
     человек объяснение «вы последний администратор» или общее «переход невозможен».
     """
+    state_before = target.state
     admins_left = store.active_admin_count(except_user_id=target.id)
     try:
         ensure_not_last_admin(target, active_admins_left=admins_left)
@@ -795,6 +839,19 @@ def _close_access(
         return _redirect("refused_transition")
 
     revoked = revoke_sessions(store.user_sessions(target.id, not_expired_before=moment), now=moment)
+    store.append_audit(
+        action="account.state_changed",
+        at=moment,
+        actor=principal.session.user_id,
+        entity="user",
+        entity_id=target.id,
+        details={
+            "action": action,
+            "from": state_before,
+            "to": target.state,
+            "sessions_revoked": len(revoked),
+        },
+    )
     store.commit()
     log.info(
         "account_access_closed",
@@ -847,6 +904,9 @@ def unsuspend_submit(user_id: str, principal: AdminMutation, store: StoreDep) ->
     какой его нет у одобрения: живых сеансов у заблокированной записи не осталось — их отозвало
     закрывающее действие, и повторный отзыв нечего отзывало бы.
 
+    Журнал (§8.7): `account.state_changed` с тем же кодом действия, что и сегмент адреса
+    (`unsuspend`), добавляется до `commit()` и одной транзакцией с переходом.
+
     Вызов `unsuspend_account` без предварительной проверки состояния — не «авось домен разберётся»,
     а намеренный отказ от второго правила: домен проверяет исходное состояние сам
     (`_ensure_state_is`), и копия той же проверки в обработчике означает две формулировки одного
@@ -855,11 +915,21 @@ def unsuspend_submit(user_id: str, principal: AdminMutation, store: StoreDep) ->
     target = _account_or_none(store, user_id)
     if target is None:
         return object_gone_response()
+    state_before = target.state
+    moment = utc_now()
     try:
         unsuspend_account(target)
     except AccountStateError as exc:
         log.info("account_unsuspend_refused", user_id=str(target.id), detail=str(exc))
         return _redirect("refused_transition")
+    store.append_audit(
+        action="account.state_changed",
+        at=moment,
+        actor=principal.session.user_id,
+        entity="user",
+        entity_id=target.id,
+        details={"action": ACTION_UNSUSPEND, "from": state_before, "to": target.state},
+    )
     store.commit()
     log.info(
         "account_unsuspended",

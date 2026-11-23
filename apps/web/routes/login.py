@@ -21,12 +21,14 @@
 * проверки `users.state` («какие состояния учётной записи пускаются на вход») — состояния относятся
   к допуска (`T-105`) и ролям (`T-106`), и придумывать это правило здесь значит решить чужую задачу
   молча;
-* записей `audit_log` о самой попытке входа и о блокировке учётной записи (§8.7:
-  `session.login_failed`) — это остаток `T-109`, перенос зафиксирован `docs/adr/ADR-009`
-  (ask `c53daa01`). Реестр имён и протокол добавления её срезы `R1` и `R2` уже дали; отказ `429`
-  событие пишет уже сейчас, и пишет механизм лимитов (`apps/web/security/rate_limit.py`), а не
-  маршрут. Компенсирующие контроля на месте: блокировка живёт в `users.locked_until`, бан адреса —
-  в `rate_buckets`, а пользователю отказ объясняется сразу (`429` + `Retry-After` + `/locked`).
+* записей `audit_log` о попытке, приведшей к отказу частоты или блокировки адреса, — их пишет
+  механизм лимитов (`apps/web/security/rate_limit.py`), а не маршрут (`ADR-025` п. 6: событие
+  принадлежит той точке, где решена причина). Срез `R2b` той же `T-109` добавляет сюда события
+  самой страницы входа: `session.login` (парольный шаг принят, сеанс выпущен) и
+  `session.login_failed` (пароль не принят). Отказ «вход закрыт окном блокировки» отдельной строки
+  не даёт намеренно: там пароль не сравнивался вообще, а наступление блокировки записано деталями
+  той попытки, которая этот порог пересекла (`locked_until`), — иначе счётчик неудач в журнале
+  перестал бы совпадать со счётчиком в таблице.
 
 CSRF. У `/login` токена нет, и это не забывчивость: токен выводится из сессии (`ADR-008`), а сессии
 до входа не существует. Вместо него включена проверка источника (`ensure_same_origin`) и работает
@@ -97,6 +99,36 @@ GENERIC_FAILURE_DETAIL: Final = "Неверный логин или пароль
 #: получить блокировку учётной записи, а переборщик — возможности размывать счётчик неудач.
 #: Частотный лимит при этом всё равно считается: §8.3 ограничивает запросы, а не неудачи.
 EMPTY_FORM_DETAIL: Final = "Нужно указать логин и пароль."
+
+#: Коды причины для журнала (§8.7: `session.login_failed`). Наружу все три случая отдаются одним и
+#: тем же `401` (§8.8: отказ не должен быть оракулом существования учётной записи), различие живёт
+#: только в журнале. `account_state` дополняется ключом `state`: код состояния возвращает
+#: `login_closed_reason`, и именно он объясняет разбору, что вход закрыт был не паролем.
+#:
+#: Имена констант намеренно не содержат слова, которое описывают: проверка `S105` (запрет
+#: «захардкоженного пароля») читает имена и отклонила бы `FAILURE_PASSWORD` со значением
+#: `password`, хотя это код причины, а не значение допуска. Значения кодов при этом настоящие —
+#: их читает разбор журнала, а не проверка.
+FAILURE_UNKNOWN_LOGIN: Final = "unknown_login"
+FAILURE_MISMATCH: Final = "password"
+FAILURE_ACCOUNT_STATE: Final = "account_state"
+
+
+def _failure_details(closed_state: str | None, locked_until: datetime | None) -> dict[str, str]:
+    """Детали `session.login_failed` (`ADR-025` п. 2: коды причин и сроки, но не значения).
+
+    Формулировка домена в журнал не уходит: она содержит момент разблокировки для человека. Здесь
+    только код причины, состояние записи и срок блокировки целым числом секунд — их хватает, чтобы
+    отличить подбор пароля от входа по закрытой записи и чтобы увидеть, какая попытка закрыла вход.
+    """
+    details: dict[str, str] = {
+        "reason": FAILURE_ACCOUNT_STATE if closed_state is not None else FAILURE_MISMATCH
+    }
+    if closed_state is not None:
+        details["state"] = closed_state
+    if locked_until is not None:
+        details["locked_until"] = locked_until.isoformat(timespec="seconds")
+    return details
 
 
 def _lock_detail(until: datetime) -> str:
@@ -203,6 +235,14 @@ async def login_submit(request: Request, store: StoreDep) -> Response:
     8. успех: снимается счётчик неудач, выпускается сессия на шаге `'password'`, фиксируется
        транзакция и только потом выдаётся кука — кука не должна пережить незафиксированную запись.
 
+    Журнал (§8.7, срез `R2b` задачи `T-109`, `ADR-025` п. 6): у отказа входа и у успеха событие
+    добавляется **до** фиксации и своей фиксацией не пользуется — `session.login` обязан уйти той же
+    транзакцией, что и строка сеанса, а `session.login_failed` — той же транзакцией, что и счётчик
+    неудач (`register_login_failure`) или окно перебора адреса (`register_address_failure`), которое
+    и фиксирует попытку. Поэтому у каждой записи журнала есть бизнес-изменение-причина: отказа без
+    события и события без отказа не бывает. Время события — тот же `moment`, что и у строки сеанса и
+    у окон счётчиков (`ADR-025` п. 2: момент снимается один раз на событие).
+
     Значения `ip` и `user_agent` пишутся в запись сессии как получены (с ограничением длины): §8.3
     показывает их в списке устройств, §8.7 требует IP входа в журнале, а уведомление «вход с нового
     IP/устройства» строится на сравнении этих значений. Один и тот же `address` идёт и в запись
@@ -234,6 +274,16 @@ async def login_submit(request: Request, store: StoreDep) -> Response:
     user = store.user_by_login(login)
     if user is None:
         request.app.state.login_timing.burn(password)
+        # Субъекта у этой строки нет намеренно: учётной записи с таким логином не существует, а
+        # выдуманный `actor` журнал не терпит (`ADR-025` п. 2). Запись добавляется до окна
+        # перебора: фиксирует её тот же `commit()`, что и окно, поэтому попытка не может остаться
+        # в счётчике без события и наоборот.
+        store.append_audit(
+            action="session.login_failed",
+            at=moment,
+            entity="user",
+            details={"reason": FAILURE_UNKNOWN_LOGIN},
+        )
         banned = register_address_failure(store, address, moment=moment)
         if banned is not None:
             return _denied(request, _rate_detail(banned), banned, LOCK_REASON_RATE, moment)
@@ -254,6 +304,14 @@ async def login_submit(request: Request, store: StoreDep) -> Response:
         closed is not None
     ):
         locked_until = register_login_failure(user, now=moment)
+        store.append_audit(
+            action="session.login_failed",
+            at=moment,
+            actor=user.id,
+            entity="user",
+            entity_id=user.id,
+            details=_failure_details(closed, locked_until),
+        )
         store.commit()
         banned = register_address_failure(store, address, moment=moment)
         if locked_until is not None:
@@ -273,6 +331,19 @@ async def login_submit(request: Request, store: StoreDep) -> Response:
         now=moment,
     )
     store.add(issued.record)
+    # `session.login` на шаге `'password'` пишется намеренно: пароль принят, и это отдельный
+    # состоявшийся факт, который обязан быть виден даже если человек до кода 2FA не дошёл.
+    # Полный вход (§8.7 «вход нового пользователя», уведомление `R3`) — вторая запись
+    # `session.login` с шагом `full`, её добавляют маршруты кода и резервного кода
+    # (`apps/web/routes/totp.py`); различие читается из `details.auth_step`.
+    store.append_audit(
+        action="session.login",
+        at=moment,
+        actor=user.id,
+        entity="session",
+        entity_id=issued.record.id,
+        details={"auth_step": issued.record.auth_step},
+    )
     store.commit()
 
     redirect = RedirectResponse(POST_LOGIN_REDIRECT, status_code=302)

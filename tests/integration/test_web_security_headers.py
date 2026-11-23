@@ -129,11 +129,14 @@ def test_отказ_csrf_тоже_несёт_политику(client: TestClient
     """
     login(client)
     before = store.commits
+    before_rows = len(store.audit_rows)
     response = client.post("/logout", data={"любое": "поле"}, follow_redirects=False)
     assert response.status_code == 403
-    assert [row.action for row in store.audit_rows] == [
-        "auth.csrf_rejected"
-    ], "отказ CSRF обязан оставить ровно одну журнальную строку (§8.7) и ни одной бизнес-записи"
+    assert [row.action for row in store.audit_rows[before_rows:]] == ["auth.csrf_rejected"], (
+        "отказ CSRF обязан оставить ровно одну журнальную строку (§8.7) и ни одной бизнес-записи; "
+        "сравнивается хвост, добавленный этим запросом: вход сам порождает `session.login` (§8.7, "
+        "срез `R2b`), и то событие к отказу отношения не имеет"
+    )
     assert store.commits == before + 1, "отказанный запрос обязан добавить только строку журнала"
     for name in SECURITY_HEADERS:
         assert name in response.headers, f"{name}: отказ `403` отдан без политики"

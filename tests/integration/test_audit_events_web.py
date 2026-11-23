@@ -19,8 +19,12 @@
   отказов при разборе;
 * **`actor` есть у отказа допуска и отсутствует у отказов до аутентификации** (CSRF, частота):
   журнал не должен содержать выдуманного субъекта (`ADR-025` п. 2);
-* **у каждого отказа ровно одна строка**: точка добавления одна (`ADR-025` п. 6), маршруты журнал
-  не пишут;
+* **у каждого отказа ровно одна строка с его именем** (`ADR-025` п. 6): точка добавления одна на
+  каждое событие, а вторая копия искажает счётчик при разборе так же, как отсутствующая. Сверяется
+  имя события, а не весь журнал целиком: срез `R2b` той же задачи `T-109` даёт маршрутам события
+  мутаций (вход порождает `session.login`), и они относятся к другому действию, а не к удвоенному
+  отказу. Закрытый перечень порождаемых имён держит контракт
+  `test_имена_событий_identity_группы_имеют_производителя`;
 * **оффлайновая копия журнала строит цепочку так же, как боевой слой** (`hash_prev` из последней
   строки): набор незацепленных хэшей неотличим от повреждённого журнала, поэтому связь записей
   проверяется и здесь.
@@ -33,6 +37,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from itertools import pairwise
 from uuid import uuid4
 
 import pytest
@@ -102,12 +107,18 @@ def _rows(store: MemoryStore) -> list[AuditLogEntry]:
     return list(store.audit_rows)
 
 
-def _only(store: MemoryStore) -> AuditLogEntry:
-    """Ровно одна строка журнала: вторая строка на тот же отказ — удвоенное событие (§8.7)."""
-    rows = _rows(store)
-    assert (
-        len(rows) == 1
-    ), f"ожидается одна журнальная строка, получено {len(rows)}: {[r.action for r in rows]}"
+def _only(store: MemoryStore, action: str) -> AuditLogEntry:
+    """Ровно одна строка с этим событием: вторая на тот же отказ — удвоенное событие (§8.7).
+
+    Фильтр по имени, а не «весь журнал»: вход в приложении порождает и собственное событие (§8.7,
+    срез `R2b`), оно обязано оставаться видимым, поэтому проверка отказа не подменяется проверкой
+    входа и наоборот.
+    """
+    rows = [row for row in _rows(store) if row.action == action]
+    assert len(rows) == 1, (
+        f"ожидается одна журнальная строка {action!r}, получено {len(rows)}: "
+        f"{[row.action for row in _rows(store)]}"
+    )
     return rows[0]
 
 
@@ -125,8 +136,7 @@ def test_отказ_по_отсутствию_токена_пишет_причи
     response = client.post("/logout", data={"любое": "поле"}, follow_redirects=False)
 
     assert response.status_code == 403
-    row = _only(store)
-    assert row.action == "auth.csrf_rejected"
+    row = _only(store, "auth.csrf_rejected")
     assert row.entity == "request"
     assert row.entity_id == "/logout"
     assert row.details == {"reason": "токена нет"}
@@ -149,8 +159,7 @@ def test_чужой_источник_на_маршруте_без_токена_�
     )
 
     assert response.status_code == 403
-    row = _only(store)
-    assert row.action == "auth.csrf_rejected"
+    row = _only(store, "auth.csrf_rejected")
     assert row.entity_id == "/login"
     details = row.details
     assert details is not None
@@ -174,8 +183,7 @@ def test_несовпавший_токен_пишет_отдельную_при�
     )
 
     assert response.status_code == 403
-    row = _only(store)
-    assert row.action == "auth.csrf_rejected"
+    row = _only(store, "auth.csrf_rejected")
     assert row.details == {"reason": "токен не совпал"}
 
 
@@ -195,8 +203,7 @@ def test_отказ_по_роли_пишет_причину_требуемую_�
     response = client.get(ADMIN_PATH)
 
     assert response.status_code == 403
-    row = _only(store)
-    assert row.action == "auth.access_denied"
+    row = _only(store, "auth.access_denied")
     assert row.details == {"reason": DENIAL_ROLE, "required": ADMIN_TIER}
     assert row.actor is not None, "у отказа допуска субъект обязан быть: сеанс опознан"
     assert row.entity == "user"
@@ -218,8 +225,7 @@ def test_отказ_без_строки_учётной_записи_пишетс
     response = client.get(CONSOLE_PATH)
 
     assert response.status_code == 403
-    row = _only(store)
-    assert row.action == "auth.access_denied"
+    row = _only(store, "auth.access_denied")
     assert row.details == {"reason": DENIAL_NO_ACCOUNT}
     assert row.actor is not None
 
@@ -242,10 +248,20 @@ def test_копия_журнала_связана_так_же_как_боева�
 
     assert (first.status_code, second.status_code) == (403, 403)
     rows = _rows(store)
-    assert len(rows) == 2
+    assert [row.action for row in rows] == [
+        "session.login",
+        "auth.csrf_rejected",
+        "auth.access_denied",
+    ], (
+        "цепочка начинается со входа (`session.login`, срез `R2b`), дальше — по одной строке на "
+        "отказ; удвоенное событие или событие чужого действия меняют перечень"
+    )
     assert rows[0].hash_prev is None, "первая запись цепочки обязана быть без предка"
-    assert rows[1].hash_prev == rows[0].hash
-    assert [row.action for row in rows] == ["auth.csrf_rejected", "auth.access_denied"]
+    for earlier, later in pairwise(rows):
+        assert later.hash_prev == earlier.hash, (
+            f"строка {later.action} не связана с предыдущей: набор незацепленных хэшей при разборе "
+            "неотличим от вырезанного куска журнала"
+        )
 
 
 def test_несостоявшаяся_запись_отвечает_503_а_не_успехом(

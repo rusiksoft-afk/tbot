@@ -45,6 +45,23 @@
 что задал пароль, означало бы пропустить и второй фактор, и очередь одобрения (§1.2). Одобрения
 здесь нет вовсе: в очередь запись ставит подтверждённая привязка 2FA (`routes/totp.py`,
 `enqueue_for_approval`), а одобрение принимает администратор (`routes/admin_users.py`).
+
+Журнал (§8.7 «все попытки использования ссылки»; срез `R2b` задачи `T-109`, `ADR-025` п. 6).
+Обработчик добавляет три события, и класс фиксации у них разный — по свойству события, а не
+по маршруту:
+
+* `invitation.accepted` и `account.created` — состоявшиеся факты: обе строки идут **той же
+  транзакцией**, что и записи `invitations` и `users` (без `commit_now`, прямо перед
+  единственным `commit()`-ом обработчика, сразу после `flush()`-а, который даёт учётной записи
+  её `id`). Поэтому «ссылка истрачена, а учётной записи нет» и «учётная запись создана, а
+  события нет» — одно и то же откатанное состояние, а не два разных;
+* `invitation.accept_failed` — попытка, приведшая к отказу: она фиксируется **своей** фиксацией
+  (`commit_now=True`), потому что транзакция запроса на отказных ветках намеренно не
+  фиксируется, а факт попытки обязан пережить ответ (§8.7 требует писать все попытки, и без
+  собственной фиксации в журнале остались бы только удавшиеся приёмы). Исключение — ветка
+  «домен отказал уже после заявки»: она не пишет ничего, поскольку её транзакция откатывается
+  целиком вместе с заявкой, а зафиксированный журнал удержал бы откатанную заявку.
+  Носителем факта там остаётся `log.exception`.
 """
 
 from __future__ import annotations
@@ -160,6 +177,44 @@ CLAIM_LOST_DETAIL: Final = (
     "Ссылка истрачена или отозвана в этот же момент: учётная запись не создана. Попробуйте "
     "снова со свежей ссылкой, если она у вас есть."
 )
+#: Коды причины `invitation.accept_failed` (§8.7). Набор закрыт: часть кодов приходит из домена
+#: (`INVITATION_UNUSABLE_CODES`) и из разбора адреса (`unknown`, `malformed`), часть — это коды
+#: отказа формы, и названы они здесь, а не выводятся из текстов §9.1: текст объяснения меняется,
+#: код причины в журнале — нет.
+#:
+#: Имя `FAILURE_POLICY` не содержит слова, которое описывает: проверка `S105` читает имена и
+#: отклонила бы константу со значением `password_policy`. Код причины от этого не меняется.
+FAILURE_EMPTY_FORM: Final = "empty_form"
+FAILURE_REPEAT_MISMATCH: Final = "repeat_mismatch"
+FAILURE_LOGIN_SYNTAX: Final = "login_syntax"
+FAILURE_POLICY: Final = "password_policy"
+FAILURE_LOGIN_TARGET: Final = "login_target_mismatch"
+FAILURE_LOGIN_TAKEN: Final = "login_taken"
+FAILURE_CLAIM_LOST: Final = "claim_lost"
+
+
+def _accept_failed(store: Store, record: Invitation | None, reason: str, moment: datetime) -> None:
+    """Строка `invitation.accept_failed` — попытка использования ссылки, которая отказала (§8.7).
+
+    Фиксируется сразу (`commit_now=True`): транзакция запроса на отказных ветках не фиксируется,
+    а факт попытки обязан пережить ответ — §8.7 требует писать *все* попытки использования
+    ссылки, и без собственной фиксации в журнале остались бы только удавшиеся приёмы.
+
+    В деталях — код причины и, когда строка найдена, её `id`. Значения ссылки, логина и пароля
+    в журнале нет: значение ссылки контролирует предъявивший её человек, а попади оно в журнал,
+    он стал бы каналом одноразовой ссылки в таблицу, которую читают администраторы и которая
+    попадает в дампы (`ADR-004`, `ADR-019`, §8.4).
+    """
+    store.append_audit(
+        action="invitation.accept_failed",
+        at=moment,
+        entity="invitation",
+        entity_id=None if record is None else record.id,
+        details={"reason": reason},
+        commit_now=True,
+    )
+
+
 ACCEPTED_NOTE: Final = (
     "Дальше — обычный вход: сначала пароль, затем привязка второго фактора. После привязки "
     "учётная запись попадёт в очередь одобрения, и доступ откроет одобрение администратора (§1.2)."
@@ -365,6 +420,7 @@ async def invite_submit(request: Request, store: StoreDep, link_value: InviteLin
     link = _resolve_link(store, link_value)
     if link.record is None:
         log.info("invitation_link_missing", reason=link.reason)
+        _accept_failed(store, None, link.reason, moment)
         return _render_link_page(
             request,
             reason=link.reason,
@@ -377,6 +433,7 @@ async def invite_submit(request: Request, store: StoreDep, link_value: InviteLin
         ensure_invitation_open(record, now=moment)
     except InvitationUnusableError as exc:
         log.info("invitation_link_closed", invitation_id=str(record.id), code=exc.code)
+        _accept_failed(store, record, exc.code, moment)
         return _render_link_page(
             request,
             reason=exc.code,
@@ -386,6 +443,7 @@ async def invite_submit(request: Request, store: StoreDep, link_value: InviteLin
         )
 
     if not login_value or not password or not repeat:
+        _accept_failed(store, record, FAILURE_EMPTY_FORM, moment)
         return _render_link_page(
             request,
             reason="",
@@ -396,6 +454,7 @@ async def invite_submit(request: Request, store: StoreDep, link_value: InviteLin
             login_value=login_value,
         )
     if password != repeat:
+        _accept_failed(store, record, FAILURE_REPEAT_MISMATCH, moment)
         return _render_link_page(
             request,
             reason="",
@@ -413,6 +472,8 @@ async def invite_submit(request: Request, store: StoreDep, link_value: InviteLin
         login_checked = ensure_login_syntax(login_value)
         check_password_policy(password, login=login_checked, email=record.email)
     except (LoginFormatError, PasswordPolicyError) as exc:
+        reason = FAILURE_LOGIN_SYNTAX if isinstance(exc, LoginFormatError) else FAILURE_POLICY
+        _accept_failed(store, record, reason, moment)
         return _render_link_page(
             request,
             reason="",
@@ -424,6 +485,7 @@ async def invite_submit(request: Request, store: StoreDep, link_value: InviteLin
         )
 
     if record.login is not None and not same_login(login_checked, record.login):
+        _accept_failed(store, record, FAILURE_LOGIN_TARGET, moment)
         return _render_link_page(
             request,
             reason="",
@@ -435,6 +497,7 @@ async def invite_submit(request: Request, store: StoreDep, link_value: InviteLin
         )
 
     if store.user_by_login(login_checked) is not None:
+        _accept_failed(store, record, FAILURE_LOGIN_TAKEN, moment)
         return _render_link_page(
             request,
             reason="",
@@ -450,6 +513,7 @@ async def invite_submit(request: Request, store: StoreDep, link_value: InviteLin
     #    запись по закрытой ссылке — это доступ, которого по записи нет.
     if not store.claim_invitation(invitation_id=record.id, now=moment):
         log.info("invitation_claim_lost", invitation_id=str(record.id))
+        _accept_failed(store, record, FAILURE_CLAIM_LOST, moment)
         return _render_link_page(
             request,
             reason="",
@@ -491,6 +555,29 @@ async def invite_submit(request: Request, store: StoreDep, link_value: InviteLin
         )
 
     store.add(account)
+    # Идентификатор учётной записи выдаёт база, а он нужен строке `account.created`: событие
+    # обязано нести `entity_id` того объекта, о котором сообщает (§8.7). Флаш ничего не
+    # фиксирует, поэтому отказ журнала откатывает и строку пользователя, и наоборот
+    # (`ADR-025` п. 6).
+    store.flush()
+    store.append_audit(
+        action="invitation.accepted",
+        at=moment,
+        entity="invitation",
+        entity_id=record.id,
+        details={"created_user_id": str(account.id), "role": account.role},
+    )
+    store.append_audit(
+        action="account.created",
+        at=moment,
+        entity="user",
+        entity_id=account.id,
+        details={
+            "invitation_id": str(record.id),
+            "role": account.role,
+            "state": account.state,
+        },
+    )
     store.commit()
     # В журнал — `id` выпуска, роль и срок: логин в журнал процесса не пишется (§8.4), а
     # `id` выпуска позволяет соотнести строку `invitations` с созданной учётной записью.

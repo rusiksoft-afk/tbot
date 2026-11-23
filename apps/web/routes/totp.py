@@ -61,12 +61,23 @@
   собственные данные учётной записи, а не карта для переборщика;
 * **алерта администратору о расходе кода** (§8.2 «+ алерт администратору»): доставка уведомлений —
   `T-716`, в этом срезе остаётся именованное событие журнала `backup_code.spent`;
-* **записей `audit_log`** о привязке, подтверждении, выпуске и расходе кодов и о блокировках (§8.7):
-  реестр имён и протокол добавления — срезы `R1` и `R2` задачи `T-109`, вызовы для этих событий —
-  её остаток (перенос зафиксирован `ADR-009`); отказ `429` фиксируется механизмом лимитов
-  (`apps/web/security/rate_limit.py`). Компенсирующие контроля на месте: состояние привязки — в `totp_enrollments`, попытки — в
-  `totp_failures`, коды и их расход — в `backup_codes`, блокировка — в `users.locked_until`, бан
-  адреса — в `rate_buckets`, и всё это объясняется человеку сразу.
+* **записей `audit_log` о блокировках и об отказе резервного пути.** Реестр имён закрыт за §8.7
+  (`ADR-025` п. 2), и имени для «неудачная попытка расхода резервного кода» в нём нет: выдумывать
+  его срез не вправе, поэтому факт попытки держат лента `totp_failures` (её двигает
+  `_register_failure_and_lock`) и `log.warning`.
+
+  События самого церемониала добавляет срез `R2b` задачи `T-109`: `totp.enrolled` (выдан секрет),
+  `totp.confirmed` (привязка подтверждена), `backup_codes.issued` и `backup_codes.invalidated`
+  (пачка кодов), `backup_code.spent` (расход), `totp.verify_failed` (неудачная попытка кода) и
+  вторая строка `session.login` с шагом `full` — тот момент, с которого §8.7 считает вход
+  состоявшимся для учётной записи со вторым фактором (первую строку даёт парольный шаг,
+  `routes/login.py`). Точка вызова — обработчик: только он знает, чей шаг поднят (сессия) и чья
+  привязка изменена (учётная запись), и у каждого события ровно одна точка. Состоявшиеся факты
+  не пользуются своей фиксацией и уходят тем же `commit()`-ом, что и изменение: «привязка
+  подтверждена, а события нет» — состояние, из-за которого журнал перестаёт быть доказательством
+  (`ADR-025` п. 6). Исключение — `backup_code.spent`: guarded-`UPDATE` расхода не имеет своей
+  фиксации и фиксируется вместе с переводом шага. Имя `totp.revoked` остаётся без производителя
+  ровно до маршрута сброса привязки (`T-103`, §9.3 п. 6) — см. пункт про перепривязку выше.
 
 Шаг `'totp'` и почему он не даёт доступа. Подтверждение привязки переводит сессию на шаг `'totp'`, и
 это **не** полный вход: полный даёт только ввод кода (§8.2 шаг (2)) либо расход резервного кода
@@ -646,6 +657,7 @@ def _rejection_answer(
     moment: datetime,
     render: Callable[[str, int], HTMLResponse],
     denied: Callable[[str, datetime, str], HTMLResponse],
+    audit_stage: str | None,
     failure_detail: str = CODE_FAILURE_DETAIL,
 ) -> Response:
     """Один ответ на любую неудачу кода: лента, окно адреса, затем — блокировки по порядку.
@@ -659,10 +671,33 @@ def _rejection_answer(
     сидеть другие люди — `ADR-007` предупреждает, что коллективный ключ наказывает соседей), и человеку
     важнее узнать про свою учётную запись.
 
+    `audit_stage` — стадия попытки для журнала (§8.7 «неудачные попытки»): `login_code` у страницы
+    кода, `enrollment_confirm` у подтверждения привязки, `None` у резервного кода. Значение нужно
+    не для текста отказа, а чтобы различать в журнале, где именно перебирали код; для резервного
+    кода стадии нет, потому что имени для неудачной попытки расхода в закрытом реестре §8.7 нет
+    (пункт «Чего здесь сознательно нет»), а выдумывать имя срез не вправе.
+
     Отдельно держится, что неудача зафиксирована **до** формирования ответа: `_register_failure_and_lock`
     двигает ленту и окна с их `commit()`-ами (счётчик обязан пережить запрос, §8.1–§8.2), а «полунеудача»
     невозможна, поскольку незакрытый транзакт откатывается закрытием соединения.
     """
+    if audit_stage is not None:
+        # Событие добавляется **до** регистрации неудачи и пользуется той фиксацией, которая у неё
+        # же: лента `totp_failures` и окно адреса обязаны пережить запрос (§8.1–§8.2), поэтому та же
+        # `commit()`-закрывающая вызов фиксирует и ленту, и строку журнала. Отдельной фиксации у
+        # события нет намеренно: «попытка в счётчике, но без события» и «событие без попытки» —
+        # ровно те расхождения, из-за которых журнал нельзя сверить с таблицей (`ADR-025` п. 6).
+        # Состояние блокировки в деталях не пишется: его несёт `users.locked_until`, а момент
+        # закрытия входа виден из деталей `session.login_failed` (`routes/login.py`).
+        store.append_audit(
+            action="totp.verify_failed",
+            at=moment,
+            actor=user.id,
+            entity="user",
+            entity_id=user.id,
+            details={"stage": audit_stage},
+        )
+
     locked_until, banned = _register_failure_and_lock(store, user, address, moment=moment)
     if locked_until is not None:
         return denied(_lock_explanation(locked_until), locked_until, LOCK_REASON_ATTEMPTS)
@@ -845,6 +880,7 @@ async def code_submit(request: Request, principal: CodeMutation, store: StoreDep
             user,
             address,
             moment=moment,
+            audit_stage="login_code",
             render=lambda detail, status_code: _render_code(
                 request, principal, detail=detail, status_code=status_code, moment=moment
             ),
@@ -859,6 +895,21 @@ async def code_submit(request: Request, principal: CodeMutation, store: StoreDep
         )
 
     advance_auth_step(principal.session, step="full", now=moment)
+    # Второй фактор пройден: по §8.7 это и есть «вход» учётной записи с 2FA — вторая строка
+    # `session.login` с шагом `full` (первую даёт парольный шаг, `routes/login.py`; реестр §8.7
+    # не даёт отдельного имени для подъёма шага, различие читается из `details.auth_step`).
+    # Значение шага читается из сессии после перехода, чтобы журнал описывал ровно то состояние,
+    # которое фиксирует этот же `commit()` (`security/sessions.touch_session`). Своей фиксацией
+    # событие не пользуется: сеанс и событие расходятся как раз тогда, когда зафиксирована
+    # только одна половинка (`ADR-025` п. 6).
+    store.append_audit(
+        action="session.login",
+        at=moment,
+        actor=user.id,
+        entity="session",
+        entity_id=principal.session.id,
+        details={"auth_step": principal.session.auth_step},
+    )
     touch_session(store, principal)
     return RedirectResponse(POST_CODE_REDIRECT, status_code=302)
 
@@ -964,6 +1015,7 @@ def enroll_start(request: Request, principal: CodeMutation, store: StoreDep) -> 
             moment=moment,
         )
 
+    replaced_unconfirmed = 0
     ring = request_key_ring(request)
     if active is not None:
         # Подтверждённой привязки здесь уже нет (она отклонена выше), поэтому отзыв обязателен в любом
@@ -973,11 +1025,33 @@ def enroll_start(request: Request, principal: CodeMutation, store: StoreDep) -> 
         # отзывается тем же вызовом: срок — только причина, по которой её стоит менять, но не условие
         # отзыва. Для пользователя это ещё и единственный способ начать заново: секрет повторно не
         # показывается (§8.2 «в UI больше не показывается»).
+        replaced_unconfirmed = 1
         revoke_enrollment(active, now=moment)
         store.commit()
 
     created = new_enrollment(user_id=user.id, now=moment, ring=ring)
+    # Число отозванных незавершённых привязок (`0` или `1`): отзыв нужен, чтобы не упёреться в
+    # частичный уникальный индекс `ix_totp_enrollments_user_active`, и это то же значение, которое
+    # уходит в детали `totp.enrolled` — отдельного `totp.revoked` здесь нет намеренно: отзываемая
+    # строка никогда не была подтверждённым вторым фактором, а §8.7 и `ADR-013` называют «отзыв
+    # 2FA» удалением действующего фактора (его даёт маршрут сброса привязки администратором,
+    # §9.3 п. 6 — `T-103`).
     store.add(created.enrollment)
+    # §8.7 «привязка 2FA»: секрет выдан и привязка создана (не подтверждена — это следующее
+    # событие, `totp.confirmed`). Строка идёт той же транзакцией, что и `INSERT` привязки: у
+    # обработчика два `commit()`-а (отзыв старой строки и выпуск новой), и событие относится ко
+    # второму — к выпуску (`ADR-025` п. 6).
+    store.append_audit(
+        action="totp.enrolled",
+        at=moment,
+        actor=user.id,
+        entity="user",
+        entity_id=user.id,
+        details={
+            "enrollment_id": str(created.enrollment.id),
+            "replaced_unconfirmed": replaced_unconfirmed,
+        },
+    )
     store.commit()
     # Картинка строится из `created.secret` — того же значения, которое этот ответ показывает
     # для ручного ввода (`ADR-015` п. 6); порядок аргументов прямой, чтобы контракт не путал
@@ -1116,6 +1190,7 @@ async def enroll_verify(request: Request, principal: CodeMutation, store: StoreD
             user,
             address,
             moment=moment,
+            audit_stage="enrollment_confirm",
             render=lambda detail, status_code: _render_enroll(
                 request,
                 principal,
@@ -1146,9 +1221,44 @@ async def enroll_verify(request: Request, principal: CodeMutation, store: StoreD
     # Открытые значения в слой не передаются никогда: хэши считаются здесь, между генерацией и
     # показом (`ADR-016` п. 3, п. 7). `superseded == 0` при первом выпуске — норма, а не ошибка:
     # прежней пачки ещё нет.
+    # §8.7 «привязка 2FA»: привязка подтверждена — состоявшийся факт, и он идёт той же
+    # транзакцией, что и `confirmed_at` и поднятие шага ниже (`touch_session`); своей фиксацией
+    # событие не пользуется намеренно: «привязка есть, события нет» — ровно то состояние, из-за
+    # которого журнал перестаёт быть доказательством (`ADR-025` п. 6).
+    store.append_audit(
+        action="totp.confirmed",
+        at=moment,
+        actor=user.id,
+        entity="user",
+        entity_id=user.id,
+        details={"enrollment_id": str(enrollment.id)},
+    )
+
     codes = new_backup_codes()
     superseded = store.invalidate_unused_backup_codes(user.id)
     store.insert_backup_code_hashes(user.id, tuple(hash_backup_code(code) for code in codes))
+    # Два события про пачку — по одному на факт (`ADR-025` п. 6): аннулирование остатков прежней
+    # пачки и выпуск новой. Первого нет при первом выпуске: аннулировать нечего, а строка журнала
+    # о нулевом аннулировании описывала бы действие, которого не было. Порядок строк повторяет
+    # порядок обращений к слою доступа — сначала `invalidate`, потом `insert`.
+    if superseded:
+        store.append_audit(
+            action="backup_codes.invalidated",
+            at=moment,
+            actor=user.id,
+            entity="user",
+            entity_id=user.id,
+            details={"count": superseded},
+        )
+    store.append_audit(
+        action="backup_codes.issued",
+        at=moment,
+        actor=user.id,
+        entity="user",
+        entity_id=user.id,
+        details={"count": len(codes), "superseded": superseded},
+    )
+
     log.info(
         "backup_codes_issued",
         user_id=str(user.id),
@@ -1164,11 +1274,28 @@ async def enroll_verify(request: Request, principal: CodeMutation, store: StoreD
     # переустанавливает и не стирает автора одобрения. Фиксируется переход тем же
     # `commit()`-ом, что и поднятие шага ниже (`security/sessions.touch_session`) — отдельного
     # фиксировать нечего: оба изменения относятся к одному решению.
+    state_before = user.state
     if enqueue_for_approval(user):
         log.info(
             "account_awaiting_approval",
             user_id=str(user.id),
             session_id=str(principal.session.id),
+        )
+        # Переход в очередь одобрения — изменение состояния учётной записи (§8.7
+        # «создание/изменение пользователя»), поэтому и он в журнале: тот же `commit()`, что и у
+        # поднятия шага. Событие внутри `if`: идемпотентный повтор привязки состояние не меняет,
+        # а строка журнала о несостоявшемся переходе была бы неправдой.
+        store.append_audit(
+            action="account.state_changed",
+            at=moment,
+            actor=user.id,
+            entity="user",
+            entity_id=user.id,
+            details={
+                "action": "enqueue_for_approval",
+                "from": state_before,
+                "to": user.state,
+            },
         )
     advance_auth_step(principal.session, step="totp", now=moment)
     touch_session(store, principal)
@@ -1435,7 +1562,9 @@ async def recovery_submit(request: Request, principal: CodeMutation, store: Stor
 
     row = store.find_unused_backup_code(user_id=user.id, code_hash=code_hash)
     spent = row is not None and store.spend_backup_code(code_id=row.id, user_id=user.id)
-    if not spent:
+    # `row is None` в условии — не вторая проверка того же факта, а способ оставить тип суженным
+    # после отказа: журнал расхода обязан нести `id` строки, а `spent` без `row` mypy не выводит.
+    if row is None or not spent:
         log.warning(
             "backup_code_rejected",
             path=request.url.path,
@@ -1450,6 +1579,11 @@ async def recovery_submit(request: Request, principal: CodeMutation, store: Stor
             user,
             address,
             moment=moment,
+            # Стадии нет: у отказа резервного пути нет имени в реестре §8.7 (перечень называет
+            # «расход резервного кода», а не неудачную попытку расхода), а выдумывать имя срез
+            # не вправе — реестр закрыт за §8.7 (`ADR-025` п. 2). Факт попытки держит лента
+            # `totp_failures` (её двигает `_register_failure_and_lock`) и `log.warning` выше.
+            audit_stage=None,
             render=lambda detail, status_code: _render_recovery(
                 request,
                 principal,
@@ -1469,9 +1603,38 @@ async def recovery_submit(request: Request, principal: CodeMutation, store: Stor
             failure_detail=RECOVERY_FAILURE_DETAIL,
         )
 
-    advance_auth_step(principal.session, step="full", now=moment)
-    touch_session(store, principal)
+    # Остаток считается здесь же, где и событие: guarded-`UPDATE` расхода уже отметил строку, а
+    # снимок `spare` снят до него, поэтому `spare_left` — то же число, которое человек видит на
+    # странице, а не прочитанное из устаревшей identity map (см. `_recovery_warning_after_spend`).
     spare_left = max(spare - 1, 0)
+    # §8.7 «расход резервного кода». В деталях — идентификатор строки, а не значение: ключи вида
+    # `code`/`code_hash` отклоняет протокол (`ADR-025` п. 2), а `id` достаточно, чтобы соотнести
+    # факт с таблицей `backup_codes`.
+    store.append_audit(
+        action="backup_code.spent",
+        at=moment,
+        actor=user.id,
+        entity="user",
+        entity_id=user.id,
+        details={"backup_code_id": str(row.id), "spare_left": spare_left},
+    )
+    advance_auth_step(principal.session, step="full", now=moment)
+    # Второй фактор пройден: по §8.7 это и есть «вход» учётной записи с 2FA — вторая строка
+    # `session.login` с шагом `full` (первую даёт парольный шаг, `routes/login.py`; реестр §8.7
+    # не даёт отдельного имени для подъёма шага, различие читается из `details.auth_step`).
+    # Значение шага читается из сессии после перехода, чтобы журнал описывал ровно то состояние,
+    # которое фиксирует этот же `commit()` (`security/sessions.touch_session`). Своей фиксацией
+    # событие не пользуется: сеанс и событие расходятся как раз тогда, когда зафиксирована
+    # только одна половинка (`ADR-025` п. 6).
+    store.append_audit(
+        action="session.login",
+        at=moment,
+        actor=user.id,
+        entity="session",
+        entity_id=principal.session.id,
+        details={"auth_step": principal.session.auth_step},
+    )
+    touch_session(store, principal)
     log.info(
         "backup_code_spent",
         user_id=str(user.id),
