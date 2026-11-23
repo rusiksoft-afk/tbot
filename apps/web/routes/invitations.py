@@ -346,7 +346,7 @@ async def invite_submit(request: Request, store: StoreDep, link_value: InviteLin
       доступа к страницам: следующий шаг — привязка второго фактора, и только она ставит запись
       в очередь одобрения (§1.2, `ADR-020` п. 3).
     """
-    ensure_same_origin(request)
+    ensure_same_origin(request, store)
     moment = utc_now()
     address = session_ip(request)
 

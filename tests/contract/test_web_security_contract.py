@@ -553,6 +553,114 @@ def test_заголовки_ставит_middleware_а_не_маршруты(app
     assert app.state.templates.env.autoescape is True
 
 
+def _audit_calls(path: pathlib.Path) -> int:
+    """Число вызовов `<объект>.append_audit(...)` в файле.
+
+    Считается по AST, а не по тексту: комментарий или докстринг со словом `append_audit` не
+    должен создавать ложный вызов — иначе проверка начала бы ловить собственное обоснование.
+    """
+    дерево = ast.parse(path.read_text(encoding="utf-8"))
+    return sum(
+        1
+        for узел in ast.walk(дерево)
+        if isinstance(узел, ast.Call)
+        and isinstance(узел.func, ast.Attribute)
+        and узел.func.attr == "append_audit"
+    )
+
+
+def _method_source(path: pathlib.Path, *, klass: str, name: str) -> str:
+    """Исходник одного метода одного класса: комментарий рядом с ним и соседние методы не входят.
+
+    Класс указывается обязательно: в `apps/web/store.py` метод объявлен дважды — узкий протокол
+    `Store` (объявление с докстрингом) и реализация `SqlStore`. Проверка протокола добавления
+    обязана смотреть на реализацию, иначе она проверяла бы заглушку.
+
+    Нужен ровно для того, чтобы проверка относилась к коду протокола, а не к его обоснованию:
+    рядом с методом стоит разбор того, почему `ON CONFLICT` запрещён, и текстовая проверка по
+    всему файлу ловила бы это объяснение вместо нарушения.
+    """
+    source = path.read_text(encoding="utf-8")
+    for узел in ast.walk(ast.parse(source)):
+        if not isinstance(узел, ast.ClassDef) or узел.name != klass:
+            continue
+        for item in узел.body:
+            if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef) and item.name == name:
+                отрезок = ast.get_source_segment(source, item)
+                assert отрезок is not None, f"{path.name}: не удалось выделить {klass}.{name}"
+                return отрезок
+        break
+    raise AssertionError(f"в {path.name} нет метода {klass}.{name}")
+
+
+def test_журнал_добавляется_из_одной_точки_протокола_а_не_из_маршрутов() -> None:
+    """Точка добавления журнала — слой доступа; маршруты журнала не касаются (`ADR-025` п. 6).
+
+    Опасность ровно одна, и по одному ответу её не видно: строка, записанная мимо протокола,
+    лишена `hash_prev` из хвоста, и весь журнал перестаёт быть доказательством. Найти разрыв
+    способен только разбор (`make audit-verify` — срез `R3`), да и то после того, как событие
+    легло в неизменяемую таблицу. Поэтому проверяется форма слоя, а не один ответ:
+
+    * ни один маршрутный модуль `append_audit` не вызывает: событие пишет тот слой, где известна
+      причина отказа (лимиты частоты, CSRF, допуск), а не обработчик ответа — к моменту,
+      когда `apps/web/main.py` получает `403`/`429`, слой доступа запроса уже закрыт;
+    * в слое безопасности вызовов ровно по одному на каждое место, где причина решается: лимиты
+      (отказ частоты и бан адреса — два разных события), CSRF, отказ допуска (одна точка на обе
+      причины, иначе «учётной записи нет» записывается дважды);
+    * `apps/web/store.py` держит признаки протокола внутри самой функции `append_audit` — вызов
+      блокировки хвоста `_lock_audit_chain` до вставки, чтение хвоста (`hash` последней строки),
+      отличие конфликта цепочки по **коду состояния**, а не по тексту сообщения, откат и проверка
+      числа затронутых строк (`rowcount`), потому что вставка без ошибки и без строки — это молча
+      потерянное событие (`ADR-025` п. 6, замеры прогонов `45163930282` и `45165930936`);
+    * форм `ON CONFLICT` в слое доступа нет: `DO NOTHING` на журнале не конфликтует, а теряет
+      событие, превращая его в `broken_link` (`ADR-025` п. 4).
+    """
+    routes = _ROOT / "apps" / "web" / "routes"
+    written = {path.name: _audit_calls(path) for path in sorted(routes.glob("*.py"))}
+    assert not any(
+        written.values()
+    ), f"маршруты пишут журнал сами ({written}): точка добавления одна — протокол слоя доступа"
+
+    security = _ROOT / "apps" / "web" / "security"
+    assert (
+        _audit_calls(security / "rate_limit.py") == 2
+    ), "у механизма лимитов должно быть по одному вызову на отказ частоты и на бан адреса"
+    assert _audit_calls(security / "csrf.py") == 1, "у отказа CSRF обязан быть ровно один вызов"
+    assert _audit_calls(security / "authorization.py") == 1, (
+        "отказ допуска пишется в одной точке: вызов внутри проверки роли записал бы причину "
+        "«учётной записи нет» дважды"
+    )
+
+    store_path = _ROOT / "apps" / "web" / "store.py"
+    protocol = _method_source(store_path, klass="SqlStore", name="append_audit")
+    assert "_lock_audit_chain()" in protocol, (
+        "из протокола исчезла блокировка хвоста: два писателя прочитают один хвост, а индекс-страж "
+        "`ix_audit_log_hash_prev_linked` отклонит вторую запись (`ADR-025` п. 6)"
+    )
+    assert "select(AuditLogEntry.hash)" in protocol, (
+        "протокол перестал читать хвост цепочки: запись ушла бы без `hash_prev`, и цепочка "
+        "распалась бы на независимые ветки"
+    )
+    # Порядок внутри метода зафиксирован и значит больше стиля: `FOR UPDATE` последней строки на
+    # пустой таблице ничего не держит, а advisory-замок, взятый после чтения хвоста, защищает уже
+    # прочитанное значение — то есть ровно ту гонку, из-за которой он и введён.
+    assert protocol.index("_lock_audit_chain()") < protocol.index(
+        "select(AuditLogEntry.hash)"
+    ), "замок цепочки обязан браться до чтения хвоста (`ADR-025` п. 6)"
+    assert "sqlstate" in protocol, (
+        "конфликт цепочки снова определяется по тексту сообщения: psycopg в сообщении код "
+        "`23505` не дублирует (прогон `45165930936`)"
+    )
+    assert "rollback" in protocol, (
+        "при конфликте цепочки перестали откатывать транзакцию целиком: изменение осталось бы "
+        "зафиксированным без события (`ADR-025` п. 6)"
+    )
+    assert "rowcount" in protocol, "проверка числа затронутых строк из протокола исчезла"
+    for form in ("on_conflict_do_nothing", "on_conflict_do_update"):
+        assert form not in protocol, f"форма {form} на журнале запрещена (`ADR-025` п. 4)"
+    assert "ON CONFLICT" not in protocol, "прямая форма ON CONFLICT на журнале запрещена (п. 4)"
+
+
 def test_страницы_состояний_из_9_остаются_в_приложении(app: FastAPI) -> None:
     """`docs/tz/09-web-ui-and-design.md` §9: `/session-expired`, `/locked` — обязательные адреса."""
     paths = _app_paths(app)

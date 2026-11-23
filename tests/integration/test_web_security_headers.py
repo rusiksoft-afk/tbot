@@ -119,12 +119,22 @@ def test_hsts_без_preload(client: TestClient) -> None:
 
 
 def test_отказ_csrf_тоже_несёт_политику(client: TestClient, store: MemoryStore) -> None:
-    """`403` создаёт обработчик исключения — заголовок обязан поставить middleware."""
+    """`403` создаёт обработчик исключения — заголовок обязан поставить middleware.
+
+    «Отклонённый запрос ничего не записывает» с срезом `R2` задачи `T-109` читается иначе, и это
+    не ослабление проверки: состояние запрос не меняет ни в одной таблице, кроме журнала, а
+    событие отказа §8.7 обязано быть зафиксировано своей отдельной фиксацией (`ADR-025` п. 6 —
+    «попытка, приведшая к отказу» не должна зависеть от бизнес-транзакции, которой здесь нет).
+    Поэтому проверяется ровно одна добавленная строка журнала и ни одной фиксации поверх неё.
+    """
     login(client)
     before = store.commits
     response = client.post("/logout", data={"любое": "поле"}, follow_redirects=False)
     assert response.status_code == 403
-    assert store.commits == before, "отклонённый запрос не должен ничего записать"
+    assert [row.action for row in store.audit_rows] == [
+        "auth.csrf_rejected"
+    ], "отказ CSRF обязан оставить ровно одну журнальную строку (§8.7) и ни одной бизнес-записи"
+    assert store.commits == before + 1, "отказанный запрос обязан добавить только строку журнала"
     for name in SECURITY_HEADERS:
         assert name in response.headers, f"{name}: отказ `403` отдан без политики"
 

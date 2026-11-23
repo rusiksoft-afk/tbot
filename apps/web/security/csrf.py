@@ -53,6 +53,8 @@ from fastapi import Request
 from apps.web.forms import form_fields
 from apps.web.security.clients import forwarded_scheme
 from apps.web.security.sessions import Principal, SessionRedirect, StoreDep, authenticate
+from apps.web.store import Store
+from packages.common.clock import utc_now
 from packages.identity.sessions import ensure_token_syntax
 
 #: Метка вывода. ADR-008: сменить способ вывода — значит поменять эту метку и получить `403` на
@@ -144,7 +146,37 @@ def csrf_context(principal: Principal | None) -> dict[str, str]:
 # ─── проверка на маршруте ─────────────────────────────────────────────────────────────────────
 
 
-def ensure_same_origin(request: Request) -> None:
+def _rejected(store: Store | None, request: Request, reason: str) -> CsrfRejected:
+    """Отказ CSRF: строка журнала (§8.7) и исключение, которое поднял бы вызывающий код.
+
+    Возвращает исключение, а не поднимает его: вызывающий обязан сохранить свою конструкцию
+    `raise ... from`, иначе отказ «сессии нет» потерял бы причину, по которой не нашлось токена.
+
+    Причина уходит в `details` как есть: набор причин закрыт и состоит из имён заголовков и
+    коротких формулировок, ни одно значение не является материалом сессии или учётных данных
+    (`ADR-025` п. 2). `actor` у строки отсутствует намеренно: отказ CSRF случается до того, как
+    слой входа узнал субъекта, а выдуманного субъекта журнал не терпит. `entity_id` — путь
+    запроса: без него строка «отказано в CSRF» не отвечала бы на вопрос, к какому действию её
+    относятся (`ADR-009`, §8.7 «действие, субъект, объект, IP, request_id»).
+
+    `store` необязателен ровно для одного случая: вызывающий без слоя доступа. Такого вызова в
+    маршрутах нет — все три точки (`require_csrf`, `/login`, `/invite`) получают слой доступа
+    вместе с запросом, и параметр обязан быть передан, иначе событие §8.7 потеряется наполовине
+    отказов.
+    """
+    if store is not None:
+        store.append_audit(
+            action="auth.csrf_rejected",
+            at=utc_now(),
+            entity="request",
+            entity_id=request.url.path,
+            details={"reason": reason},
+            commit_now=True,
+        )
+    return CsrfRejected(reason)
+
+
+def ensure_same_origin(request: Request, store: Store | None = None) -> None:
     """Проверить источник запроса (§8.3: «проверка origin»).
 
     Сначала `Sec-Fetch-Site`: он не подделывается скриптом с чужого источника и даёт точный
@@ -154,15 +186,19 @@ def ensure_same_origin(request: Request) -> None:
 
     Нормализация обязательна: `http://host` и `http://host:80` — один источник, а разные строки, и
     сравнение без нормализации отклоняло бы легитимные запросы.
+
+    `store` нужен для строки журнала: отказ источника бывает и на маршрутах без CSRF-токена
+    (`/login`, `/invite` — `ADR-008`), и если бы событие писал только `require_csrf`, половина
+    отказов §8.7 осталась бы без носителя.
     """
     site = request.headers.get(SEC_FETCH_SITE_HEADER)
     if site is not None and site.lower() != SAME_ORIGIN_SITE:
-        raise CsrfRejected(f"{SEC_FETCH_SITE_HEADER}={site!r}")
+        raise _rejected(store, request, f"{SEC_FETCH_SITE_HEADER}={site!r}")
     origin = request.headers.get(ORIGIN_HEADER)
     if origin is None:
         return
     if _normalize_origin(origin) != _request_origin(request):
-        raise CsrfRejected(f"{ORIGIN_HEADER}={origin!r}")
+        raise _rejected(store, request, f"{ORIGIN_HEADER}={origin!r}")
 
 
 def _normalize_origin(value: str) -> tuple[str, str, int | None]:
@@ -239,20 +275,26 @@ async def require_csrf(request: Request, store: StoreDep) -> Principal:
     5. токен не совпал → `403` без подробностей.
 
     Отказ ничего не меняет в состоянии: незавершённый транзакт откатывается закрытием соединения
-    (`store.get_store`), поэтому «полумутация» невозможна.
+    (`store.get_store`), поэтому «полумутация» невозможна. Отказ при этом остаётся в журнале
+    (`auth.csrf_rejected`, §8.7, `T-109` срез `R2`): событие фиксируется **до** ответа и своей
+    отдельной фиксацией (`ADR-025` п. 6 — «попытка, приведшая к отказу» не должна зависеть от
+    бизнес-транзакции, которая в этом случае ничего не меняла). Место записи — проверка, а не
+    обработчик `403` в `apps/web/main.py`: к моменту, когда обработчик исключений получает
+    `CsrfRejected`, слой доступа уже закрыт: FastAPI закрывает зависимости раньше, чем исключение
+    дойдёт до обработчика, и отдельное соединение для события означало бы второй путь к журналу.
     """
-    ensure_same_origin(request)
+    ensure_same_origin(request, store)
     token = await presented_token(request)
     if token is None:
-        raise CsrfRejected("токена нет")
+        raise _rejected(store, request, "токена нет")
     try:
         principal = authenticate(request, store)
     except SessionRedirect as exc:
         if exc.reason is None:
-            raise CsrfRejected("сессии нет") from exc
+            raise _rejected(store, request, "сессии нет") from exc
         raise
     if not token_matches(token, expected_token(principal)):
-        raise CsrfRejected("токен не совпал")
+        raise _rejected(store, request, "токен не совпал")
     return principal
 
 

@@ -54,6 +54,7 @@ from apps.web.security.sessions import (
     StoreDep,
     require_full_session,
 )
+from packages.common.clock import utc_now
 from packages.common.logging import get_logger
 from packages.identity.authorization import (
     ADMIN_TIER,
@@ -74,8 +75,44 @@ log = get_logger("web")
 #: `AC-identity-01` требует `403` без утечки списка пользователей, а матрица §8.8 — «`operator` к
 #: чужим данным → 403/404 без утечки». Класс отказа («недостаточно прав») человеку назвать нужно:
 #: без него отказ выглядел бы сбоем, а §9 требует внятных состояний. Подробности — в логе процесса
-#: (`access_denied` + причина), в `audit_log` их же переведёт `T-109` (перенос зафиксирован `ADR-009`).
+#: и в `audit_log` (`auth.access_denied`, §8.7): посетителю различие причин недоступно намеренно,
+#: разбор делает журнал (`ADR-009` п. 4, запись — срез `R2` задачи `T-109`).
 DENIAL_DETAIL: Final = "недостаточно прав для этого действия"
+
+
+def _record_denial(
+    store: StoreDep, principal: Principal, *, reason: str, required: str | None = None
+) -> None:
+    """Строка `auth.access_denied` (§8.7, `ADR-009` п. 4, `ADR-017` п. 4).
+
+    Пишется на той же точке, где решена причина отказа, а не в обработчике `403`: к моменту, когда
+    `apps/web/main.py` получает `AccessDeniedError`, слой доступа запроса уже закрыт (FastAPI
+    выходит из зависимостей запроса раньше, чем исключение доходит до обработчика исключений), а
+    отдельное соединение ради одной строки журнала означало бы второй путь добавления в цепочку —
+    ровно то, чего `ADR-025` п. 6 не допускает.
+
+    `actor` — учётная запись, чей сеанс принёс запрос: §8.7 требует субъекта, а отказа без субъекта
+    в этом слое не бывает (до аутентификации работают отказы частоты и CSRF, у них `actor` пустой).
+    `required` в `details` нужен разбору: без требуемой роли «роль ниже требуемой» неотличима от
+    «человек залез не туда». `DENIAL_BODY` оба значения посетителю не выдаёт — различие живёт
+    только в журнале.
+
+    Каждая причина записывается ровно один раз: `no_account` — забота `load_account`, роли —
+    забота `enforce_role`, и второй строки на ту же причину `enforce_role` не плодит.
+    """
+    details: dict[str, str] = {"reason": reason}
+    if required is not None:
+        details["required"] = required
+    store.append_audit(
+        action="auth.access_denied",
+        at=utc_now(),
+        actor=principal.session.user_id,
+        entity="user",
+        entity_id=principal.session.user_id,
+        details=details,
+        commit_now=True,
+    )
+
 
 #: Тело ответа отказа — одно на все причины (`DENIAL_REASONS`): роль ниже требуемой, роль вне
 #: закрытого набора, учётной записи сеанса нет. Различать их ответом означало бы сообщить
@@ -138,6 +175,7 @@ def load_account(store: StoreDep, principal: Principal) -> User:
     """
     account = store.user_of_id(principal.session.user_id)
     if account is None:
+        _record_denial(store, principal, reason=DENIAL_NO_ACCOUNT)
         raise AccessDeniedError(DENIAL_NO_ACCOUNT)
     return account
 
@@ -155,8 +193,15 @@ def enforce_role(store: StoreDep, principal: Principal, *, required: str) -> str
     немедленной видимости отзыва сеанса. Кэш роли в памяти процесса дал бы окно, в котором
     уже снятый с прав человек оставался бы администратором до перезапуска `web`.
     """
-    account = load_account(store, principal)
-    role = ensure_account_role(account, required=required)
+    try:
+        account = load_account(store, principal)
+        role = ensure_account_role(account, required=required)
+    except AccessDeniedError as exc:
+        # `DENIAL_NO_ACCOUNT` записан в `load_account`: вторая строка на ту же причину удвоила бы
+        # событие и соврала бы при разборе о числе отказов.
+        if exc.reason != DENIAL_NO_ACCOUNT:
+            _record_denial(store, principal, reason=exc.reason, required=required)
+        raise
     # Состояние учётной записи проверяется **после** роли и до любого обращения к объекту
     # (`ADR-020` п. 6, `ADR-017` п. 3). Порядок принципиален: отказ по роли обязан оставаться
     # безликим (`DENIAL_BODY`, `AC-identity-01`), а объяснение состояния относится к самому
