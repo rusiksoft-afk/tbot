@@ -128,9 +128,13 @@ def _marker() -> str:
 def _read(bind: Engine | Session, marker: str) -> list[AuditLogEntry]:
     """Прочитать строки маркера по `id` — так же, как их читает разбор цепочки.
 
-    `Engine` читается отдельным соединением: чтение тем же сеансом, который правил, показало бы
-    identity map вместо базы (замер `CI 45163930282`), а проверки отката обязаны видеть состояние,
-    видимое снаружи.
+    `Engine` читается отдельным сеансом, а не «сырым» соединением, и это не стилистическая мелочь:
+    `Connection.scalars(select(Модель))` на соединении из пула отдаёт **первый столбец** строки —
+    целые `id` вместо объектов модели (замер `CI 45183773961`:
+    `AttributeError: 'int' object has no attribute 'entity_id'`). Отдельный сеанс — это и есть
+    отдельное соединение, и он не разделяет identity map с пишущим сеансом, что обязательно для
+    проверок отката (замер `CI 45163930282`): чтение тем же сеансом, который правил, показало бы
+    прежние атрибуты вместо состояния базы.
     """
     statement = (
         select(AuditLogEntry)
@@ -138,8 +142,8 @@ def _read(bind: Engine | Session, marker: str) -> list[AuditLogEntry]:
         .order_by(AuditLogEntry.id)
     )
     if isinstance(bind, Engine):
-        with bind.connect() as connection:
-            return list(connection.scalars(statement).all())
+        with Session(bind) as session:
+            return list(session.scalars(statement).all())
     return list(bind.scalars(statement).all())
 
 
