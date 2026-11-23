@@ -53,7 +53,12 @@ from apps.web.security.keys import (
 )
 from apps.web.security.rate_limit import RateLimitExceeded
 from apps.web.security.sessions import REASON_QUERY, SessionRedirect, clear_session_cookie
-from apps.web.store import LoginTiming, StoreUnavailableError, build_session_factory
+from apps.web.store import (
+    AuditAppendError,
+    LoginTiming,
+    StoreUnavailableError,
+    build_session_factory,
+)
 from packages.common import metrics
 from packages.common.clock import utc_now
 from packages.common.config import ConfigError, Settings, load_settings
@@ -156,6 +161,11 @@ def create_app(settings: Settings) -> FastAPI:
     @app.middleware("http")
     async def _trace_middleware(request: Any, call_next: Any) -> Any:
         trace_id = request.headers.get("X-Trace-Id") or new_trace_id()
+        # Значение уходит ещё и в состояние запроса: `apps.web.store.journal_context_of` берёт
+        # `request_id` строки журнала отсюда. В логи `trace_id` уже связан со всей цепочкой записей
+        # запроса (§12.1), а в журнале та же привязка нужна как отдельная колонка `request_id` —
+        # §8.7 требует, чтобы событие указывало на запрос, который его породил.
+        request.state.trace_id = trace_id
         bind_request_context(trace_id=trace_id, path=request.url.path)
         try:
             response = await call_next(request)
@@ -207,7 +217,9 @@ def create_app(settings: Settings) -> FastAPI:
 
         В ответе нет ни причины, ни признака, по которому запрос отклонён: по различию ответов
         подбором находилось бы, где именно живёт запрошенный контур. Причина уходит в лог
-        процесса, а в `audit_log` её же переведёт задача `T-109`.
+        процесса, и в `audit_log` она лежит тем же текстом (`auth.csrf_rejected` + причина в
+        `details`, §8.7): событие пишет проверка в `apps/web/security/csrf.py`, а не этот
+        обработчик — к моменту, когда исключение доходит сюда, слой доступа запроса уже закрыт.
         """
         log.warning("csrf_rejected", detail=str(exc))
         return JSONResponse(
@@ -269,8 +281,10 @@ def create_app(settings: Settings) -> FastAPI:
         Маршруты входа этот ответ не отдают: им нужна ссылка на страницу состояния `/locked` (§9),
         поэтому они ловят исключение сами и объясняют его HTML-страницей. Один обработчик на
         остальные мутации нужен потому, что иначе «429 без Retry-After» появилось бы ровно там, где
-        никто не проверял. Запись в `audit_log` (§8.7) здесь не делается осознанно: имена событий и
-        цепочка хэшей — `T-109`, перенос зафиксирован `docs/adr/ADR-009`.
+        никто не проверял. Событие журнала (`auth.rate_limited`, §8.7) пишет не этот обработчик, а
+        сам механизм лимитов в `apps/web/security/rate_limit.py`: маршруты входа и 2FA ловят
+        `RateLimitExceeded` сами и отвечают страницей `/locked`, поэтому у обработчика отказов
+        остались бы только «прочие» маршруты.
         """
         log.warning("rate_limited", path=request.url.path, scope=exc.scope)
         return JSONResponse(
@@ -280,6 +294,34 @@ def create_app(settings: Settings) -> FastAPI:
             },
             status_code=429,
             headers={"Retry-After": str(exc.retry_after)},
+        )
+
+    @app.exception_handler(AuditAppendError)
+    async def _audit_append_failed(request: Request, exc: AuditAppendError) -> JSONResponse:
+        """`503`: запись журнала не состоялась, и бизнес-транзакция откатана вместе с ней.
+
+        Молча ответить «готово» нельзя по `ADR-025` п. 6: событие §8.7 отсутствует, а разбор
+        показывает недостающую строку как `broken_link` — то есть как подделку содержимого.
+        Состояние при этом исправно (изменение не применено), поэтому ответ говорит правду:
+        возможность недоступна, а не «приложение упало» — та же формулировка, что у `503` файла
+        ключей и у `503` без базы (§8.4).
+
+        Отдельного текста для конфликта цепочки (`AuditChainConflictError`) нет намеренно:
+        посетителю различие двух внутренних причин не даёт ничего, а наблюдателю его даёт лог
+        процесса с именем исключения и кодом состояния.
+        """
+        log.error(
+            "audit_append_failed",
+            path=request.url.path,
+            error_type=type(exc).__name__,
+            detail=str(exc),
+        )
+        return JSONResponse(
+            {
+                "status": "not_ready",
+                "detail": "журнал аудита недоступен, изменение не выполнено",
+            },
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
         )
 
     @app.exception_handler(StoreUnavailableError)

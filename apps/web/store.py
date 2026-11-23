@@ -29,6 +29,16 @@
 порядок вызовов в маршрутах: счётчик двигается **до** того, как обработчик изменил что-то ещё,
 иначе коммит счётчика попутно зафиксировал бы незавершённое состояние.
 
+**Журнал аудита добавляется отсюда, и только отсюда** (`T-109`, срез `R2`, `ADR-025` п. 6).
+Протокол «замок хвоста → чтение хвоста → вставка с посчитанным `hash_prev`» исполняет один метод
+(`SqlStore.append_audit`), а не каждый маршрут: два процесса, прочитавшие один хвост, открыли бы
+две ветки, и страж (`ix_audit_log_hash_prev_linked`, ревизия `0007`) отклонил бы одну из вставок
+уже ценой откатанной бизнес-транзакции. Отсюда два правила вызывающего: запись журнала — последнее
+изменение транзакции перед `commit()` (иначе транзакция, держащая замок журнала, запросила бы
+строку, которую держит сосед, ждущий этого замка), и событие «попытка, приведшая к отказу»
+фиксируется отдельной фиксацией (`commit_now=True`), чтобы отказ бизнес-логики не стёр сам факт
+отказа.
+
 **`expire_on_commit=False`.** После `commit()` обработчик ещё читает объект сессии (шаг входа,
 `id` для вывода CSRF-токена, отметки для списка устройств). При значении по умолчанию каждое такое
 чтение ушло бы новым запросом, а после закрытия соединения — ошибкой.
@@ -48,25 +58,29 @@
 from __future__ import annotations
 
 import secrets
-from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Any, Protocol, cast
+from typing import Any, Final, Protocol, cast
 from uuid import UUID
 
 from fastapi import Request
 from sqlalchemy import create_engine, func, insert, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.engine import CursorResult, Engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
+from apps.web.security.clients import client_address
 from packages.common.config import Settings
 from packages.common.db import sqlalchemy_url
+from packages.identity.audit import audit_row_values, make_record
 from packages.identity.authorization import ROLE_ADMIN
 from packages.identity.backup_codes import BackupCodeError, is_sha256_hex
 from packages.identity.passwords import hash_password, verify_password
 from packages.identity.users import CONSOLE_STATE
 from packages.storage.models import (
+    AuditLogEntry,
     BackupCode,
     Invitation,
     RateBucket,
@@ -86,6 +100,78 @@ USER_AGENT_MAX_LEN: int = 256
 #: производительности, а чтобы у маршрута не появилось соблазна вытащить таблицу целиком.
 #: Постраничность — за кадром этого среза (`ADR-020` п. 8).
 ACCOUNTS_LIST_LIMIT: int = 200
+
+
+#: Ключ advisory-блокировки цепочки журнала (`pg_advisory_xact_lock`, `ADR-025` п. 6).
+#: Значение выведено из ASCII-метки `tbot-aud` и записано константой: два процесса обязаны сойтись
+#: на одном ключе, а «случайное число» дало бы два независимых замка над одной цепочкой. Метка
+#: короче восьми байт намеренно: ключ `pg_advisory_xact_lock` — `bigint` со знаком, и восьмибайтное
+#: значение вышло бы за верхнюю границу.
+AUDIT_CHAIN_LOCK_KEY: Final = 8_386_388_000_885_536_100
+
+#: SQLSTATE «нарушение уникальности». Код состояния читают из `error.orig.sqlstate`, а не из текста:
+#: psycopg3 поднимает `psycopg.errors.UniqueViolation`, и в его сообщении кода нет (замер
+#: `CI 45165930936` — проверка искала подстроку `23505` в тексте и падала на правильном отказе).
+SQLSTATE_UNIQUE_VIOLATION: Final = "23505"
+
+
+@dataclass(frozen=True)
+class JournalContext:
+    """Контекст запроса для строк журнала: `request_id` и адрес (§4.1, §8.7).
+
+    Оба значения берутся из запроса один раз (`journal_context_of`) и подставляются в каждую
+    строку этого запроса, чтобы маршруту не пришлось их переносить: потерянный `request_id` лишает
+    разбора возможности связать событие с журналом процесса, а адрес события обязан совпадать с
+    адресом счётчика и адресом сеанса (`ADR-009`).
+
+    `request_id` берётся из `trace_id` middleware и только тогда, когда значение разбирается UUID.
+    Значение заголовка `X-Trace-Id` контролирует клиент (§8.4: запрос — не источник данных
+    журнала), поэтому произвольный текст остаётся в логе, но в колонку `UUID` не попадает.
+    """
+
+    request_id: UUID | None = None
+    address: str | None = None
+
+
+#: Контекст слоя доступа, построенного вне HTTP-запроса (живые проверки, скрипты): ни
+#: идентификатора запроса, ни адреса у такого слоя нет, и выдумывать их нельзя.
+EMPTY_JOURNAL_CONTEXT: Final = JournalContext()
+
+
+def journal_context_of(request: Request) -> JournalContext:
+    """Собрать контекст журнала из запроса.
+
+    Адрес даёт та же функция, что ключ счётчика частоты и `sessions.ip` (`ADR-009`): адрес «того,
+    кого показываем в журнале», «того, кого блокируем» и «того, чей сеанс выпускаем» обязан
+    считаться одним и тем же значением.
+    """
+    raw = getattr(request.state, "trace_id", None)
+    request_id: UUID | None = None
+    if isinstance(raw, str) and raw:
+        try:
+            request_id = UUID(raw)
+        except ValueError:
+            request_id = None
+    return JournalContext(request_id=request_id, address=client_address(request))
+
+
+class AuditAppendError(RuntimeError):
+    """Запись журнала не добавлена; транзакция откатана целиком.
+
+    Молча продолжить нельзя: события §8.7 нет, а разбор показывает недостающее событие как
+    `broken_link`, то есть как подделку содержимого (`ADR-025` п. 7). На уровне HTTP этому случаю
+    соответствует `503` с фиксированным текстом: процесс жив, недоступна одна возможность.
+    """
+
+
+class AuditChainConflictError(AuditAppendError):
+    """Хвост цепочки уже занят другой записью (`ix_audit_log_hash_prev_linked`, `23505`).
+
+    Отдельный класс нужен затем, чтобы слой доступа отличал конфликт цепочки от прочих нарушений
+    по коду состояния, а не по тексту сообщения (`ADR-025` п. 6). Повтор «дописать запись» не
+    делается: повтор на том же хвосте — та же развилка, а повтор всей транзакции применил бы
+    бизнес-изменение дважды.
+    """
 
 
 class StoreUnavailableError(RuntimeError):
@@ -449,6 +535,39 @@ class Store(Protocol):
         запрос, и решение «срок просрочен» обязано быть видимым в разборе, а не прятаться в `WHERE`.
         """
 
+    # ─── журнал аудита (§8.7, `T-109` срез `R2`, `ADR-025` п. 2/4/6) ───────────────────────
+    #
+    # Метод — единственная точка добавления записи журнала; протокол (замок хвоста, `hash_prev`
+    # из хвоста, проверка числа затронутых строк) разбирает `SqlStore.append_audit`. Здесь только
+    # обязательства вызывающего:
+    #
+    # * `at` передаётся явно и снимается **один раз на событие** (`ADR-025` п. 2): метка «сейчас
+    #   по умолчанию» на одной попытке дала бы две разные записи с разными микросекундами (замер
+    #   `CI 45165930936` — на dev-машине ход часов крупнее, чем на Linux, и оффлайновые проверки
+    #   были зелёными);
+    # * `action` — из закрытого `AUDIT_ACTIONS` (§8.7): имя вне реестра отклоняется при записи, а
+    #   не записывается свободной строкой;
+    # * `details` — идентификаторы, коды причин и целые счётчики; значений учётных данных там быть
+    #   не может (политику держит `packages/identity/audit.py`);
+    # * событие состоявшегося изменения пишется **до** `commit()` маршрута (изменение и журнал —
+    #   одна транзакция), событие попытки, приведшей к отказу — с `commit_now=True`, чтобы отказ
+    #   бизнес-логики не стёр сам факт отказа.
+
+    def append_audit(
+        self,
+        *,
+        action: str,
+        at: datetime,
+        actor: UUID | None = None,
+        entity: object = None,
+        entity_id: object = None,
+        details: Mapping[str, Any] | None = None,
+        ip: object = None,
+        request_id: UUID | None = None,
+        commit_now: bool = False,
+    ) -> None:
+        """Добавить запись журнала в текущую транзакцию (или зафиксировать своей)."""
+
     def commit(self) -> None:
         """Зафиксировать изменения текущего запроса.
 
@@ -475,8 +594,9 @@ class BucketWindow:
 class SqlStore:
     """Реализация `Store` поверх одного соединения текущего запроса."""
 
-    def __init__(self, session: Session) -> None:
+    def __init__(self, session: Session, journal: JournalContext | None = None) -> None:
         self._session = session
+        self._journal = journal or EMPTY_JOURNAL_CONTEXT
 
     def user_by_login(self, login: str) -> User | None:
         return self._session.execute(select(User).where(User.login == login)).scalar_one_or_none()
@@ -655,6 +775,81 @@ class SqlStore:
         # затронутых строк ноль.
         return bool(result.rowcount == 1)
 
+    # ─── журнал аудита: единственный путь добавления записи (§8.7, `ADR-025` п. 2/4/6) ─────
+    #
+    # Порядок внутри метода фиксирован: замок → хвост → вставка. `pg_advisory_xact_lock` держится
+    # до конца транзакции, поэтому второй писатель ждёт и читает уже новый хвост. Замок берётся
+    # именно **до** чтения: `FOR UPDATE` последней строки на пустой таблице ничего не блокирует,
+    # и два процесса вставили бы по первой записи цепочки (обе с `hash_prev IS NULL`, а страж
+    # таких пар не отклоняет — частичный индекс исключает `NULL`).
+    #
+    # `ON CONFLICT DO NOTHING` здесь нет и появиться не может: такая конструкция вернулась бы без
+    # исключения при `rowcount == 0`, то есть молча потеряла бы событие, а разбор показал бы его
+    # как `broken_link` — как подделку содержимого (`ADR-025` п. 4; живая проверка
+    # `test_обход_через_on_conflict_do_nothing_не_создаёт_строку`). Поэтому метод обязан смотреть
+    # на число затронутых строк.
+
+    def append_audit(
+        self,
+        *,
+        action: str,
+        at: datetime,
+        actor: UUID | None = None,
+        entity: object = None,
+        entity_id: object = None,
+        details: Mapping[str, Any] | None = None,
+        ip: object = None,
+        request_id: UUID | None = None,
+        commit_now: bool = False,
+    ) -> None:
+        record = make_record(
+            action=action,
+            at=at,
+            actor=actor,
+            entity=entity,
+            entity_id=entity_id,
+            details=details,
+            ip=self._journal.address if ip is None else ip,
+            request_id=self._journal.request_id if request_id is None else request_id,
+        )
+        self._lock_audit_chain()
+        tail = self._session.execute(
+            select(AuditLogEntry.hash).order_by(AuditLogEntry.id.desc()).limit(1)
+        ).scalar_one_or_none()
+        linked = replace(record, hash_prev=tail)
+        try:
+            result = cast(
+                "CursorResult[Any]",
+                self._session.execute(insert(AuditLogEntry).values(audit_row_values(linked))),
+            )
+        except IntegrityError as error:
+            # Откат целиком: «изменение зафиксировано, события нет» — ровно то состояние, из-за
+            # которого журнал перестаёт быть доказательством (`ADR-025` п. 6).
+            self._session.rollback()
+            if str(getattr(error.orig, "sqlstate", "")) == SQLSTATE_UNIQUE_VIOLATION:
+                raise AuditChainConflictError(
+                    "хвост цепочки журнала уже занят другой записью: "
+                    "ix_audit_log_hash_prev_linked отклонил вставку (23505)"
+                ) from error
+            raise
+        if result.rowcount != 1:
+            self._session.rollback()
+            raise AuditAppendError(
+                f"вставка в журнал затронула {result.rowcount} строк, ожидалась одна: "
+                f"событие {action} не записано"
+            )
+        if commit_now:
+            self._session.commit()
+
+    def _lock_audit_chain(self) -> None:
+        """Взять advisory-замок цепочки журнала на время транзакции.
+
+        Замок транзакционный, поэтому отдельно его снимать не нужно и нельзя: он держится ровно
+        столько, сколько транзакция, добавившая запись, не зафиксирована. Ключ один на весь
+        журнал — цепочка тоже одна.
+        """
+        self._session.execute(select(func.pg_advisory_xact_lock(AUDIT_CHAIN_LOCK_KEY)))
+
     def commit(self) -> None:
         self._session.commit()
 
@@ -827,7 +1022,7 @@ def get_store(request: Request) -> Iterator[Store]:
         raise StoreUnavailableError
     session = factory()
     try:
-        yield SqlStore(session)
+        yield SqlStore(session, journal_context_of(request))
     finally:
         session.close()
 

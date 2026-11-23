@@ -18,7 +18,8 @@ CSRF-токена и объясняющих страниц должны запу
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Final, cast
@@ -39,11 +40,13 @@ from apps.web.store import ACCOUNTS_LIST_LIMIT, BucketWindow, Store, get_store
 from packages.common.clock import utc_now
 from packages.common.config import Settings
 from packages.common.ids import uuid7
+from packages.identity.audit import build_audit_entry, make_record
 from packages.identity.authorization import ROLE_ADMIN
 from packages.identity.backup_codes import BackupCodeError, is_sha256_hex
 from packages.identity.sessions import IssuedSession, token_hash_of
 from packages.identity.users import CONSOLE_STATE, new_user
 from packages.storage.models import (
+    AuditLogEntry,
     BackupCode,
     Invitation,
     TotpEnrollment,
@@ -79,6 +82,7 @@ class MemoryStore:
         self._totp_failures: list[TotpFailure] = []
         self._backup_codes: list[BackupCode] = []
         self._invitations: list[Invitation] = []
+        self.audit_rows: list[AuditLogEntry] = []
         self.commits: int = 0
         self.hash_lookups: list[str] = []
 
@@ -341,6 +345,44 @@ class MemoryStore:
             return False
         row.last_used_step = step
         return True
+
+    # ─── журнал аудита (§8.7, `T-109` срез `R2`, `ADR-025` п. 2/4/6) ───────────────────
+    #
+    # Зеркало `SqlStore.append_audit`: та же нормализация записи, тот же закрытый реестр
+    # `AUDIT_ACTIONS` и та же цепочка (`hash_prev` из последней строки копии). Чего память
+    # доказать не может и переносить сюда нельзя: блокировку хвоста
+    # (`pg_advisory_xact_lock`), отказ стража `ix_audit_log_hash_prev_linked` с кодом `23505`,
+    # откат бизнес-транзакции вместе с отказом вставки и проверку числа затронутых строк — у
+    # памяти нет ни индексов, ни транзакций. Это держит живой файл
+    # `tests/integration/test_audit_append_db.py` (job `миграции`).
+
+    def append_audit(
+        self,
+        *,
+        action: str,
+        at: datetime,
+        actor: UUID | None = None,
+        entity: object = None,
+        entity_id: object = None,
+        details: Mapping[str, object] | None = None,
+        ip: object = None,
+        request_id: UUID | None = None,
+        commit_now: bool = False,
+    ) -> None:
+        record = make_record(
+            action=action,
+            at=at,
+            actor=actor,
+            entity=entity,
+            entity_id=entity_id,
+            details=details,
+            ip=ip,
+            request_id=request_id,
+        )
+        tail = self.audit_rows[-1].hash if self.audit_rows else None
+        self.audit_rows.append(build_audit_entry(replace(record, hash_prev=tail)))
+        if commit_now:
+            self.commits += 1
 
     def commit(self) -> None:
         self.commits += 1

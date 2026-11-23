@@ -392,6 +392,30 @@ def _is_hex64(value: str) -> bool:
     return len(value) == _HEX64_LEN and all(char in "0123456789abcdef" for char in value)
 
 
+def audit_row_values(record: AuditRecord) -> dict[str, Any]:
+    """Значения колонок строки журнала по записи — один источник для ORM-объекта и для `INSERT`.
+
+    Нужен ровно потому, что у слоя доступа два пути к одной таблице: ORM-объект (проверки и
+    инструменты разбора) и конструктор `INSERT` (боевая вставка, где обязано быть видно число
+    затронутых строк — `ADR-025` п. 6). Два списка колонок разошлись бы при первой же правке, и
+    второй путь начал бы молча терять колонку, а с ней и часть материала хэша.
+
+    `id` в наборе нет: колонку выдаёт база (§4.1), и в материал хэша она не входит (`ADR-025` п. 3).
+    """
+    return {
+        "at": record.at,
+        "actor": record.actor,
+        "action": record.action,
+        "entity": record.entity,
+        "entity_id": record.entity_id,
+        "details": dict(record.details) if record.details is not None else None,
+        "ip": record.ip,
+        "request_id": record.request_id,
+        "hash_prev": record.hash_prev,
+        "hash": record.content_hash(),
+    }
+
+
 def build_audit_entry(record: AuditRecord) -> AuditLogEntry:
     """Построить строку `audit_log` по записи: `hash` посчитан, `id` не выставлен.
 
@@ -402,18 +426,7 @@ def build_audit_entry(record: AuditRecord) -> AuditLogEntry:
     состояние и событие журнала (§8.7) могли бы разойтись по разным транзакциям (то же
     правило, что у `packages/identity/sessions.py`).
     """
-    return AuditLogEntry(
-        at=record.at,
-        actor=record.actor,
-        action=record.action,
-        entity=record.entity,
-        entity_id=record.entity_id,
-        details=dict(record.details) if record.details is not None else None,
-        ip=record.ip,
-        request_id=record.request_id,
-        hash_prev=record.hash_prev,
-        hash=record.content_hash(),
-    )
+    return AuditLogEntry(**audit_row_values(record))
 
 
 # ─── прочитанная строка и разбор цепочки ────────────────────────────────────────────────────
