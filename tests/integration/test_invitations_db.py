@@ -147,15 +147,19 @@ def db(engine: Engine) -> Iterator[Session]:
         сессия.scalars(select(User.id).where(User.login.like(f"{_LOGIN_PREFIX}%"))).all()
     )
     if идентификаторы:
+        сессия.execute(delete(Invitation).where(Invitation.created_by.in_(идентификаторы)))
+        сессия.execute(delete(UserSession).where(UserSession.user_id.in_(идентификаторы)))
+        # Учётка закрывается состоянием, а не удаляется: с событиями §8.7 (срез `R2b`) на ней висит
+        # `audit_log.actor` — администратор выпуска, отзыва, одобрения и смены состояния
+        # (`fk_audit_log_actor_users`, `ON DELETE RESTRICT`), а журнал append-only и не чистится
+        # (`ADR-017`); `approved_by` при этом не обнуляется: ссылка «кто открыл доступ» остаётся
+        # и на закрытой записи (§4.1 позволяет только `state='archived'`).
         сессия.execute(
             update(User)
             .where(User.id.in_(идентификаторы))
-            .values(approved_by=None)
+            .values(state="archived")
             .execution_options(synchronize_session=False)
         )
-        сессия.execute(delete(Invitation).where(Invitation.created_by.in_(идентификаторы)))
-        сессия.execute(delete(UserSession).where(UserSession.user_id.in_(идентификаторы)))
-        сессия.execute(delete(User).where(User.id.in_(идентификаторы)))
         сессия.commit()
     сессия.close()
 

@@ -86,11 +86,21 @@ def db(engine: Engine) -> Iterator[Session]:
     session = sessionmaker(bind=engine, expire_on_commit=False)()
     yield session
     # `user_id` — `ON DELETE RESTRICT`: сначала сессии, потом учётка. Удаление «пользователя вместе
-    # с сессиями» сломало бы ссылочную целостность журнала, который на этом же ключе строит `T-109`.
+    # с сессиями» сломало бы ссылочную целостность журнала, который на этом же ключе строит `T-109`.    #
+    # Учётка при этом не удаляется, а закрывается состоянием `archived`: с событием §8.7 (срез
+    # `R2b` задачи `T-109`) на ней висит ещё и `audit_log.actor` (`fk_audit_log_actor_users`,
+    # тоже `ON DELETE RESTRICT`), а журнал append-only: его очистка была бы ровно тем ручным
+    # `DELETE`, который `ADR-017` требует оформлять находкой, а не уборкойтеста. Удаление учётки
+    # вместе с её событиями означало бы «действие было, а субъекта нет».
     ids = list(session.scalars(select(User.id).where(User.login.like(f"{_LOGIN_PREFIX}%"))).all())
     if ids:
         session.execute(delete(UserSession).where(UserSession.user_id.in_(ids)))
-        session.execute(delete(User).where(User.id.in_(ids)))
+        session.execute(
+            update(User)
+            .where(User.id.in_(ids))
+            .values(state="archived")
+            .execution_options(synchronize_session=False)
+        )
         session.commit()
     session.close()
 

@@ -43,7 +43,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Final
 
 import pytest
-from sqlalchemy import Engine, create_engine, delete, event, func, select, text
+from sqlalchemy import Engine, create_engine, delete, event, func, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -138,7 +138,15 @@ def db(engine: Engine) -> Iterator[Session]:
         session.execute(delete(TotpFailure).where(TotpFailure.user_id.in_(ids)))
         session.execute(delete(TotpEnrollment).where(TotpEnrollment.user_id.in_(ids)))
         session.execute(delete(UserSession).where(UserSession.user_id.in_(ids)))
-        session.execute(delete(User).where(User.id.in_(ids)))
+        # Учётка закрывается состоянием, а не удаляется: с событиями §8.7 (срез `R2b`) на ней висит
+        # `audit_log.actor` (`fk_audit_log_actor_users`, `ON DELETE RESTRICT`), а журнал append-only
+        # и не чистится (`ADR-017`) — §4.1 и так позволяет только `state='archived'`.
+        session.execute(
+            update(User)
+            .where(User.id.in_(ids))
+            .values(state="archived")
+            .execution_options(synchronize_session=False)
+        )
         session.commit()
     session.close()
 
