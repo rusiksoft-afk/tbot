@@ -74,7 +74,14 @@ REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 --    `APPEND_ONLY_TABLES` при каждом запуске файла возвращается текущему владельцу схемы.
 --    Правило новой таблицы журнала: имя — в реестр (`packages/storage/base.py`), `ALTER TABLE` —
 --    сюда, `REVOKE` — в п. 4; перечень сверяет контрактный тест `tests/contract/test_db_roles.py`.
+-- Второй таблицей реестра append-only стал `web_audit_outbox` (журнал решений порога
+-- уведомлений §8.7, `T-116`, ревизия `0006`, `ADR-028`): в отличие от `audit_log`, который
+-- стоит в схеме с `0002`, эту таблицу создаёт сама ревизия `0006`, поэтому для неё обязательны
+-- обе строки — и возврат владения здесь, и отзыв прав в п. 4.1 ниже. Файл прав после `0006`
+-- обязан быть прогнан повторно (он идемпотентен) в порядке
+-- «миграции → `roles.sql` → приложение» (`ADR-018` п. 4, `AGENTS.md`).
 ALTER TABLE audit_log OWNER TO CURRENT_USER;
+ALTER TABLE web_audit_outbox OWNER TO CURRENT_USER;
 
 -- 3) Все таблицы текущей схемы: полный DML.
 GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO tbot_app;
@@ -87,6 +94,18 @@ GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO tbot_app;
 --    триггерами, которые меняют правило «дописали — и больше не трогают».
 GRANT SELECT, INSERT ON TABLE audit_log TO tbot_app;
 REVOKE UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE audit_log FROM tbot_app;
+
+-- 4.1) Второй журнал реестра — `web_audit_outbox` (основания уведомлений §8.7, `T-116`,
+--      `ADR-028`). Смысл отзыва тот же, что у журнала: решение порога — доказательство, а не
+--      рабочее состояние очереди доставки, поэтому права на правку строки решению не выдаются
+--      вовсе («сообщение ушло» транспорт допишет отдельной строкой, `ADR-028` п. 4). Явная
+--      выдача `SELECT`/`INSERT` нужна по той же причине, что и для журнала: после возврата
+--      владения владельцу раздача DML из п. 3 на эту таблицу не распространяется, и без явной
+--      выдачи приложение не увидело бы ни собственного решения, ни того, что порог уже
+--      срабатывал. `REFERENCES` отзывается здесь тоже: очередь уведомлений будущих вех не должна
+--      становиться целью внешних ключей, правящих эти строки.
+GRANT SELECT, INSERT ON TABLE web_audit_outbox TO tbot_app;
+REVOKE UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER ON TABLE web_audit_outbox FROM tbot_app;
 
 -- 5) Таблицы, которые появятся в следующих ревизиях, получают полный DML автоматически.
 --    Без этого новая таблица была бы невидима для приложения до ближайшего ручного `GRANT`.

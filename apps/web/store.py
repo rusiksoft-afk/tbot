@@ -80,9 +80,21 @@ from packages.common.db import sqlalchemy_url
 from packages.identity.audit import make_record
 from packages.identity.authorization import ROLE_ADMIN
 from packages.identity.backup_codes import BackupCodeError, is_sha256_hex
+from packages.identity.notify import (
+    AUTH_STEP_FULL,
+    decide_backup_code_notice,
+    decide_login_notice,
+    login_pair,
+)
 from packages.identity.passwords import hash_password, verify_password
 from packages.identity.users import CONSOLE_STATE
-from packages.storage.audit_store import append_audit_record
+from packages.storage.audit_store import (
+    NotifyDecisionRow,
+    append_audit_record,
+    append_notify_decision,
+    read_login_notice_state,
+    read_notify_decisions,
+)
 from packages.storage.models import (
     BackupCode,
     Invitation,
@@ -543,8 +555,60 @@ class Store(Protocol):
         ip: object = None,
         request_id: UUID | None = None,
         commit_now: bool = False,
+    ) -> int:
+        """Добавить запись журнала в текущую транзакцию (или зафиксировать своей).
+
+        Возвращает `id`, выданный базой. Он нужен не протоколу цепочки, а вызывающему: журнал
+        решений порога уведомлений ссылается на строку события (`web_audit_outbox.audit_id`,
+        `ADR-028` п. 2), а второй ссылкой был бы `request_id` — он повторяется на несколько
+        событий одного запроса, ссылка же обязана быть на одно событие.
+        """
+
+    def append_login_notice(
+        self,
+        *,
+        audit_id: int,
+        user_id: UUID,
+        at: datetime,
+        auth_step: str,
+        address: str | None,
+        user_agent: str | None,
     ) -> None:
-        """Добавить запись журнала в текущую транзакцию (или зафиксировать своей)."""
+        """Строка решения порога на событие `session.login` (§8.7, `ADR-028` п. 6).
+
+        Вызывается сразу после `append_audit` того же события и в той же транзакции: «событие
+        зафиксировано, решения нет» — ровно то состояние, из-за которого рассылка теряет смысл
+        (`ADR-025` п. 6). Порядок внутри один и тот же во всех точках: ключ → чтение состояния →
+        решение → вставка (`ADR-026` п. 4: сначала чтение, потом запись).
+
+        `auth_step` ≠ `full` не даёт ни строки, ни обращения к базе: поводом §8.7 «вход нового
+        пользователя» считается полный вход, первую строку `session.login` даёт парольный шаг, и
+        уведомление на него удвоило бы событие («одна точка на событие», `ADR-025` п. 6).
+        """
+
+    def append_backup_code_notice(
+        self,
+        *,
+        audit_id: int,
+        user_id: UUID,
+        backup_code_id: UUID,
+        at: datetime,
+    ) -> None:
+        """Строка решения порога на событие `backup_code.spent` (§8.7, `ADR-028` п. 6).
+
+        Порога на этот повод нет, но строка есть: решение «уведомить» обязано быть записано,
+        чтобы раздел администрирования показывал расход кода, а страж
+        `ix_web_audit_outbox_dedup_key` закрыл повторную рассылку по тому же коду. Значения кода
+        здесь нет — идентификатор строки `backup_codes` (`ADR-016` п. 4).
+        """
+
+    def notify_decisions(self, *, limit: int) -> tuple[NotifyDecisionRow, ...]:
+        """Последние решения порога уведомлений — раздел администрирования (§9.3 п. 6–10).
+
+        Строки `muted` читаются вместе со строками `notify`: администратор обязан видеть и
+        подавленные поводы, иначе раздел выглядел бы как «уведомлений не было» там, где порог
+        промолчал (`ADR-028` п. 4).
+        """
 
     def flush(self) -> None:
         """Отправить накопленное в базу, не фиксируя транзакцию.
@@ -790,7 +854,7 @@ class SqlStore:
         ip: object = None,
         request_id: UUID | None = None,
         commit_now: bool = False,
-    ) -> None:
+    ) -> int:
         record = make_record(
             action=action,
             at=at,
@@ -805,9 +869,67 @@ class SqlStore:
         # и у слоя входа нет права её задавать. Отказ вставки (`AuditChainConflictError`,
         # `AuditAppendError`) откатывает транзакцию целиком — и бизнес-изменение того же запроса
         # тоже; обработчик `create_app` отвечает на это `503`.
-        append_audit_record(self._session, record)
+        inserted_id = append_audit_record(self._session, record)
         if commit_now:
             self._session.commit()
+        return inserted_id
+
+    # ─── журнал решений порога уведомлений (§8.7, `T-116`, `ADR-028`) ───────────────────────
+    #
+    # Правила порога здесь не формулируются: их держит `packages/identity/notify.py`, а этот
+    # отрезок — путь к таблице: ключ → чтение состояния → решение → вставка (`ADR-026` п. 4).
+    # Разделение то же, что у цепочки журнала: правила в `identity`, SQL в общем слое, потому что
+    # вторым писателем решений когда-нибудь станет `jobs`, а процессам запрещено импортировать
+    # друг друга (`tests/contract/test_repo_layout.py`).
+    #
+    # Чего оффлайновая половинка доказать не может и переносить в память нельзя: частичный
+    # уникальный индекс `ix_web_audit_outbox_dedup_key` (в памяти «повтор» воспроизводится
+    # предикатом, а не отказом базы), отказ внешнего ключа
+    # `fk_web_audit_outbox_audit_id_audit_log` с `23503`, append-only права роли приложения
+    # (`UPDATE`/`DELETE` отозваны) и то, что повтор закрывает страж, а не «проверка перед
+    # вставкой». Это держит живой файл `tests/integration/test_audit_notify_db.py` (job
+    # `миграции`).
+
+    def append_login_notice(
+        self,
+        *,
+        audit_id: int,
+        user_id: UUID,
+        at: datetime,
+        auth_step: str,
+        address: str | None,
+        user_agent: str | None,
+    ) -> None:
+        if auth_step != AUTH_STEP_FULL:
+            # Шаг `'password'`: пароль принят, входа ещё нет. Ранний возврат без обращения к базе
+            # — не «проверка на всякий случай», а граница «одна точка на событие»: строка
+            # `session.login` с шагом `'password'` и строка с шагом `'full'` — один и тот же
+            # человек, и второе уведомление удвоило бы счётчик поводов (§8.7).
+            return
+        pair = login_pair(user_id=user_id, address=address, user_agent=user_agent)
+        state = read_login_notice_state(self._session, user_id=user_id, dedup_key=pair.dedup_key)
+        decision = decide_login_notice(
+            state,
+            pair=pair,
+            user_id=user_id,
+            now=at,
+            auth_step=auth_step,
+        )
+        append_notify_decision(self._session, decision=decision, audit_id=audit_id, at=at)
+
+    def append_backup_code_notice(
+        self,
+        *,
+        audit_id: int,
+        user_id: UUID,
+        backup_code_id: UUID,
+        at: datetime,
+    ) -> None:
+        decision = decide_backup_code_notice(user_id=user_id, backup_code_id=backup_code_id)
+        append_notify_decision(self._session, decision=decision, audit_id=audit_id, at=at)
+
+    def notify_decisions(self, *, limit: int) -> tuple[NotifyDecisionRow, ...]:
+        return read_notify_decisions(self._session, limit=limit)
 
     def flush(self) -> None:
         self._session.flush()

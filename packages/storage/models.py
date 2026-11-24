@@ -77,6 +77,27 @@ SESSION_AUTH_STEPS: Final[tuple[str, ...]] = ("password", "totp", "full")
 # значит получить расхождение между состоянием и временем.
 INVITATION_STATES: Final[tuple[str, ...]] = ("pending", "used", "revoked")
 
+#: Основания уведомления администратору — второй абзац TZ §8.7 дословно: «вход нового
+#: пользователя (новый IP/устройство), расход резервного кода, изменение лимитов риска,
+#: отзыв токена, включение kill-switch». Домен замкнут базой (`ck_web_audit_outbox_ground`):
+#: новое основание — это новая ревизия и новый CHECK, а не «дописали строку в кортеж». Производители
+#: есть сегодня только у первых двух имён; остальные ждут вех M2/M3, и этот перечень держит
+#: контракт `tests/contract/test_audit_notify_contract.py` (`ADR-028` п. 3).
+AUDIT_NOTIFY_GROUNDS: Final[tuple[str, ...]] = (
+    "session.login",
+    "backup_code.spent",
+    "risk.limits_changed",
+    "token.revoked",
+    "risk.kill_switch_changed",
+)
+
+#: Решение порога на момент вставки строки. `notify` — «уведомление должно уйти, когда канал
+#: появится»; `muted` — «порог решил промолчать, и это решение записано доказательством».
+#: Состояний «отправлено/доставлено» здесь нет намеренно: канал доставки не заведён (`T-714`),
+#: а таблица append-only — транспорт дописывает собственные строки, а не правит эти
+#: (`ADR-028` п. 4).
+AUDIT_NOTIFY_OUTCOMES: Final[tuple[str, ...]] = ("notify", "muted")
+
 # §8.2: «допуск ±1 шаг (по умолчанию ±1, максимум ±2)».
 # Области прикладного счётчика частоты запросов (docs/adr/ADR-007). Перечень закрытый: четыре
 # лимита §8.3 (`/login` 10 запросов/мин/IP, `/totp` 10/мин/сессия и 5/мин/IP, все
@@ -580,6 +601,100 @@ class AuditLogEntry(Base):
     hash: Mapped[str] = mapped_column(
         Text(), nullable=False, comment="SHA-256 от канонического JSON записи + hash_prev"
     )
+
+
+class WebAuditOutbox(Base):
+    """Журнал решений порога «уведомить или промолчать» по поводам §8.7 (`T-116`, `ADR-028`).
+
+    Таблица — переходник между журналом `audit_log` и каналом доставки. Канал по §8.7 —
+    Telegram, но `tgbot` на площадке не поднят и упирается в `T-714`, поэтому строка фиксирует
+    **решение** порога (основание, вердикт, причину и ссылку на строку журнала), а не обещание
+    сообщения: «уведомления нет» здесь отличимо от «уведомление не требовалось», и обе половины
+    перечитываются из раздела администрирования.
+
+    Append-only, как журнал: имя стоит в `APPEND_ONLY_TABLES`, права — `SELECT` + `INSERT`
+    (`deploy/postgres/roles.sql`, п. 2.1 и п. 4). Поэтому в таблице нет колонок «состояние
+    доставки», `attempts` и `next_try_at`: транспорт дописывает собственные строки (TZ §4.9
+    `telegram_messages_log`) либо оформляет право `UPDATE` новым ADR и новой ревизией —
+    третьего пути база не оставляет (`ADR-028` п. 4).
+
+    Повторная рассылка одного и того же повода закрыта частичным уникальным индексом
+    `ix_web_audit_outbox_dedup_key` (`dedup_key` при `NOT NULL`): ключ строит доменный слой,
+    и по нему же читается «этот адрес/устройство уже уведомляли». У строк `muted` ключа нет —
+    их на одно основание несколько намеренно, иначе порог молчал бы без доказательства.
+    """
+
+    __tablename__ = "web_audit_outbox"
+    __table_args__ = (
+        # Домен оснований — второй абзац §8.7. Значения перечислены в DDL целиком (проверка
+        # `test_домены_перечислений_совпадают_с_тз_и_записаны_в_ddl`), потому что «основание
+        # появится позже» — ровно то место, где требование ТЗ тихо сужается до удобного.
+        CheckConstraint(
+            "ground IN ('session.login', 'backup_code.spent', 'risk.limits_changed', "
+            "'token.revoked', 'risk.kill_switch_changed')",
+            name="ground",
+        ),
+        CheckConstraint("outcome IN ('notify', 'muted')", name="outcome"),
+        # Причина — код, а не свободный текст: её читает разбор, и текстовая свобода превратила бы
+        # перечень причин в шум. Словарь кодов держит `packages/identity/notify.py`.
+        CheckConstraint("reason ~ '^[a-z][a-z0-9_]{0,39}$'", name="reason_code"),
+        # Ключ деидентификации обязателен ровно у решения «уведомить»: он и есть страж повтора.
+        CheckConstraint(
+            "outcome <> 'notify' OR dedup_key IS NOT NULL", name="notify_has_dedup_key"
+        ),
+        CheckConstraint(
+            "dedup_key IS NULL OR dedup_key ~ '^[a-z0-9._:-]{1,128}$'", name="dedup_key_format"
+        ),
+        # Страж повторной рассылки: двух строк «уведомить» на одно и то же основание и тот же
+        # объект не существует. Частичность нужна потому, что `muted`-строк на ключ нет, а `NULL`
+        # в уникальном индексе не участвует (тот же приём, что у `ix_audit_log_hash_prev_linked`).
+        Index(
+            "ix_web_audit_outbox_dedup_key",
+            "dedup_key",
+            unique=True,
+            postgresql_where=text("dedup_key IS NOT NULL"),
+        ),
+        Index("ix_web_audit_outbox_at", "at"),
+        # Запрос порога («когда по этому основанию уже уведомляли эту учётную запись»).
+        Index("ix_web_audit_outbox_user_ground", "user_id", "ground"),
+        {
+            "comment": (
+                "Append-only журнал решений порога уведомлений (TZ §8.7, T-116, ADR-028). "
+                "Канал доставки не заведён: строка — решение, а не обещание сообщения. "
+                "Права приложения: SELECT + INSERT."
+            )
+        },
+    )
+
+    # Счётчик выдаёт база (та же форма, что у `audit_log`: §4.8 задаёт `bigserial`, а журнал
+    # и этот журнал пишут разные процессы).
+    id: Mapped[int] = mapped_column(BigInteger(), Identity(always=False), primary_key=True)
+    # Момент совпадает с моментом события журнала: решение принимается на том же снимке,
+    # и две разные метки дали бы расхождение «событие раньше решения» при разборе.
+    at: Mapped[datetime] = mapped_column(TIMESTAMPTZ, nullable=False, server_default=text("now()"))
+    ground: Mapped[str] = mapped_column(
+        Text(), nullable=False, comment="повод §8.7 — имя из закрытого домена"
+    )
+    outcome: Mapped[str] = mapped_column(
+        Text(), nullable=False, comment="notify — уведомить; muted — порог промолчал"
+    )
+    reason: Mapped[str] = mapped_column(Text(), nullable=False, comment="код причины решения")
+    # Ссылка на строку журнала, породившую решение: адрес, субъект и `request_id` разбора
+    # берутся оттуда, а не копируются в эту таблицу второй копией (`ADR-028` п. 2).
+    audit_id: Mapped[int] = mapped_column(
+        BigInteger(), ForeignKey("audit_log.id", ondelete="RESTRICT"), nullable=False
+    )
+    # Учётная запись, к которой относится повод. `NULL` — основание общего уровня (лимиты риска,
+    # kill-switch): учётной записи у такого события может не быть вовсе.
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid(), ForeignKey("users.id", ondelete="RESTRICT")
+    )
+    dedup_key: Mapped[str | None] = mapped_column(
+        Text(), comment="ключ деидентификации повода; NULL только у строк muted"
+    )
+    # Политика деталей та же, что у журнала: целые числа, коды и идентификаторы, но не значения
+    # учётных данных и не адрес как значение (`ADR-025` п. 2).
+    details: Mapped[dict[str, Any] | None] = mapped_column(JSONB())
 
 
 class RateBucket(Base):

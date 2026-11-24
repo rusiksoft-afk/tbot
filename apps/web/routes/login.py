@@ -336,13 +336,27 @@ async def login_submit(request: Request, store: StoreDep) -> Response:
     # Полный вход (§8.7 «вход нового пользователя», уведомление `R3`) — вторая запись
     # `session.login` с шагом `full`, её добавляют маршруты кода и резервного кода
     # (`apps/web/routes/totp.py`); различие читается из `details.auth_step`.
-    store.append_audit(
+    audit_id = store.append_audit(
         action="session.login",
         at=moment,
         actor=user.id,
         entity="session",
         entity_id=issued.record.id,
         details={"auth_step": issued.record.auth_step},
+    )
+    # Решение порога уведомления §8.7 принадлежит тому же событию и тому же транзакту, но для
+    # парольного шага строка не пишется: `append_login_notice` отсекает шаг ≠ `'full'` до всякого
+    # обращения к базе (`ADR-028` п. 6). Вызов здесь стоит намеренно: три точки `session.login`
+    # обязаны выглядеть одинаково, иначе «забыли спросить порог на этом шаге» неотличимо от
+    # «на этом шаге порога нет» (закрытый перечень точек держит контракт
+    # `tests/contract/test_audit_notify_contract.py`).
+    store.append_login_notice(
+        audit_id=audit_id,
+        user_id=user.id,
+        at=moment,
+        auth_step=issued.record.auth_step,
+        address=address,
+        user_agent=issued.record.user_agent,
     )
     store.commit()
 

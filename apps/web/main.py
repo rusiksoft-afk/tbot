@@ -41,6 +41,7 @@ from apps.web.forms import FormBodyTooLarge
 from apps.web.routes import admin_users as admin_routes
 from apps.web.routes import invitations as invitation_routes
 from apps.web.routes import login as login_routes
+from apps.web.routes import notifications as notification_routes
 from apps.web.routes import profile as profile_routes
 from apps.web.routes import sessions as session_routes
 from apps.web.routes import totp as totp_routes
@@ -153,6 +154,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(totp_routes.router)
     app.include_router(invitation_routes.router)
     app.include_router(admin_routes.router)
+    app.include_router(notification_routes.router)
 
     @app.middleware("http")
     async def _trace_middleware(request: Any, call_next: Any) -> Any:

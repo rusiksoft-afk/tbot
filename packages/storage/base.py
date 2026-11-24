@@ -45,4 +45,9 @@ class Base(DeclarativeBase):
 # источник списка: `deploy/postgres/roles.sql` обязан отозвать `UPDATE`/`DELETE`/`TRUNCATE` на
 # каждой из них, а `tests/contract/test_db_roles.py` сверяет список с SQL-файлом — иначе новая
 # таблица журнала окажется защищённой только в комментариях.
-APPEND_ONLY_TABLES: Final[frozenset[str]] = frozenset({"audit_log"})
+#
+# `audit_log` — журнал (§4.1). `web_audit_outbox` — журнал решений порога уведомлений (§8.7,
+# `T-116`, ревизия `0006`, `ADR-028`): он тоже дописываемый, потому что решение порога —
+# доказательство, а очередь доставки, и состояние «сообщение ушло» транспорт дописывает
+# отдельной строкой, а не правкой этой (`ADR-028` п. 4).
+APPEND_ONLY_TABLES: Final[frozenset[str]] = frozenset({"audit_log", "web_audit_outbox"})

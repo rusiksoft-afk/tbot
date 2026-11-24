@@ -782,6 +782,12 @@ ROUTE_AUDIT_CALLS: Final[dict[str, int]] = {
     "admin_users.py": 7,
     "invitations.py": 3,
     "login.py": 3,
+    # Страница журнала решений порога (§8.7, `T-116`, `ADR-028` п. 8): ноль — не «забыли», а
+    # состояние раздела: он только читает `web_audit_outbox` и `audit_log` не пишет. События тех
+    # же поводов пишут точки `login.py` и `totp.py`, а решение порога добавляет слой доступа
+    # (`Store.append_login_notice` / `append_backup_code_notice`) — эти точки закрыты перечнем
+    # `NOTICE_CALLS` в `tests/contract/test_audit_notify_contract.py`.
+    "notifications.py": 0,
     "profile.py": 1,
     "sessions.py": 3,
     "totp.py": 9,

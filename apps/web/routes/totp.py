@@ -106,6 +106,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Resp
 
 from apps.web.forms import form_fields
 from apps.web.qrcode import QrBuildError, QrGraphic, qr_graphic
+from apps.web.routes.login import USER_AGENT_HEADER
 from apps.web.routes.sessions import RateLimitedMutation
 from apps.web.security.csrf import csrf_context
 from apps.web.security.keys import request_key_ring
@@ -138,7 +139,7 @@ from apps.web.security.sessions import (
     session_ip,
     touch_session,
 )
-from apps.web.store import Store
+from apps.web.store import Store, clamp_user_agent
 from packages.common.clock import utc_now
 from packages.common.crypto import KeyRing
 from packages.common.logging import get_logger
@@ -974,13 +975,26 @@ async def code_submit(request: Request, principal: CodeMutation, store: StoreDep
     # которое фиксирует этот же `commit()` (`security/sessions.touch_session`). Своей фиксацией
     # событие не пользуется: сеанс и событие расходятся как раз тогда, когда зафиксирована
     # только одна половинка (`ADR-025` п. 6).
-    store.append_audit(
+    audit_id = store.append_audit(
         action="session.login",
         at=moment,
         actor=user.id,
         entity="session",
         entity_id=principal.session.id,
         details={"auth_step": principal.session.auth_step},
+    )
+    # Решение порога §8.7 («вход нового пользователя (новый IP/устройство)») — тот же транзакт и
+    # то же событие: строка сеанса, строка журнала и строка решения либо зафиксированы вместе,
+    # либо отсутствуют вместе (`ADR-025` п. 6). Материал сочетания — адрес и `User-Agent` этого
+    # запроса, а не поля записи сеанса: §8.7 говорит об этом входе, а запись сеанса держит
+    # материал шага пароля, который мог быть выпущен с другого выхода (`ADR-028` п. 5).
+    store.append_login_notice(
+        audit_id=audit_id,
+        user_id=user.id,
+        at=moment,
+        auth_step=principal.session.auth_step,
+        address=address,
+        user_agent=clamp_user_agent(request.headers.get(USER_AGENT_HEADER)),
     )
     touch_session(store, principal)
     return RedirectResponse(POST_CODE_REDIRECT, status_code=302)
@@ -1682,13 +1696,24 @@ async def recovery_submit(request: Request, principal: CodeMutation, store: Stor
     # §8.7 «расход резервного кода». В деталях — идентификатор строки, а не значение: ключи вида
     # `code`/`code_hash` отклоняет протокол (`ADR-025` п. 2), а `id` достаточно, чтобы соотнести
     # факт с таблицей `backup_codes`.
-    store.append_audit(
+    spent_audit_id = store.append_audit(
         action="backup_code.spent",
         at=moment,
         actor=user.id,
         entity="user",
         entity_id=user.id,
         details={"backup_code_id": str(row.id), "spare_left": spare_left},
+    )
+    # Расход резервного кода — второй из двух поводов §8.7, у которых есть производитель.
+    # Порога на него нет сознательно (§8.7 называет этот повод редким и значимым), но строка
+    # решения обязана быть: без неё «уведомления не было» неотличимо от «порог промолчал», а
+    # повторная рассылка по тому же коду закрыта стражем `ix_web_audit_outbox_dedup_key`.
+    # Значения кода здесь нет — только идентификатор строки (`ADR-016` п. 4).
+    store.append_backup_code_notice(
+        audit_id=spent_audit_id,
+        user_id=user.id,
+        backup_code_id=row.id,
+        at=moment,
     )
     advance_auth_step(principal.session, step="full", now=moment)
     # Второй фактор пройден: по §8.7 это и есть «вход» учётной записи с 2FA — вторая строка
@@ -1698,13 +1723,26 @@ async def recovery_submit(request: Request, principal: CodeMutation, store: Stor
     # которое фиксирует этот же `commit()` (`security/sessions.touch_session`). Своей фиксацией
     # событие не пользуется: сеанс и событие расходятся как раз тогда, когда зафиксирована
     # только одна половинка (`ADR-025` п. 6).
-    store.append_audit(
+    login_audit_id = store.append_audit(
         action="session.login",
         at=moment,
         actor=user.id,
         entity="session",
         entity_id=principal.session.id,
         details={"auth_step": principal.session.auth_step},
+    )
+    # Резервный код поднимает сессию до `'full'`, поэтому этот вход полный, и порог §8.7
+    # спрашивается на нём на тех же основаниях, что и на странице кода (`ADR-016` п. 9).
+    # Сочетание адрес+устройство здесь то же, что и на парольном шаге этой церемонии, поэтому
+    # второго уведомления, как правило, не будет: ключ занят строкой `notify`, а решение про «уже
+    # уведомляли» пишется строкой `muted` (`ADR-028` п. 6).
+    store.append_login_notice(
+        audit_id=login_audit_id,
+        user_id=user.id,
+        at=moment,
+        auth_step=principal.session.auth_step,
+        address=address,
+        user_agent=clamp_user_agent(request.headers.get(USER_AGENT_HEADER)),
     )
     touch_session(store, principal)
     log.info(

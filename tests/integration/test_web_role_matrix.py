@@ -54,6 +54,7 @@ from apps.web.routes.admin_users import (
     ADMIN_USERS_NOTE,
     ADMIN_USERS_PATH,
 )
+from apps.web.routes.notifications import ADMIN_NOTIFICATIONS_PATH
 from apps.web.security.authorization import DENIAL_BODY
 from apps.web.security.csrf import CSRF_FORM_FIELD, csrf_token_for
 from apps.web.security.sessions import (
@@ -254,6 +255,13 @@ ROUTE_POLICY: Final[dict[tuple[str, str], Policy]] = {
         TIER_ADMIN,
         frozenset({200}),
         "раздел администратора из карты §9.3 п. 6: адрес занят допуском, содержимое строит срез `R7b` (`T-105`)",
+    ),
+    (ADMIN_NOTIFICATIONS_PATH, "GET"): Policy(
+        TIER_ADMIN,
+        frozenset({200}),
+        "журнал решений порога уведомлений (§8.7, `T-116`, `ADR-028`): страница только "
+        "читает `web_audit_outbox`, мутаций нет, поэтому CSRF-цепочка не участвует "
+        "(`ADR-008`); канал доставки не заведён (`T-714`), и раздел не обещает отправку",
     ),
     (ADMIN_INVITATIONS_PATH, "POST"): Policy(
         TIER_ADMIN,

@@ -43,8 +43,18 @@ from packages.common.ids import uuid7
 from packages.identity.audit import build_audit_entry, make_record
 from packages.identity.authorization import ROLE_ADMIN
 from packages.identity.backup_codes import BackupCodeError, is_sha256_hex
+from packages.identity.notify import (
+    AUTH_STEP_FULL,
+    GROUND_LOGIN,
+    LoginNoticeState,
+    NotifyDecision,
+    decide_backup_code_notice,
+    decide_login_notice,
+    login_pair,
+)
 from packages.identity.sessions import IssuedSession, token_hash_of
 from packages.identity.users import CONSOLE_STATE, new_user
+from packages.storage.audit_store import NotifyDecisionRow
 from packages.storage.models import (
     AuditLogEntry,
     BackupCode,
@@ -83,6 +93,12 @@ class MemoryStore:
         self._backup_codes: list[BackupCode] = []
         self._invitations: list[Invitation] = []
         self.audit_rows: list[AuditLogEntry] = []
+        self.notify_rows: list[NotifyDecisionRow] = []
+        # Ключи деидентификации решений держатся отдельным списком: `NotifyDecisionRow` —
+        # это колонки раздела администрирования, и `dedup_key` в них не выводится
+        # (`ADR-028` п. 8), а страж повтора в памяти обязан работать по тому же ключу, что
+        # частичный уникальный индекс на базе.
+        self.notify_keys: list[str | None] = []
         self.commits: int = 0
         self.hash_lookups: list[str] = []
 
@@ -368,7 +384,7 @@ class MemoryStore:
         ip: object = None,
         request_id: UUID | None = None,
         commit_now: bool = False,
-    ) -> None:
+    ) -> int:
         record = make_record(
             action=action,
             at=at,
@@ -383,6 +399,98 @@ class MemoryStore:
         self.audit_rows.append(build_audit_entry(replace(record, hash_prev=tail)))
         if commit_now:
             self.commits += 1
+        # Порядокный номер вместо `id` базы: `IDENTITY` в памяти нет, а решению порога нужен
+        # только носитель ссылки (`web_audit_outbox.audit_id`), не его значение.
+        return len(self.audit_rows)
+
+    # ─── журнал решений порога уведомлений (§8.7, `T-116`, `ADR-028`) ───────────────────
+    #
+    # Зеркало `SqlStore`: те же доменные правила (`packages/identity/notify.py` — одна копия на
+    # обе половинки) и тот же порядок вызовов: ключ → чтение состояния → решение → вставка
+    # (`ADR-026` п. 4). Чего память доказать не может и переносить сюда нельзя: частичный
+    # уникальный индекс `ix_web_audit_outbox_dedup_key` (здесь «повтор» воспроизводится
+    # предикатом, а не отказом базы с `23505`), отказ внешнего ключа
+    # `fk_web_audit_outbox_audit_id_audit_log` с `23503`, поведение `ON CONFLICT DO NOTHING
+    # RETURNING id` и append-only права роли приложения (`UPDATE`/`DELETE` отозваны). Это держит
+    # живой файл `tests/integration/test_audit_notify_db.py` (job `миграции`).
+
+    def append_login_notice(
+        self,
+        *,
+        audit_id: int,
+        user_id: UUID,
+        at: datetime,
+        auth_step: str,
+        address: str | None,
+        user_agent: str | None,
+    ) -> None:
+        if auth_step != AUTH_STEP_FULL:
+            return
+        pair = login_pair(user_id=user_id, address=address, user_agent=user_agent)
+        last: datetime | None = None
+        for row in self.notify_rows:
+            if (
+                row.ground == GROUND_LOGIN
+                and row.user_id == user_id
+                and row.outcome == "notify"
+                and (last is None or row.at > last)
+            ):
+                last = row.at
+        decision = decide_login_notice(
+            LoginNoticeState(known_pair=self._dedup_key_seen(pair.dedup_key), last_notify_at=last),
+            pair=pair,
+            user_id=user_id,
+            now=at,
+            auth_step=auth_step,
+        )
+        self._record_notify(decision, audit_id=audit_id, at=at)
+
+    def append_backup_code_notice(
+        self,
+        *,
+        audit_id: int,
+        user_id: UUID,
+        backup_code_id: UUID,
+        at: datetime,
+    ) -> None:
+        decision = decide_backup_code_notice(user_id=user_id, backup_code_id=backup_code_id)
+        self._record_notify(decision, audit_id=audit_id, at=at)
+
+    def notify_decisions(self, *, limit: int) -> tuple[NotifyDecisionRow, ...]:
+        return tuple(sorted(self.notify_rows, key=lambda row: row.id, reverse=True))[:limit]
+
+    def _dedup_key_seen(self, key: str) -> bool:
+        return any(seen == key for seen in self.notify_keys)
+
+    def _record_notify(self, decision: NotifyDecision, *, audit_id: int, at: datetime) -> None:
+        """Зеркало `append_notify_decision`: та же граница повтора, без SQL.
+
+        `None` от домена здесь тоже возможен: ключ уже занят строкой `notify` — в памяти это
+        пропуск строки, на базе — `ON CONFLICT DO NOTHING` без возвращённого `id`. Различить эти
+        два ответа памяти нельзя (индекса нет), поэтому проверка «повторного уведомления нет»
+        живёт в живом файле, а здесь проверяется только договорённость слоя: решение вынесено,
+        строка одна.
+        """
+        if decision.dedup_key is not None and self._dedup_key_seen(decision.dedup_key):
+            return
+        self.notify_keys.append(decision.dedup_key)
+        login: str | None = None
+        for user in self._users.values():
+            if user.id == decision.user_id:
+                login = user.login
+                break
+        self.notify_rows.append(
+            NotifyDecisionRow(
+                id=len(self.notify_rows) + 1,
+                at=at,
+                ground=decision.ground,
+                outcome=decision.outcome,
+                reason=decision.reason,
+                audit_id=audit_id,
+                user_id=decision.user_id,
+                login=login,
+            )
+        )
 
     def flush(self) -> None:
         """Зеркало `SqlStore.flush`: в памяти идентификаторы уже проставлены на `add`.

@@ -245,6 +245,21 @@ def _details_copy(details: Mapping[str, Any]) -> dict[str, Any]:
     return cast("dict[str, Any]", json.loads(json.dumps(details, ensure_ascii=False)))
 
 
+def validate_details(details: Mapping[str, Any]) -> None:
+    """Проверить значения `details` без копии и без построения записи журнала.
+
+    Нужен второму носителю тех же правил — журналу решений порога уведомлений
+    (`web_audit_outbox.details`, `ADR-028` п. 2): политика значений одна («идентификаторы, коды и
+    целые счётчики, но не значения учётных данных и не адрес как значение»), и вторая копия
+    правил неизбежно разошлась бы с первой, оставив одну таблицу защищённой лучше другой.
+
+    Публичной функцией, а не `_normalize_details`, сделана потому, что проверяющему не нужна ни
+    копия, ни канонизация: решение порога живёт в своей таблице и в хэше журнала не участвует.
+    Отклонение — тот же `AuditRecordError`, чтобы вызывающий не различал два отказа.
+    """
+    _validate_details_value(details, path="details")
+
+
 def _normalize_details(details: Mapping[str, Any] | None) -> dict[str, Any] | None:
     if details is None:
         return None

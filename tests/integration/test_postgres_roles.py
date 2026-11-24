@@ -11,6 +11,10 @@
 Что закреплено:
 
 * `INSERT` в `audit_log` ролью приложения проходит, `UPDATE`/`DELETE`/`TRUNCATE` — отказ `42501`;
+* у журнала решений порога уведомлений `web_audit_outbox` (`T-116`, `ADR-028`, ревизия `0006`) та же
+  граница: `SELECT`+`INSERT` проходят, правка и отзыв — `42501`, владение — у роли-владельца схемы,
+  а страж повторной рассылки (`ix_web_audit_outbox_dedup_key`) отклоняет второй тот же ключ и под
+  ролью приложения (`23505`) — иначе «append-only» новой таблицы зависел бы от кода приложения;
 * счётчик `audit_log.id` выдаётся базой без прав на последовательность: у identity-колонки
   PostgreSQL проверяет право `INSERT` на таблицу (у `serial` пришлось бы выдавать
   `USAGE ON SEQUENCE` — различие закреплено поведенчески, потому что прав на последовательности
@@ -50,6 +54,7 @@ _ROLES_SQL: Final = (
 ).read_text(encoding="utf-8")
 _APP_ROLE: Final = "tbot_app"
 _INSUFFICIENT_PRIVILEGE: Final = "42501"
+_UNIQUE_VIOLATION: Final = "23505"
 _HASH: Final = "c" * 64
 _ARGON2ID: Final = (
     "$argon2id$v=19$m=65536,t=3,p=4$c29tZXNhbHRzb29sZA"
@@ -109,8 +114,9 @@ def _denied(
     sql: str,
     what: str,
     params: tuple[object, ...] = (),
+    expected: str = _INSUFFICIENT_PRIVILEGE,
 ) -> None:
-    """Ожидаем отказ ровно по правам (`42501`), а не по синтаксису или по данным.
+    """Ожидаем отказ ровно ожидаемого класса (`42501` по умолчанию), а не по синтаксису.
 
     Код ошибки принципиален: при пустом или кривом файле прав запрос мог бы упасть по другой
     причине, и проверка осталась бы зелёной, не проверяя ничего.
@@ -129,11 +135,11 @@ def _denied(
         connection.execute("ROLLBACK TO SAVEPOINT denied_probe")
         connection.execute("RELEASE SAVEPOINT denied_probe")
 
-    assert captured is not None, f"{what}: право не отозвано — запрос выполнился без ошибки"
+    assert captured is not None, f"{what}: отказ не получен — запрос выполнился без ошибки"
     sqlstate = getattr(captured, "sqlstate", None)
-    assert sqlstate == _INSUFFICIENT_PRIVILEGE, (
-        f"{what}: ожидался отказ по правам ({_INSUFFICIENT_PRIVILEGE}), получено "
-        f"{type(captured).__name__} sqlstate={sqlstate}: {captured}"
+    assert sqlstate == expected, (
+        f"{what}: ожидался код {expected}, получено {type(captured).__name__} "
+        f"sqlstate={sqlstate}: {captured}"
     )
 
 
@@ -185,6 +191,27 @@ def test_audit_append_only_role(app_session: psycopg.Connection[tuple[Any, ...]]
     assert readable[0] >= 1, "приложение обязано читать журнал после отказов на правку"
 
 
+def _notify_row_id(
+    connection: psycopg.Connection[tuple[Any, ...]], *, audit_id: int, dedup_key: str
+) -> int:
+    """Одна строка решений порога, вставленная текущей ролью: возвращает выданный базой `id`.
+
+    `user_id` — `NULL`: решение входа привязано к учётной записи полем `user_id`, но для проверки
+    прав эта колонка не важна, а выдуманный идентификатор отклонился бы внешним ключом (`23503`),
+    и проверка разбирала бы не то.
+    """
+    row = connection.execute(
+        "INSERT INTO web_audit_outbox (at, ground, outcome, reason, audit_id, user_id, dedup_key, "
+        "details) VALUES (now(), 'session.login', 'notify', 'new_pair', %s, NULL, %s, "
+        "'{}'::jsonb) RETURNING id",
+        (audit_id, dedup_key),
+    ).fetchone()
+    assert row is not None, "вставка в web_audit_outbox не вернула строку"
+    record_id = row[0]
+    assert isinstance(record_id, int), f"web_audit_outbox.id имеет неожиданный тип {type(row[0])}"
+    return record_id
+
+
 def test_счётчик_журнала_выдаёт_база_без_прав_на_последовательность(
     app_session: psycopg.Connection[tuple[Any, ...]],
 ) -> None:
@@ -205,6 +232,100 @@ def test_счётчик_журнала_выдаёт_база_без_прав_н�
     )
     first, second = _audit_row_id(app_session), _audit_row_id(app_session)
     assert second > first, f"identity журнала не растёт: {first} → {second}"
+
+
+def test_outbox_решений_порога_append_only_ролью_приложения(
+    app_session: psycopg.Connection[tuple[Any, ...]],
+    admin_connection: psycopg.Connection[tuple[Any, ...]],
+) -> None:
+    """Та же граница, что у журнала, у новой таблицы ревизии `0006` (`T-116`, `ADR-028`).
+
+    Обязательный шаг прав после ревизии с новой журнальной таблицей (`AGENTS.md`, `ADR-022` п. 3,
+    признак — `op.create_table` в `upgrade()`) состоит из трёх мест: имя в `APPEND_ONLY_TABLES`,
+    `ALTER TABLE … OWNER TO CURRENT_USER` (п. 2.1) и `REVOKE` (п. 4). Контрактная проверка
+    `tests/contract/test_db_roles.py` сверяет перечень с текстом файла, а здесь измеряется
+    поведение: приложение способно только дописать строку решения и прочитать её.
+
+    Без этой проверки «append-only» новой таблицы зависел бы от кода приложения: тот же процесс,
+    который пишет решения, смог бы их и править — в частности стереть строку `muted`, чтобы скрыть
+    что порог промолчал (§8.7 сверяется по таблице решений, а не по памяти приложения).
+
+    Отдельно держится страж повторной рассылки под ролью приложения: отказ `23505`, а не `42501`,
+    то есть частичный уникальный индекс `ix_web_audit_outbox_dedup_key` работает для той роли,
+    которая пишет. Если бы индекс потерял уникальность или предикат, второй вызов того же писателя
+    дал бы второе уведомление на одно сочетание, и приложение обнаружило бы это только на площадке.
+    """
+    # Ключ строится по тому же формату, что и в `packages/identity/notify.py` (литерал здесь без
+    # импорта домена: файл проверяет права базы, а не коды приложения, и связывать их нечем).
+    key = f"session.login:{uuid.uuid4().hex}:{'a' * 32}"
+    first_audit = _audit_row_id(app_session)
+    decision_id = _notify_row_id(app_session, audit_id=first_audit, dedup_key=key)
+    assert decision_id > 0, "web_audit_outbox.id обязан выдавать база"
+
+    second_audit = _audit_row_id(app_session)
+    _denied(
+        app_session,
+        "INSERT INTO web_audit_outbox (at, ground, outcome, reason, audit_id, user_id, dedup_key, "
+        "details) VALUES (now(), 'session.login', 'notify', 'new_pair', %s, NULL, %s, '{}'::jsonb)",
+        "повтор ключа деидентификации ролью приложения",
+        (second_audit, key),
+        expected=_UNIQUE_VIOLATION,
+    )
+
+    _denied(
+        app_session,
+        "UPDATE web_audit_outbox SET outcome = 'muted' WHERE id = %s",
+        "UPDATE web_audit_outbox ролью приложения",
+        (decision_id,),
+    )
+    _denied(
+        app_session,
+        "DELETE FROM web_audit_outbox WHERE id = %s",
+        "DELETE FROM web_audit_outbox ролью приложения",
+        (decision_id,),
+    )
+    _denied(app_session, "TRUNCATE web_audit_outbox", "TRUNCATE web_audit_outbox ролью приложения")
+    _denied(
+        app_session,
+        "ALTER TABLE web_audit_outbox OWNER TO tbot_app",
+        "смена владельца журнала решений порога",
+    )
+
+    granted_sequence = app_session.execute(
+        "SELECT has_sequence_privilege(%s, 'web_audit_outbox_id_seq'::regclass, 'USAGE')",
+        (_APP_ROLE,),
+    ).fetchone()
+    assert granted_sequence is not None, "has_sequence_privilege не вернул строку"
+    assert not granted_sequence[0], (
+        "роли приложения выдано право на последовательность журнала решений: файл прав не должен "
+        "его выдавать, identity-колонка проверяет право INSERT на таблицу"
+    )
+
+    closed = [
+        privilege
+        for privilege in ("update", "delete", "truncate", "references", "trigger")
+        if _has_table_privilege(admin_connection, "web_audit_outbox", privilege)
+    ]
+    assert not closed, f"роли приложения не отозваны права {closed} на web_audit_outbox"
+    for privilege in ("select", "insert"):
+        assert _has_table_privilege(admin_connection, "web_audit_outbox", privilege), (
+            f"приложению не выдано право {privilege} на web_audit_outbox: раздел администратора "
+            "или писатель решений не работают"
+        )
+
+    owner = admin_connection.execute(
+        "SELECT tableowner FROM pg_tables WHERE tablename = 'web_audit_outbox'"
+    ).fetchone()
+    assert owner is not None, "в базе нет таблицы web_audit_outbox"
+    assert owner[0] != _APP_ROLE, (
+        f"журнал решений принадлежит роли {owner[0]}: приложение стало владельцем таблицы, "
+        "и append-only снова стал текстом, а не правом базы"
+    )
+
+    readable = app_session.execute("SELECT count(*) FROM web_audit_outbox").fetchone()
+    assert readable is not None, "счётчик решений не вернул строку"
+    assert isinstance(readable[0], int), "count(*) имеет неожиданный тип"
+    assert readable[0] >= 1, "приложение обязано читать решения после отказов на правку"
 
 
 def test_обычные_таблицы_доступны_роли_приложения_на_полный_dml(
