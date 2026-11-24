@@ -122,6 +122,7 @@
           <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
           <button type="submit">Разблокировать</button>
         </form>
+        <a href="{{ row.role_url }}">Сменить роль</a>
         <a href="{{ row.archive_url }}">В архив</a>
       </td>
     </tr>

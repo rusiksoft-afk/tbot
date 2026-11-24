@@ -16,6 +16,12 @@
   `archive_account`), а не пишут в `users.state`: правило переходов живёт в
   `packages/identity/users.STATE_TRANSITIONS`, и вторая копия правила в обработчике разошлась бы
   при первой же правке (`ADR-020` п. 1: «маршруты не знают правил перехода»);
+* **смена роли — единственное действие раздела, которое правит поле, а не состояние**: таблицы
+  переходов для ролей нет (любое из трёх значений §1.1 доступно любой видимой записи, кроме
+  архивированной), и правило «роль меняется только через домен» держит `change_role`
+  (`packages/identity/users.py`). Страж последнего живого администратора смотрит при этом на
+  **будущую** роль (`ensure_role_change_keeps_admin` — до правки): вызванный после правки
+  `ensure_not_last_admin` смотрит на текущую роль и понижения бы не увидел (§8.7, `ADR-020` п. 6);
 * **кнопки показаны для каждой учётной записи**: недопустимый переход отвергает сервер и
   объясняет причину на той же странице. «Показывать только разрешённые кнопки» означало бы
   продублировать таблицу переходов в разметке — ровно та дыра, из-за которой скрытая кнопка
@@ -43,13 +49,13 @@
    мутации, поэтому «забыть охрану» в этом файле невозможно без падения контрактной проверки
    покрытия (`tests/contract/test_web_roles_contract.py`).
 
-Чего здесь нет специально. Ни смены роли: `account.role_changed` в реестре §8.7 есть, а маршрута
-смены роли в M0 нет (он появится вместе с разделом профиля `T-111`), поэтому и события такого в
-разделе не бывает. Ни колонку «последний вход», ни колонок 2FA и Telegram (§9.3 п. 6) — это данные
-`T-109`, `T-103` и `T-409`, и выдумывать их источник означало бы решить эти задачи молча. Ни
-сброса 2FA администратором (`T-103`): у действия нет доменной половины, а завести маршрут без неё
-нельзя. Ни приглашения «по выбору администратора» без адресата: §1.2 требует e-mail или логин, и
-это держит домен (`InvitationTargetError`), а не форма.
+Чего здесь нет специально. Ни колонки «последний вход», ни колонок 2FA и Telegram (§9.3 п. 6) — это
+данные `T-109`, `T-103` и `T-409`, и выдумывать их источник означало бы решить эти задачи молча. Ни
+сброса 2FA администратором: имя `totp.revoked` из реестра §8.7 пока без производителя, доменную
+половину (`revoke_enrollment`) вызывает только перепривязка самого человека, а маршрут без решения о
+том, что делать с живыми сеансами, заводить нельзя — это срез `R4b` задачи `T-109`. Ни приглашения
+«по выбору администратора» без адресата: §1.2 требует e-mail или логин, и это держит домен
+(`InvitationTargetError`), а не форма.
 
 Срез `R2b` задачи `T-109` добавляет в раздел записи `audit_log` о состоявшихся действиях
 (§8.7, `ADR-025` п. 6): `invitation.issued`, `invitation.revoked`, `account.approved` и
@@ -85,7 +91,10 @@ from packages.common.clock import to_msk, utc_now
 from packages.common.logging import get_logger
 from packages.identity.authorization import (
     ADMIN_TIER,
+    ROLE_ADMIN,
     ROLE_LADDER,
+    ROLE_OPERATOR,
+    ROLE_VIEWER,
     RoleOutsideDomainError,
 )
 from packages.identity.invitations import (
@@ -101,7 +110,9 @@ from packages.identity.users import (
     LoginFormatError,
     approve_account,
     archive_account,
+    change_role,
     ensure_not_last_admin,
+    ensure_role_change_keeps_admin,
     suspend_account,
     unsuspend_account,
 )
@@ -138,6 +149,11 @@ ADMIN_ACCOUNT_APPROVE_PATH: Final = f"{ADMIN_USERS_PATH}/{{{USER_ID_PARAM}}}/app
 ADMIN_ACCOUNT_SUSPEND_PATH: Final = f"{ADMIN_USERS_PATH}/{{{USER_ID_PARAM}}}/suspend"
 ADMIN_ACCOUNT_UNSUSPEND_PATH: Final = f"{ADMIN_USERS_PATH}/{{{USER_ID_PARAM}}}/unsuspend"
 ADMIN_ACCOUNT_ARCHIVE_PATH: Final = f"{ADMIN_USERS_PATH}/{{{USER_ID_PARAM}}}/archive"
+
+#: Смена роли (§9.3 п. 6 «смена роли», §8.7 «изменение … роли»). Отдельное окно со списком
+#: значений, а не общий `admin_confirm.html`: у того нет поля выбора, и подтверждение, которое не
+#: показывает, какой именно ролью человек подтверждает запись, не называет следствия (§9.1).
+ADMIN_ACCOUNT_ROLE_PATH: Final = f"{ADMIN_USERS_PATH}/{{{USER_ID_PARAM}}}/role"
 
 #: Имена действий: они же — сегменты адресов выше, они же — ключи выбора доменного действия, они
 #: же — код действия в деталях `audit_log` (§8.7). Один список на все употребления, иначе адрес,
@@ -272,6 +288,14 @@ ACTION_NOTES: Final[dict[str, str]] = {
         "доступ открыт. Сначала передайте права другой учётной записи, иначе система останется "
         "без того, кто способен включить её обратно."
     ),
+    "role_changed": (
+        "Роль изменена. Живые сеансы этой записи не отозваны: новая роль проверяется на каждом "
+        "следующем охраняемом запросе (ADR-017 п. 7)."
+    ),
+    "role_same": "Роль не изменилась: выбранное значение совпадает с текущим.",
+    "refused_role_state": (
+        "Роль не изменена: архивированная запись роль не меняет — состояние терминально (§1.2)."
+    ),
 }
 
 #: Метки состояний учётной записи для человека (§9.1). Значения держит домен §4.1; метка вне
@@ -297,6 +321,51 @@ EMPTY_QUEUE_NOTE: Final = "Учётных записей, которые жду�
 EMPTY_ACCOUNTS_NOTE: Final = "Учётных записей ещё нет: пригласите первую ссылку ниже."
 EMPTY_INVITATIONS_NOTE: Final = "Открытых приглашений нет."
 
+# ─── смены роли: подписи и предупреждения (§9.3 п. 6) ───────────────────────────────────────
+
+#: Подписи ролей для человека (§1.1: «администратор, оператор, наблюдатель»). Набор равен `ROLES`:
+#: равность проверяет `tests/contract/test_web_roles_contract.py` — метка вне набора означала бы
+#: «роль есть в списке выбора, но база её отвергает». Метки держит представление: домен §1.1
+#: оперирует значениями ролей, а не словами.
+ROLE_LABELS: Final[dict[str, str]] = {
+    ROLE_VIEWER: "наблюдатель",
+    ROLE_OPERATOR: "оператор",
+    ROLE_ADMIN: "администратор",
+}
+
+#: Предупреждение на окне смены роли (§9.1: подтверждение обязано называть следствие). Главное
+#: следствие здесь — не новое значение, а набор открывающихся разделов, и отдельно сказано про
+#: сеансы: в отличие от блокировки их не отзывают (ADR-017 п. 7), и иначе это заметили бы только
+#: после действия.
+ROLE_WARNING: Final = (
+    "Роль решает, какие разделы и действия доступны учётной записи. Живые сеансы при смене роли не "
+    "отзываются: новая роль проверяется на каждом следующем охраняемом запросе."
+)
+
+#: Тот же смысл про собственную запись: понижение закрывает доступ к разделу администратора, и
+#: возвращать роль придётся другому живому администратору (`ADR-020` п. 6 оставляет такое действие
+#: возможным, если в системе есть второй живой администратор).
+ROLE_SELF_WARNING: Final = (
+    "Это ваша собственная учётная запись: после понижения раздел администрирования станет "
+    "недоступен, и возвращать роль придётся другому живому администратору."
+)
+
+#: Подсказка, когда цель — единственный живой администратор. Отказ предсказуем до `POST`, поэтому
+#: он показывается здесь, а не после попытки: человек сэкономит действие, а проверка останется той
+#: же (`ensure_role_change_keeps_admin` смотрит на будущую роль до правки).
+ROLE_LAST_ADMIN_HINT: Final = (
+    "Это единственный живой администратор: понизить его нельзя, пока права не получит другая "
+    "запись. Оставить администратором или повысить другую запись — можно (§8.7, ADR-020 п. 6)."
+)
+
+#: Почему у архивированной записи нет кнопки подтверждения: §1.2 делает `archived` терминальным, и
+#: показывать действие, которое заведомо отвергается, означало бы заставлять человека подтверждать
+#: то, чего система не сделает.
+ROLE_ARCHIVED_HINT: Final = (
+    "Архивированная запись роль не меняет: состояние терминально (§1.2), и менять её роль — значит "
+    "записать в журнал изменение, которое ни на что не влияет."
+)
+
 # ─── строки списков ────────────────────────────────────────────────────────────────────────────
 
 
@@ -321,6 +390,7 @@ class AccountRow:
     suspend_url: str
     unsuspend_url: str
     archive_url: str
+    role_url: str
 
 
 @dataclass(frozen=True)
@@ -381,6 +451,7 @@ def _account_row(principal: Principal, account: User) -> AccountRow:
         suspend_url=f"{ADMIN_USERS_PATH}/{identifier}/suspend",
         unsuspend_url=f"{ADMIN_USERS_PATH}/{identifier}/unsuspend",
         archive_url=f"{ADMIN_USERS_PATH}/{identifier}/archive",
+        role_url=f"{ADMIN_USERS_PATH}/{identifier}/role",
     )
 
 
@@ -967,3 +1038,167 @@ def archive_submit(user_id: str, principal: AdminMutation, store: StoreDep) -> R
     if target is None:
         return object_gone_response()
     return _close_access(store, target, principal, action=ACTION_ARCHIVE, moment=utc_now())
+
+
+# ─── смена роли (§9.3 п. 6 «смена роли», §8.7 «изменение … роли») ────────────────────────────
+
+
+def _role_options(current: str) -> list[tuple[str, str, bool]]:
+    """Строки выбора роли: значение, подпись, признак «это текущее значение».
+
+    Порядок — лестница `ROLE_LADDER` (§1.1: `viewer ⊂ operator ⊂ admin`), а не алфавит: список
+    читается снизу вверх так же, как читаются права, и переставить его местами значит изменить то,
+    что человек видит первым, не изменив ничего в допуске.
+
+    Текущее значение помечается, а не скрывается и не блокируется: «оставить как было» — тоже
+    осмысленный ответ формы, и обработчик отвечает на него кодом `role_same`, а не молчанием.
+    """
+    return [(role, ROLE_LABELS.get(role, role), role == current) for role in ROLE_LADDER]
+
+
+def _render_role_confirm(
+    request: Request, principal: Principal, target: User, *, hints: list[str]
+) -> Response:
+    """Окно смены роли: объект, текущее значение, выбор нового и следствия (§9.1).
+
+    Кнопка подтверждения есть только когда действие возможно: для архивированной записи показывать
+    «подтвердить» и заведомо отказать в `POST` означало бы завести действие без шансов исполниться.
+    При этом сам `GET` остаётся доступен для любой видимой записи (§4.1: архивная строка видна
+    всегда) — страница объясняет, почему действия нет.
+    """
+    context = {
+        "page_title": "Сменить роль",
+        "warning": ROLE_WARNING,
+        "hints": hints,
+        "object_kind": "учётная запись",
+        "object_label": target.login,
+        "object_state": (
+            f"роль {ROLE_LABELS.get(target.role, target.role)}, {_state_label(target.state)}"
+        ),
+        "roles": _role_options(target.role),
+        "field_role": FIELD_ROLE,
+        "change_allowed": target.state != "archived",
+        "archived_hint": ROLE_ARCHIVED_HINT,
+        "action_url": f"{ADMIN_USERS_PATH}/{target.id}/role",
+        "cancel_url": ADMIN_USERS_PATH,
+    } | csrf_context(principal)
+    response: HTMLResponse = request.app.state.templates.TemplateResponse(
+        request, "admin_role_change.html", context
+    )
+    return response
+
+
+@router.get(ADMIN_ACCOUNT_ROLE_PATH, response_class=HTMLResponse)
+def role_confirm(
+    request: Request, user_id: str, principal: AdminSession, store: StoreDep
+) -> Response:
+    """Показать окно смены роли: текущее значение, три роли и следствия (§9.1).
+
+    Предупреждения считаются здесь, а не в шаблоне: «единственный ли это живой администратор» —
+    вопрос к репозиторию (`active_admin_count`), а разметка счёт вести не должна (второй календарь
+    и второй счётчик разошлись бы с доменом при первой же правке).
+    """
+    target = _account_or_none(store, user_id)
+    if target is None:
+        return object_gone_response()
+    hints: list[str] = []
+    if _is_self(target, principal):
+        hints.append(ROLE_SELF_WARNING)
+    if (
+        target.state == "active"
+        and target.role == ROLE_ADMIN
+        and store.active_admin_count(except_user_id=target.id) == 0
+    ):
+        hints.append(ROLE_LAST_ADMIN_HINT)
+    return _render_role_confirm(request, principal, target, hints=hints)
+
+
+@router.post(ADMIN_ACCOUNT_ROLE_PATH, response_class=Response)
+async def role_submit(
+    request: Request, user_id: str, principal: AdminMutation, store: StoreDep
+) -> Response:
+    """Сменить роль учётной записи (§9.3 п. 6 «смена роли», §8.7 «изменение … роли»).
+
+    Порядок тот же, что `_close_access` держит для состояний (`ADR-020` п. 6 пункты 1–2): счёт
+    живых администраторов **до** правки, страж последнего администратора — до правки, сама правка —
+    из доменной функции `change_role`, а не присваиванием поля в обработчике, строка `audit_log` —
+    той же транзакцией, один `commit()` на всё.
+
+    Порядок стража принципиален: `ensure_not_last_admin` смотрит на **текущую** роль, поэтому после
+    `change_role` понижение он бы не увидел (роль уже не `admin` → ранний возврат). Отсюда
+    `ensure_role_change_keeps_admin` до правки — она проверяет будущую роль и вызывает тот же
+    доменный страж, не заводя второго правила в обработчике.
+
+    Живые сеансы цели не отзываются: роль читается из репозитория на каждый охраняемый запрос
+    (`ADR-017` п. 7), поэтому понижение видно следующему же запросу, а §8.3 требует немедленного
+    отзыва только при блокировке и архивировании. Именно это отличие написано на окне подтверждения
+    (`ROLE_WARNING`): иначе его заметили бы только после действия.
+
+    Значение роли вне набора §1.1 — ошибка поля, а не отказ допуска: ответ — страница раздела с
+    `400` и формулировкой домена, как у выпуска приглашения. Вторая формулировка в представлении
+    разошлась бы с проверкой `ensure_role` при первой же правке. В журнал процесса формулировка не
+    уходит: она содержит значение поля.
+    """
+    fields = await form_fields(request)
+    moment = utc_now()
+    target = _account_or_none(store, user_id)
+    if target is None:
+        return object_gone_response()
+    wanted = fields.get(FIELD_ROLE, "").strip()
+    role_before = target.role
+    admins_left = store.active_admin_count(except_user_id=target.id)
+    try:
+        ensure_role_change_keeps_admin(target, to_role=wanted, active_admins_left=admins_left)
+        changed = change_role(target, to_role=wanted)
+    except LastAdministratorError as exc:
+        # Порядок `except` принципиален: `LastAdministratorError` является `AccountStateError`, и
+        # иначе человек получил бы общее «состояние не позволяет» вместо объяснения про последнего
+        # администратора (тот же довод, что у `_close_access`).
+        log.info("account_last_admin_guard", user_id=str(target.id), detail=str(exc))
+        return _redirect("refused_last_admin")
+    except RoleOutsideDomainError as exc:
+        log.info(
+            "account_role_value_rejected",
+            user_id=str(target.id),
+            admin_id=str(principal.session.user_id),
+        )
+        return _render_section(
+            request,
+            principal,
+            store,
+            detail=str(exc),
+            status_code=400,
+            moment=moment,
+        )
+    except AccountStateError as exc:
+        log.info("account_role_change_refused", user_id=str(target.id), detail=str(exc))
+        return _redirect("refused_role_state")
+
+    if not changed:
+        # Отдельной строки журнала нет: §8.7 заводит `account.role_changed` на изменение роли, а
+        # здесь изменения не было — заполнять журнал тем, что не случилось, означало бы обесценить
+        # его как доказательство.
+        log.info(
+            "account_role_unchanged",
+            user_id=str(target.id),
+            admin_id=str(principal.session.user_id),
+        )
+        return _redirect("role_same")
+
+    store.append_audit(
+        action="account.role_changed",
+        at=moment,
+        actor=principal.session.user_id,
+        entity="user",
+        entity_id=target.id,
+        details={"from": role_before, "to": target.role, "state": target.state},
+    )
+    store.commit()
+    log.info(
+        "account_role_changed",
+        user_id=str(target.id),
+        role_from=role_before,
+        role_to=target.role,
+        admin_id=str(principal.session.user_id),
+    )
+    return _redirect("role_changed")

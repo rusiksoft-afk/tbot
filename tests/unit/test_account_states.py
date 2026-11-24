@@ -28,6 +28,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from packages.identity.authorization import RoleOutsideDomainError
 from packages.identity.users import (
     ACCESS_CODES,
     CLOSED_STATES,
@@ -44,11 +45,13 @@ from packages.identity.users import (
     LoginLockedError,
     approve_account,
     archive_account,
+    change_role,
     ensure_account_state,
     ensure_console_access,
     ensure_login_allowed,
     ensure_login_syntax,
     ensure_not_last_admin,
+    ensure_role_change_keeps_admin,
     login_closed_reason,
     move_account_state,
     new_user,
@@ -494,3 +497,115 @@ def test_отрицательный_счёт_ошибка_вызывающего
     account.role = "admin"
     with pytest.raises(ValueError, match="отрицательным"):
         ensure_not_last_admin(account, active_admins_left=-1)
+
+
+# ─── смена роли (§8.7 «изменение … роли», §9.3 п. 6; срез `R4` задачи `T-109`) ──────────────
+
+
+def test_роль_меняется_через_домен_и_возвращает_было_ли_изменение() -> None:
+    """`change_role` — единственная точка правки `users.role`; возврат отвечает на «было ли
+    изменение»: `True` при новой роли и `False`, если значение совпало с текущим (§8.7 заводит
+    `account.role_changed` на изменение, а не на попытку)."""
+    account = _account("active")
+    assert account.role == "operator"
+    assert change_role(account, to_role="admin") is True
+    assert account.role == "admin"
+    assert change_role(account, to_role="admin") is False, (
+        "та же роль не обязана считаться изменением: событие о том, чего не случилось, обесценивает "
+        "журнал как доказательство"
+    )
+    assert account.role == "admin"
+
+
+def test_роль_вне_закрытого_набора_отклоняется_без_правок() -> None:
+    """Значение проверяется `ensure_role`: `Admin`, `ADMIN ` и `boss` (§1.1: ровно три роли) —
+    отказ здесь, а не в `INSERT`: база держит тот же набор `CHECK`-ограничением `ck_users_role`
+    (ревизия `0002`), и второго источника правды о том, что такое роль, быть не должно."""
+    for значение in ("Admin", "ADMIN", "boss", ""):
+        account = _account("active")
+        with pytest.raises(RoleOutsideDomainError):
+            change_role(account, to_role=значение)
+        assert account.role == "operator", f"значение {значение!r} всё-таки записано"
+
+
+def test_архивированной_записи_роль_не_меняется() -> None:
+    """`archived` терминально (§1.2): менять роль мёртвой записи — значит записать в журнал
+    изменение, которое ни на что не влияет; отказ — исключение, а не тихое «ничего не сделали»."""
+    account = _account("archived")
+    with pytest.raises(AccountStateError, match="терминально"):
+        change_role(account, to_role="admin")
+    assert account.role == "operator"
+
+
+@pytest.mark.parametrize("state", ["invited", "awaiting_approval", "active", "suspended"])
+def test_роль_меняется_у_любой_живой_записи(state: str) -> None:
+    """Роль выбирается в приглашении (`ADR-020` п. 1) и правится до одобрения: без этого ошибка
+    роли при выпуске исправлялась бы только переспуском приглашения и новой ссылкой (§1.2).
+
+    `suspended` меняется намеренно: блокировка закрывает доступ состоянием, и роль при этом не
+    часть допуска; оставить заблокированной записи роль, которую администратор назначит позже,
+    значило бы запрещать решение, которое §9.3 п. 6 не запрещает.
+    """
+    account = _account(state)
+    assert change_role(account, to_role="admin") is True
+    assert account.role == "admin"
+    assert account.state == state, "смена роли не имеет права трогать состояние"
+
+
+def test_смена_роли_не_трогает_историю_одобрения() -> None:
+    """`approved_by`/`approved_at` отвечают на вопрос «кто одобрил доступ» (§4.1), а не «какая у
+    записи роль сейчас»: правка роли не имеет права стирать или подменять автора одобрения."""
+    approver = uuid4()
+    account = _account("active")
+    account.approved_by = approver
+    account.approved_at = NOW
+    change_role(account, to_role="admin")
+    assert account.approved_by == approver
+    assert account.approved_at == NOW
+
+
+def test_страж_смотрит_на_будущую_роль_и_не_трогает_запись() -> None:
+    """Порядок стража — до правки, и это не стиль, а правило (§8.7, `ADR-020` п. 6).
+
+    Понижение единственного живого администратора оставило бы систему без того, кто способен
+    включить её обратно. `ensure_not_last_admin` смотрит на **текущую** роль, поэтому вызванный
+    после `change_role` он молчит: роль уже не `admin` → ранний возврат. Проверка показывает обе
+    половины: страж по будущей роли отказывает, а «проверить после правки» — проходит, то есть
+    был бы дырой. Сам страж при этом ничего не меняет: решение принимает обработчик, а не проверка.
+    """
+    account = _account("active")
+    account.role = "admin"
+    with pytest.raises(LastAdministratorError):
+        ensure_role_change_keeps_admin(account, to_role="operator", active_admins_left=0)
+    assert account.role == "admin", "страж изменил запись, хотя решение не принято"
+
+    change_role(account, to_role="operator")
+    ensure_not_last_admin(account, active_admins_left=0)  # так проверка уже ничего не ловит
+
+
+def test_страж_не_мешает_повышению_сохранению_и_второму_администратору() -> None:
+    """Живых администраторов убавляет только понижение: повышение, оставление роли `admin` и
+    понижение при втором живом администраторе проходят не глядя на счёт — отказать зря так же
+    плохо, как пропустить случай, ради которого проверка заведена."""
+    promoted = _account("awaiting_approval")
+    ensure_role_change_keeps_admin(promoted, to_role="admin", active_admins_left=0)
+
+    same = _account("active")
+    same.role = "admin"
+    ensure_role_change_keeps_admin(same, to_role="admin", active_admins_left=0)
+
+    demoted = _account("active")
+    demoted.role = "admin"
+    ensure_role_change_keeps_admin(demoted, to_role="viewer", active_admins_left=1)
+
+
+def test_страж_роли_тоже_ловится_базовым_классом() -> None:
+    """`LastAdministratorError` остаётся подклассом `AccountStateError` и для смены роли:
+    обработчик, который ловит только базовый класс, тоже удержит отказ — потерять можно только
+    причину, но не сам отказ."""
+    account = _account("active")
+    account.role = "admin"
+    with pytest.raises(AccountStateError):
+        ensure_role_change_keeps_admin(account, to_role="viewer", active_admins_left=0)
+    with pytest.raises(RoleOutsideDomainError):
+        ensure_role_change_keeps_admin(account, to_role="суперuser", active_admins_left=0)

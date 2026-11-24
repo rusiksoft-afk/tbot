@@ -75,6 +75,7 @@ from apps.web.routes.admin_users import (
     ACTION_SUSPEND,
     ACTION_UNSUSPEND,
     ADMIN_ACCOUNT_APPROVE_PATH,
+    ADMIN_ACCOUNT_ROLE_PATH,
     ADMIN_ACCOUNT_SUSPEND_PATH,
     ADMIN_ACCOUNT_UNSUSPEND_PATH,
     ADMIN_INVITATION_REVOKE_PATH,
@@ -768,6 +769,87 @@ def test_блокировка_и_разблокировка_пишут_пере�
         "сеансы, закрытые блокировкой, не плодят отдельные строки: реестр §8.7 даёт на такое "
         "решение одно имя"
     )
+
+
+# ─── смена роли (§9.3 п. 6, §8.7 «изменение … роли»; срез `R4` задачи `T-109`) ────────────────
+
+
+def test_смена_роли_пишет_одну_строку_с_парой_ролей_и_не_трогает_сеансы(
+    store: MemoryStore, settings: Settings, kek: Path
+) -> None:
+    """`account.role_changed`: пара ролей, состояние цели, ровно одна строка, сеансы живые.
+
+    Значения в деталях — **роли**, а не подписи: журнал читают и при разборе, и из дампов
+    (`ADR-002`), и подписи для человека (§1.1 «наблюдатель») в нём были бы вторым источником правды
+    о том, что такое роль. Состояние цели в деталях держится намеренно: то же действие над
+    ожидающей записью и над одобренной — разные решения, и без состояния разбор не отличил бы их.
+
+    `session.revoke` здесь нет ни одной строки — это проверяется именно потому, что рядом стоит
+    блокировка, которая сеансы закрывает и пишет `sessions_revoked` в деталях. Роль читается из
+    репозитория на каждый охраняемый запрос (`ADR-017` п. 7), поэтому понижение видно следующему же
+    запросу, и отдельный отзыв был бы вторым решением там, где его не принимали (§8.3 требует
+    немедленного отзыва для блокировки и архивирования, не для смены роли).
+
+    Отказ формы (роль вне набора §1.1) и «значение совпало с текущим» строк журнала не дают: §8.7
+    заводит это имя на **изменение** роли, и писать событие о том, чего не случилось, — значит
+    обесценить журнал как доказательство.
+    """
+    admin = _администратор(store, settings, kek)
+    admin_row = store.user_by_login(ADMIN_LOGIN)
+    assert admin_row is not None, "администратор не заведён"
+    assert admin_row.id is not None, "у администратора нет идентификатора"
+    цель = _завести(store, TARGET_LOGIN, role=INVITED_ROLE, state="active")
+    assert цель.id is not None
+    _выпустить_сеанс(store, цель.id, device="ноутбук-цели")
+    url = ADMIN_ACCOUNT_ROLE_PATH.format(**{USER_ID_PARAM: str(цель.id)})
+
+    мимо = _мутация(admin, url, {FIELD_ROLE: "supерuser"}, token_path=ADMIN_USERS_PATH)
+    assert мимо.status_code == 400, f"роль вне набора: {мимо.status_code}, {мимо.text[:300]}"
+    assert цель.role == INVITED_ROLE, "отказ формы изменил роль"
+    assert (
+        _сколько(store, "account.role_changed") == 0
+    ), "отказ формы не обязан писать событие: роли не изменились"
+
+    то_же = _мутация(admin, url, {FIELD_ROLE: INVITED_ROLE}, token_path=ADMIN_USERS_PATH)
+    assert то_же.status_code in (302, 303), то_же.text[:300]
+    assert "note=role_same" in то_же.headers.get("location", ""), то_же.headers
+    assert (
+        _сколько(store, "account.role_changed") == 0
+    ), "«значение то же» не должно порождать строку: события об изменении не было"
+
+    повышение = _мутация(admin, url, {FIELD_ROLE: "admin"}, token_path=ADMIN_USERS_PATH)
+    assert повышение.status_code in (302, 303), повышение.text[:300]
+    assert "note=role_changed" in повышение.headers.get("location", ""), повышение.headers
+    assert цель.role == "admin", "роль не применена к объекту"
+    строки = _события(store, "account.role_changed")
+    assert len(строки) == 1, "одна мутация — ровно одна строка события"
+    запись = строки[0]
+    assert запись.actor == admin_row.id, "субъект — администратор, а не автор учётной записи"
+    assert запись.entity == "user", "объект события — учётная запись"
+    assert запись.entity_id == _текст(цель.id), "цель обязана быть различима без деталей"
+    assert _детали(запись) == {
+        "from": INVITED_ROLE,
+        "to": "admin",
+        "state": "active",
+    }, "роли в деталях — значения, а не подписи для человека"
+
+    понизили = _мутация(admin, url, {FIELD_ROLE: INVITED_ROLE}, token_path=ADMIN_USERS_PATH)
+    assert понизили.status_code in (302, 303), понизили.text[:300]
+    строки = _события(store, "account.role_changed")
+    assert len(строки) == 2, "две мутации — ровно две строки: ни удвоения, ни потери"
+    assert _детали(строки[1]) == {"from": "admin", "to": INVITED_ROLE, "state": "active"}
+
+    assert _сколько(store, "session.revoke") == 0, (
+        "смена роли сеансы не закрывает: роль проверяется на каждом следующем запросе "
+        "(ADR-017 п. 7), отдельного требования §8.3 здесь нет"
+    )
+    живой = store.user_sessions(цель.id, not_expired_before=FROZEN)
+    assert len(живой) == 1, (
+        "живой сеанс цели обязан пережить оба действия: отзыв при смене роли был бы вторым "
+        "решением, которого администратор не принимал (§8.3 требует немедленного отзыва при "
+        "блокировке и архивировании, для смены роли такого требования нет)"
+    )
+    _цепочка(store)
 
 
 # ─── 2FA и резервные коды (§8.2, `ADR-013`, `ADR-015`, `ADR-016`) ─────────────────────────────

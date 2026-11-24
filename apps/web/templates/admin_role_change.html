@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{# Окно смены роли учётной записи (§9.3 п. 6 «смена роли», §8.7 «изменение … роли»).
+
+   Отдельный шаблон, а не `admin_confirm.html`: у подтверждения без выбора нет поля значения, и
+   подтверждение, которое не показывает, какой именно ролью человек подтверждает запись, не называет
+   следствия (§9.1 требует называть объект и следствие). Список значений подготовлен обработчиком:
+   разметка не знает закрытый набор ролей §1.1 и не ведёт счёт живых администраторов — иначе второй
+   источник правды о правах появился бы в шаблонах.
+
+   `GET` ничего не меняет: изменение делает только `POST` со скрытым полем токена (§8.3, `ADR-008`).
+   Кнопки нет, когда действие невозможно (архивированная запись, §1.2): показывать подтверждение
+   действия, которое сервер заведомо отвергнет, — значит заставлять человека делать то, чего система
+   не сделает. #}
+{% block content %}
+<h1>{{ page_title }}</h1>
+<p role="alert">{{ warning }}</p>
+{% for hint in hints %}
+<p role="alert">{{ hint }}</p>
+{% endfor %}
+<table>
+  <caption>{{ object_kind }}, которой меняют роль</caption>
+  <tbody>
+    <tr>
+      <th scope="row">Кому</th>
+      <td>{{ object_label }}</td>
+    </tr>
+    <tr>
+      <th scope="row">Сейчас</th>
+      <td>{{ object_state }}</td>
+    </tr>
+  </tbody>
+</table>
+{% if change_allowed %}
+<form method="post" action="{{ action_url }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p>
+    <label for="role_new">Новая роль</label>
+    <select id="role_new" name="{{ field_role }}">
+      {% for value, label, is_current in roles %}
+      <option value="{{ value }}"{% if is_current %} selected{% endif %}>{{ label }}{% if is_current %} — текущая{% endif %}</option>
+      {% endfor %}
+    </select>
+  </p>
+  <p><button type="submit">Назначить выбранную роль</button></p>
+</form>
+{% else %}
+<p role="alert">{{ archived_hint }}</p>
+{% endif %}
+<p><a href="{{ cancel_url }}">Отменить и вернуться к списку</a></p>
+{% endblock %}

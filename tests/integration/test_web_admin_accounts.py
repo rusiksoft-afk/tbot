@@ -36,6 +36,7 @@ from apps.web.routes.admin_users import (
     ACTION_NOTES,
     ADMIN_ACCOUNT_APPROVE_PATH,
     ADMIN_ACCOUNT_ARCHIVE_PATH,
+    ADMIN_ACCOUNT_ROLE_PATH,
     ADMIN_ACCOUNT_SUSPEND_PATH,
     ADMIN_ACCOUNT_UNSUSPEND_PATH,
     ADMIN_INVITATION_REVOKE_PATH,
@@ -48,6 +49,11 @@ from apps.web.routes.admin_users import (
     FIELD_ROLE,
     NOTE_QUERY,
     REVOKE_WARNING,
+    ROLE_ARCHIVED_HINT,
+    ROLE_LABELS,
+    ROLE_LAST_ADMIN_HINT,
+    ROLE_SELF_WARNING,
+    ROLE_WARNING,
     STATE_LABELS,
     SUSPEND_WARNING,
 )
@@ -62,6 +68,7 @@ from apps.web.security.authorization import (
 )
 from apps.web.security.csrf import CSRF_FORM_FIELD
 from apps.web.security.sessions import (
+    CONSOLE_PATH,
     INVITE_LINK_KEY,
     INVITE_PATH,
     LOGIN_PATH,
@@ -767,3 +774,204 @@ def test_собственная_запись_предупреждает_что_�
     assert (
         "собственная учётная запись" not in чужая_страница.text
     ), "предупреждение о собственной записи показано для чужой учётной записи"
+
+
+# ─── смена роли (§9.3 п. 6, §8.7 «изменение … роли»; срез `R4` задачи `T-109`) ────────────────
+
+#: Отдельная архивированная запись: §1.2 делает состояние терминальным, и роль такой записи —
+#: часть её прошлой истории. Окно обязано это показать, а не дать подтвердить действие, которое
+#: сервер заведомо отвергнет.
+ARCHIVED_LOGIN: Final = "op.archived-r4"
+
+
+def _форма_роли(страница: Response, user_id: UUID) -> int:
+    """Есть ли на странице форма смены именно этой записи.
+
+    Считать нужно форму, а не слово «роль»: колонка роли есть в списке раздела всегда, и
+    проверка «кнопки нет» по тексту провалилась бы на собственном списке.
+    """
+    return страница.text.count(f'action="{ADMIN_ACCOUNT_ROLE_PATH.format(user_id=user_id)}"')
+
+
+def test_окно_роли_называет_объект_а_POST_без_токена_роль_не_меняет(
+    admin_client: TestClient, accounts: dict[str, User]
+) -> None:
+    """Страница смены роли: объект, текущее значение, три значения выбора, следствие (§9.1).
+
+    Окно отличается от общей страницы подтверждения (`admin_confirm.html`) полем выбора: без него
+    подтверждение не называет, **какой** ролью человек подтверждает запись, а именно новое значение
+    и есть следствие (§9.1). Текущее значение помечено и выбрано по умолчанию: «оставить как было» —
+    осмысленный ответ формы, и обработчик отвечает на него объяснением, а не молчанием.
+
+    `POST` без токена формы отклоняется до всякого перехода и роль не меняет: страница раздела и
+    окно смены роли стоят под одной охраной CSRF (`ADR-008`).
+    """
+    цель = accounts["target"]
+    url = ADMIN_ACCOUNT_ROLE_PATH.format(user_id=цель.id)
+
+    страница = admin_client.get(url, headers=_заголовки(ADMIN_ADDRESS))
+    assert страница.status_code == 200, страница.text[:400]
+    assert ROLE_WARNING in страница.text, страница.text[:400]
+    assert цель.login in страница.text, "окно не называет объект"
+    assert f"роль {ROLE_LABELS[цель.role]}" in страница.text, страница.text[:400]
+    for role in ("viewer", "operator", "admin"):
+        assert f'value="{role}"' in страница.text, f"в выборе нет роли {role} (§1.1: ровно три)"
+    assert f'<option value="{цель.role}" selected>' in страница.text, страница.text[:400]
+    assert _форма_роли(страница, цель.id) == 1
+    роль_до = цель.role
+
+    отказ = _мутация(admin_client, url, "")
+    assert отказ.status_code == 403, отказ.text[:300]
+    assert отказ.json()["status"] == "forbidden", отказ.text[:300]
+    assert цель.role == роль_до, "POST без токена формы изменил роль"
+    assert str(цель.id) not in отказ.text, "безликий отказ CSRF назвал id объекта (§8.8)"
+
+
+def test_повышение_и_понижение_не_отзывают_живые_сеансы_цели(
+    admin_client: TestClient, store: MemoryStore, accounts: dict[str, User]
+) -> None:
+    """Смена роли применяет новое значение и не трогает сеансы цели (§8.7, `ADR-017` п. 7).
+
+    Сеанс цели жив и после понижения — это проверяется здесь именно потому, что блокировка и
+    архивирование в этом же разделе сеансы закрывают (`ADR-020` п. 6). Различие принципиальное:
+    роль читается из репозитория на каждый охраняемый запрос, поэтому понижённый человек теряет
+    права следующим же запросом, и отдельный отзыв был бы вторым решением, которого администратор
+    не принимал (§8.3 требует немедленного отзыва для блокировки и архивирования, про смену роли
+    требования нет).
+    """
+    цель = accounts["target"]
+    сеанс = _сеанс(store, цель.id, device="ноутбук-цели")
+    url = ADMIN_ACCOUNT_ROLE_PATH.format(user_id=цель.id)
+    токен = _токен(admin_client)
+
+    вверх = _мутация(admin_client, url, токен, data={FIELD_ROLE: "admin"})
+    assert вверх.status_code in (302, 303), вверх.text[:300]
+    assert _заметка(вверх) == "role_changed"
+    assert цель.role == "admin", "роль не применена к объекту"
+    assert сеанс.record.revoked_at is None, "смена роли отозвала сеанс цели"
+
+    вниз = _мутация(admin_client, url, токен, data={FIELD_ROLE: OPERATOR_ROLE})
+    assert вниз.status_code in (302, 303), вниз.text[:300]
+    assert _заметка(вниз) == "role_changed"
+    assert цель.role == OPERATOR_ROLE
+    assert сеанс.record.revoked_at is None, (
+        "понижение обязана оставлять сеанс живым: права снимает проверка роли на следующем "
+        "запросе, а не отзыв (`ADR-017` п. 7)"
+    )
+
+
+def test_единственный_живой_администратор_понижен_не_будет(
+    admin_client: TestClient, accounts: dict[str, User]
+) -> None:
+    """Понизить единственного живого администратора нельзя и предупреждение видно до `POST`.
+
+    Фикстура держит второго администратора в `awaiting_approval`: счёт живых администраторов
+    считает только `active` (`ADR-020` п. 6), поэтому прав «кому включить систему обратно» такая
+    строка не даёт и отказ обязан сработать.
+
+    Проверяются оба конца: подсказка на окне (отказ предсказуем до действия — человек экономит
+    попытку) и сам отказ с сохранением роли. Порядок стража принципиален: он смотрит на **будущую**
+    роль до правки, иначе после `change_role` проверка не увидела бы понижения (§8.7).
+    """
+    единственный = accounts["admin"]
+    url = ADMIN_ACCOUNT_ROLE_PATH.format(user_id=единственный.id)
+
+    страница = admin_client.get(url, headers=_заголовки(ADMIN_ADDRESS))
+    assert страница.status_code == 200, страница.text[:400]
+    assert ROLE_LAST_ADMIN_HINT in страница.text, страница.text[:400]
+    assert ROLE_SELF_WARNING in страница.text, "окно своей записи не предупреждает о потере доступа"
+
+    ответ = _мутация(admin_client, url, _токен(admin_client), data={FIELD_ROLE: OPERATOR_ROLE})
+    assert ответ.status_code in (302, 303), ответ.text[:300]
+    assert _заметка(ответ) == "refused_last_admin"
+    assert единственный.role == "admin", "отказ изменил роль"
+
+    # Та же запись: повысить другую запись и оставить администратором себя — можно; страж
+    # отсекает только понижение единственного живого администратора.
+    оставление = _мутация(admin_client, url, _токен(admin_client), data={FIELD_ROLE: "admin"})
+    assert _заметка(оставление) == "role_same", "та же роль обязана объясняться, а не отказом"
+    assert единственный.role == "admin"
+
+
+def test_архивированной_записи_формы_нет_а_POST_отказывается(
+    admin_client: TestClient, store: MemoryStore
+) -> None:
+    """Архивная запись остаётся видимой, но роль не меняется: формы нет, `POST` объясняет (§1.2).
+
+    Две половины нужны обе. Страница обязана существовать и объяснять (§4.1: архивная строка
+    видна всегда, и прятать её — значит потерять историю), а формы подтверждения быть не должно:
+    показывать действие, которое сервер заведомо отвергнет, — значит заставлять человека
+    подтверждать то, чего система не сделает. `POST` при этом проверяется намеренно: адрес можно
+    послать и без формы, и отказ обязан остаться отказом, а не исполненной правкой.
+    """
+    archived = _учётка(store, ARCHIVED_LOGIN, role=OPERATOR_ROLE, state="archived")
+    url = ADMIN_ACCOUNT_ROLE_PATH.format(user_id=archived.id)
+
+    страница = admin_client.get(url, headers=_заголовки(ADMIN_ADDRESS))
+    assert страница.status_code == 200, страница.text[:400]
+    assert ROLE_ARCHIVED_HINT in страница.text, страница.text[:400]
+    assert f"роль {ROLE_LABELS[archived.role]}" in страница.text, страница.text[:400]
+    assert _форма_роли(страница, archived.id) == 0, "архивной записи дана форма смены роли"
+
+    ответ = _мутация(admin_client, url, _токен(admin_client), data={FIELD_ROLE: "admin"})
+    assert ответ.status_code in (302, 303), ответ.text[:300]
+    assert _заметка(ответ) == "refused_role_state"
+    assert archived.role == OPERATOR_ROLE, "архивированной записи роль всё-таки изменили"
+
+
+def test_значение_роли_вне_набора_отвергается_без_изменений(
+    admin_client: TestClient, accounts: dict[str, User]
+) -> None:
+    """Роль вне закрытого набора §1.1 — ошибка поля: `400` с формулировкой домена, роль та же.
+
+    Отказ формы отличается от отказа допуска: первый отвечает той же страницей раздела с `400` (как
+    выпуск приглашения), второй — перенаправлением с кодом объяснения. Смешать их означало бы
+    показать человеку «в системе нет администраторов» там, где он просто опечатался в значении,
+    и наоборот — выдать причину отказа допуска как текст поля.
+    """
+    цель = accounts["target"]
+    url = ADMIN_ACCOUNT_ROLE_PATH.format(user_id=цель.id)
+    роль_до = цель.role
+
+    for значение in ("ADMIN", "boss", ""):
+        ответ = _мутация(admin_client, url, _токен(admin_client), data={FIELD_ROLE: значение})
+        assert ответ.status_code == 400, f"{значение!r}: {ответ.status_code}, {ответ.text[:300]}"
+        assert цель.role == роль_до, f"значение {значение!r} изменило роль"
+
+    # Значение вне набора не просачивается в разметку как есть без объяснения домена: страница
+    # раздела показывает формулировку `ensure_role`, а не эхо поля.
+    ответ = _мутация(admin_client, url, _токен(admin_client), data={FIELD_ROLE: "boss"})
+    assert "закрытого набора" in ответ.text, ответ.text[:400]
+
+
+def test_понижая_себя_администратор_теряет_доступ_к_разделу(
+    admin_client: TestClient, store: MemoryStore, accounts: dict[str, User]
+) -> None:
+    """Понизить себя можно, если в системе есть второй живой администратор; доступ закрывается.
+
+    Порядок действий в тесте и есть проверка: сначала второму живому администратору открывается
+    доступ (`active`), и только потом собственное понижение проходит. Без второго живого
+    администратора сработал бы страж, и проверка показала бы отказ вместо снятия прав.
+
+    Следствие проверяется следующим запросом: раздел требует роли `admin` (`ADR-017` п. 7 читает
+    роль из репозитория на каждый запрос), и сеанс при этом остаётся живым — доступ закрывает
+    проверка роли, а не отзыв. Это и есть отличие смены роли от блокировки.
+    """
+    своя = accounts["admin"]
+    второй = accounts["second"]
+    второй.state = "active"
+    store.commit()
+
+    url = ADMIN_ACCOUNT_ROLE_PATH.format(user_id=своя.id)
+    ответ = _мутация(admin_client, url, _токен(admin_client), data={FIELD_ROLE: OPERATOR_ROLE})
+    assert ответ.status_code in (302, 303), ответ.text[:300]
+    assert _заметка(ответ) == "role_changed"
+    assert своя.role == OPERATOR_ROLE
+
+    закрытие = admin_client.get(ADMIN_USERS_PATH, headers=_заголовки(ADMIN_ADDRESS))
+    assert закрытие.status_code == 403, "раздел администрирования остался доступен пониженому"
+    консоль = admin_client.get(CONSOLE_PATH, headers=_заголовки(ADMIN_ADDRESS))
+    assert консоль.status_code == 200, (
+        "понижение до `operator` обязано оставить доступ к консоли: роль снимается по лестнице "
+        "§1.1, а не целиком"
+    )

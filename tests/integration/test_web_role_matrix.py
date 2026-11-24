@@ -45,6 +45,7 @@ from httpx import Response
 from apps.web.routes.admin_users import (
     ADMIN_ACCOUNT_APPROVE_PATH,
     ADMIN_ACCOUNT_ARCHIVE_PATH,
+    ADMIN_ACCOUNT_ROLE_PATH,
     ADMIN_ACCOUNT_SUSPEND_PATH,
     ADMIN_ACCOUNT_UNSUSPEND_PATH,
     ADMIN_INVITATION_REVOKE_PATH,
@@ -308,6 +309,20 @@ ROUTE_POLICY: Final[dict[tuple[str, str], Policy]] = {
         frozenset({404}),
         "архивирование: тот же порядок закрытия доступа, что у блокировки, и отсутствие "
         "обратного перехода; в матрице — несуществующий `id`",
+    ),
+    (ADMIN_ACCOUNT_ROLE_PATH, "GET"): Policy(
+        TIER_ADMIN,
+        frozenset({404}),
+        "окно смены роли: `GET` ничего не меняет (§9.1); страница показывает выбор значений, "
+        "поэтому она отдельная, а не общая страница подтверждения; в матрице — несуществующий `id`",
+    ),
+    (ADMIN_ACCOUNT_ROLE_PATH, "POST"): Policy(
+        TIER_ADMIN,
+        frozenset({404}),
+        "смена роли (§9.3 п. 6): правка поля вместо перехода состояния, но тот же счёт живых "
+        "администраторов до правки и тот же страж последнего администратора, только по будущей "
+        "роли (§8.7, `ADR-020` п. 6); живые сеансы цели не отзываются — роль читается на каждый "
+        "охраняемый запрос (`ADR-017` п. 7); в матрице — несуществующий `id`",
     ),
     (INVITE_PATH, "GET"): Policy(
         TIER_CEREMONY,
