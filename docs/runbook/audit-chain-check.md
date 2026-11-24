@@ -53,18 +53,21 @@
 Порт health'а процесса `jobs` — `9103` (`TBOT_JOBS_HEALTH_PORT`), слушатель внутри контейнера
 (`127.0.0.1`), наружу он не публикуется: наружу выходит только TLS-край `caddy`.
 
-## 3. Временный порядок, пока `jobs` на площадке не поднят (`T-714`)
+## 3. Ручной прогон: разовая проверка и разбор инцидента (`T-109`, `R3.1`)
 
-На живой ВМ поднимались `postgres`, `web`, `migrate` и `caddy`; `jobs`, `engine` и `tgbot` — нет
-(приёмка `docs/acceptance/prod-deploy-t112-first-account.md`). Значит ежедневная задача там ещё не
-идёт, и остаток дня без проверки закрывается ручной командой из того же кода разбора:
+С 2026-11-24 процесс `jobs` на живой ВМ **поднят** (протокол
+`docs/acceptance/prod-deploy-jobs-integrity.md`): суточный регламент `integrity-check` исполняет
+задача, строки `integrity.audit_chain` лежат в журнале, и отдельная периодическая команда площадки
+не нужна. Ручная команда из того же кода разбора остаётся тремя способами проверки: разовая
+сверка после деплоя или после подозрения на подделку, разбор копию дампа и ограниченный интервал
+`id`.
 
 ```bash
 # /opt/tbot — 750 root:root: форма — sudo и абсолютные пути (замер 2026-11-23, протокол
 # docs/acceptance/prod-deploy-t112-first-account.md §7). Вывод compose run в неинтерактивном
 # канале теряется: он пишется в файл, код берётся из $?
 COMPOSE="sudo docker compose -f /opt/tbot/deploy/compose.yaml -f /opt/tbot/deploy/compose.prod.yaml --env-file /opt/tbot/deploy/tbot.prod.env"
-cd /opt/tbot && sudo git -C /opt/tbot -c core.sshCommand="ssh -i /root/.ssh/tbot_deploy_key_20261122 -o IdentitiesOnly=yes" pull --ff-only
+sudo git -C /opt/tbot -c core.sshCommand="ssh -i /root/.ssh/tbot_deploy_key_20261122 -o IdentitiesOnly=yes" pull --ff-only
 $COMPOSE run --rm -v /opt/tbot/scripts:/srv/tbot/scripts:ro web python3 scripts/audit_verify.py \
   < /dev/null > /tmp/audit-verify.txt 2>&1; rc=$?; cat /tmp/audit-verify.txt; echo "rc=$rc"; sudo rm -f /tmp/audit-verify.txt
 ```
@@ -76,9 +79,7 @@ $COMPOSE run --rm -v /opt/tbot/scripts:/srv/tbot/scripts:ro web python3 scripts/
 
 Три вещи про временный порядок:
 
-* **периодичность выбирает оператор.** Агент на площадке планировщик не заводит: `cron`-запись или
-  systemd-таймер — действие на боевой машине, оно отдельное решение (`ADR-003`). Ориентир §8.7 —
-  не реже одного раза в сутки;
+* **периодичность штатной проверки — сутки, её задаёт процесс** (`ADR-026` п. 3): после подъёма `jobs` отдельного планировщика на ВМ не требуется, а `cron`-запись или systemd-таймер для *ручных* прогонов — действие на боевой машине и отдельное решение (`ADR-003`). Ориентир §8.7 — не реже одного раза в сутки;
 * **ручной прогон ничего не пишет в журнал** (`ADR-025` п. 7): строку `integrity.audit_chain`
   создаёт только задача `jobs`. Двойных строк и расхождения счётчиков между ручным и автоматическим
   прогоном не появляется — разбор один и тот же (`packages/storage/audit_store.py`), меняются только
