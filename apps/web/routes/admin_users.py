@@ -79,13 +79,15 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from apps.web.forms import FIELD_LOGIN, form_fields
 from apps.web.routes.sessions import FullMutation
+from apps.web.routes.totp import FIELD_CODE, confirm_second_factor
 from apps.web.security.authorization import (
     enforce_role,
     object_gone_response,
     require_admin_role,
 )
 from apps.web.security.csrf import csrf_context
-from apps.web.security.sessions import Principal, StoreDep, invite_link
+from apps.web.security.keys import request_key_ring
+from apps.web.security.sessions import Principal, StoreDep, invite_link, session_ip
 from apps.web.store import ACCOUNTS_LIST_LIMIT, Store
 from packages.common.clock import to_msk, utc_now
 from packages.common.logging import get_logger
@@ -104,6 +106,7 @@ from packages.identity.invitations import (
     revocation_outcome,
 )
 from packages.identity.sessions import revoke_sessions
+from packages.identity.totp_enrollment import revoke_enrollment
 from packages.identity.users import (
     AccountStateError,
     LastAdministratorError,
@@ -116,7 +119,7 @@ from packages.identity.users import (
     suspend_account,
     unsuspend_account,
 )
-from packages.storage.models import Invitation, User
+from packages.storage.models import Invitation, TotpEnrollment, User
 
 log = get_logger("web")
 
@@ -154,6 +157,12 @@ ADMIN_ACCOUNT_ARCHIVE_PATH: Final = f"{ADMIN_USERS_PATH}/{{{USER_ID_PARAM}}}/arc
 #: значений, а не общий `admin_confirm.html`: у того нет поля выбора, и подтверждение, которое не
 #: показывает, какой именно ролью человек подтверждает запись, не называет следствия (§9.1).
 ADMIN_ACCOUNT_ROLE_PATH: Final = f"{ADMIN_USERS_PATH}/{{{USER_ID_PARAM}}}/role"
+
+#: Сброс второго фактора администратором (§9.3 п. 6 «сброс 2FA», §8.1 случай «без второго фактора
+#: восстановления по почте»). Маршрут живёт в этом разделе, а машина кода — в `routes/totp.py`:
+#: проверять код обязаны одним и тем же порядком (расход шага, лента `totp_failures`, окно адреса,
+#: строка `totp.verify_failed`), и второй копии этого порядка в разделе не должно быть.
+ADMIN_ACCOUNT_TOTP_RESET_PATH: Final = f"{ADMIN_USERS_PATH}/{{{USER_ID_PARAM}}}/totp-reset"
 
 #: Имена действий: они же — сегменты адресов выше, они же — ключи выбора доменного действия, они
 #: же — код действия в деталях `audit_log` (§8.7). Один список на все употребления, иначе адрес,
@@ -296,6 +305,18 @@ ACTION_NOTES: Final[dict[str, str]] = {
     "refused_role_state": (
         "Роль не изменена: архивированная запись роль не меняет — состояние терминально (§1.2)."
     ),
+    "totp_reset": (
+        "Второй фактор сброшен: живые сеансы учётной записи отозваны, неиспользованные резервные "
+        "коды аннулированы, при следующем входе привязку нужно пройти заново (§8.1, §9.3 п. 6)."
+    ),
+    "refused_no_totp": (
+        "Сброс не выполнен: у учётной записи нет активной привязки — сбрасывать нечего. Список "
+        "ниже показывает актуальное состояние."
+    ),
+    "refused_totp_state": (
+        "Сброс не выполнен: архивированная запись вход не откроет, живых сеансов и резервных кодов "
+        "у неё нет (§1.2), а событие о том, что ни на что не влияет, размывает журнал (§8.7)."
+    ),
 }
 
 #: Метки состояний учётной записи для человека (§9.1). Значения держит домен §4.1; метка вне
@@ -366,6 +387,55 @@ ROLE_ARCHIVED_HINT: Final = (
     "записать в журнал изменение, которое ни на что не влияет."
 )
 
+# ─── сброс второго фактора: подписи и предупреждения (§9.3 п. 6, §8.1) ─────────────────────
+
+#: Подписи состояния привязки цели (§9.1: страница объясняет состояние). Различать «подтверждён» и
+#: «начата, но не подтверждена» нужно потому, что у этих состояний разные носители: у
+#: неподтверждённой привязки нет ни второго фактора входа, ни пачки резервных кодов, и сброс такой
+#: привязки — не «удаление действующего фактора» (§8.7), а снятие незавершённой попытки.
+TOTP_BOUND_LABEL: Final = "второй фактор подтверждён"
+TOTP_PENDING_LABEL: Final = "привязка начата, но не подтверждена"
+TOTP_NONE_LABEL: Final = "привязки нет"
+
+#: Последствие сброса, названное до подтверждения (§9.3 п. 6 «с предупреждением», §9.1). Сеансы и
+#: резервные коды закрываются вместе с привязкой намеренно: и то, и другое выдано тем же вторым
+#: фактором (`ADR-016` п. 6 аннулирует остатки пачки при перевыпуске привязки), и оставить их
+#: означало бы, что после сброса в консоль по-прежнему пускает либо украденная кука, либо код из
+#: старой пачки — то есть второй фактор, который администратор только что снял.
+TOTP_RESET_WARNING: Final = (
+    "Сброс закрывает второй фактор учётной записи. Её живые сеансы отзываются, неиспользованные "
+    "резервные коды аннулируются, а при следующем входе привязку нужно пройти заново (§8.1)."
+)
+
+#: Требование кода администратора (§8.1: «сброс администратора требует TOTP администратора», §9.3
+#: п. 6: «с TOTP администратора»). Полный шаг сеанса его не заменяет: шаг доказывает, что код
+#: ввели когда-то при входе, а код на этой странице доказывает, что устройство разблокировки в
+#: руках ровно в момент опасного действия.
+TOTP_RESET_CODE_NOTE: Final = (
+    "Действие требует код вашего второго фактора: без него сброс не исполняется (§8.1, §9.3 п. 6). "
+    "Неудачная попытка движет ту же ленту неудач, что и вход (§8.2)."
+)
+
+#: Собственная запись: сброс своей привязки допустим (раздел не запрещает), но он закрывает и
+#: собственный вход. Тот же порядок, что у самоблокировки в `ADR-020` п. 6: запрет не правило, а
+#: предупреждение о последствиях.
+TOTP_RESET_SELF_WARNING: Final = (
+    "Это ваша собственная учётная запись: после сброса будут отозваны и ваши сеансы, а следующий "
+    "вход потребует привязать генератор заново."
+)
+
+#: Почему у записи без привязки кнопки нет: §8.7 называет «отзыв 2FA» удалением действующего
+#: фактора, а не строкой «попробовали снять то, чего нет».
+TOTP_NOT_BOUND_HINT: Final = (
+    "У учётной записи нет активной привязки: сбрасывать нечего. Незавершённую привязку отменяет её "
+    "владелец — раздел показывает актуальное состояние."
+)
+
+TOTP_ARCHIVED_HINT: Final = (
+    "Архивированной записи второй фактор не сбрасывают: вход закрыт состоянием (§1.2), живых "
+    "сеансов у неё нет, а событие о действии без последствий размывает журнал (§8.7)."
+)
+
 # ─── строки списков ────────────────────────────────────────────────────────────────────────────
 
 
@@ -391,6 +461,7 @@ class AccountRow:
     unsuspend_url: str
     archive_url: str
     role_url: str
+    totp_reset_url: str
 
 
 @dataclass(frozen=True)
@@ -452,6 +523,7 @@ def _account_row(principal: Principal, account: User) -> AccountRow:
         unsuspend_url=f"{ADMIN_USERS_PATH}/{identifier}/unsuspend",
         archive_url=f"{ADMIN_USERS_PATH}/{identifier}/archive",
         role_url=f"{ADMIN_USERS_PATH}/{identifier}/role",
+        totp_reset_url=f"{ADMIN_USERS_PATH}/{identifier}/totp-reset",
     )
 
 
@@ -1202,3 +1274,174 @@ async def role_submit(
         admin_id=str(principal.session.user_id),
     )
     return _redirect("role_changed")
+
+
+# ─── сброс второго фактора администратором (§9.3 п. 6 «сброс 2FA», §8.1, §8.7 «отзыв 2FA») ────
+
+#: Стадия неудачной попытки кода для журнала (§8.7 «неудачные попытки 2FA»). Рядом со стадиями
+#: `login_code` и `enrollment_confirm` из `routes/totp.py` значение нужно затем, чтобы разбор
+#: отличал перебор кода входа от перебора кода на опасном админском действии: субъекты разные —
+#: код вводит администратор, а не владелец записи.
+TOTP_RESET_STAGE: Final = "admin_totp_reset"
+
+
+def _totp_state_label(enrollment: TotpEnrollment | None) -> str:
+    """Подпись состояния привязки цели: подтверждена, начата или её нет (§9.1)."""
+    if enrollment is None:
+        return TOTP_NONE_LABEL
+    if enrollment.confirmed_at is None:
+        return TOTP_PENDING_LABEL
+    return TOTP_BOUND_LABEL
+
+
+def _render_totp_reset(
+    request: Request,
+    principal: Principal,
+    target: User,
+    enrollment: TotpEnrollment | None,
+    *,
+    detail: str = "",
+    status_code: int = 200,
+) -> HTMLResponse:
+    """Страница сброса: объект, состояние привязки, следствия и поле кода администратора.
+
+    Поле кода — не «дополнительная предосторожность»: §8.1 («сброс администратора требует TOTP
+    администратора») и §9.3 п. 6 («с TOTP администратора и предупреждением») требуют код, и
+    страница обязана сказать это до действия, а не после отказа. Кнопки нет, когда действие
+    невозможно (архив, привязки нет): показывать подтверждение действия, которое сервер заведомо
+    отвергнет, — тот же дефект, что у страницы смены роли.
+    """
+    hints = [TOTP_RESET_WARNING, TOTP_RESET_CODE_NOTE]
+    if _is_self(target, principal):
+        hints.append(TOTP_RESET_SELF_WARNING)
+    if target.state == "archived":
+        hints.append(TOTP_ARCHIVED_HINT)
+    if enrollment is None:
+        hints.append(TOTP_NOT_BOUND_HINT)
+    context = {
+        "page_title": "Сбросить второй фактор",
+        "object_kind": "учётная запись",
+        "object_label": target.login,
+        "object_state": _state_label(target.state),
+        "totp_state": _totp_state_label(enrollment),
+        "hints": hints,
+        "detail": detail,
+        "field_code": FIELD_CODE,
+        "change_allowed": target.state != "archived" and enrollment is not None,
+        "action_url": f"{ADMIN_USERS_PATH}/{target.id}/totp-reset",
+        "cancel_url": ADMIN_USERS_PATH,
+    } | csrf_context(principal)
+    response: HTMLResponse = request.app.state.templates.TemplateResponse(
+        request, "admin_totp_reset.html", context, status_code=status_code
+    )
+    return response
+
+
+@router.get(ADMIN_ACCOUNT_TOTP_RESET_PATH, response_class=HTMLResponse)
+def totp_reset_confirm(
+    request: Request, user_id: str, principal: AdminSession, store: StoreDep
+) -> Response:
+    """Показать страницу сброса второго фактора (§9.1: объект, следствие, требуемый код)."""
+    target = _account_or_none(store, user_id)
+    if target is None:
+        return object_gone_response()
+    return _render_totp_reset(request, principal, target, store.active_enrollment(target.id))
+
+
+@router.post(ADMIN_ACCOUNT_TOTP_RESET_PATH, response_class=Response)
+async def totp_reset_submit(
+    request: Request, user_id: str, principal: AdminMutation, store: StoreDep
+) -> Response:
+    """Сбросить второй фактор учётной записи (§9.3 п. 6, §8.1, §8.7 «отзыв 2FA»).
+
+    Порядок и его основания:
+
+    1. **«Есть ли что сбрасывать» — до кода администратора.** Иначе система сжигала бы шаг второго
+       фактора (а при неверном коде — двигала бы ленту `totp_failures`) на действии, которое не
+       будет исполнено, и отказ по состоянию был бы неотличим от отказа по коду (§9.1 требует
+       объяснять причину). Обоих проверяющих хватает после цепочки допуска: роль `admin` и шаг
+       `full` проверены зависимостями, поэтому сведения о привязке не видны постороннему.
+    2. **Код администратора** — `confirm_second_factor` из `routes/totp.py`: тот же расход шага
+       (`ADR-013`), та же лента неудач и окно адреса, та же строка `totp.verify_failed` той же
+       фиксацией (`ADR-025` п. 6). Второй копии этого порядка в разделе нет намеренно.
+    3. **Отзыв привязки → отзыв живых сеансов → аннулирование неиспользованных резервных кодов →
+       строка `totp.revoked` → один `commit()`.** Сеансы и коды закрываются вместе с привязкой,
+       потому что и то, и другое выдано тем же вторым фактором: оставить их — значит позволить
+       чужой куке или коду из старой пачки войти без фактора, который администратор только что
+       снял (§8.2 «политика `mfa_required=true`, отключить нельзя», `ADR-016` п. 6 аннулирует
+       остатки пачки при перевыпуске привязки). Один `commit()` на всё: «привязка снята, а сеансы
+       живы» — ровно то полуисполненное решение, которого журнал потом не объяснит.
+    4. **Порядок «сначала цель, потом код, потом мутация»** отличается от `_close_access` только
+       проверяемым свойством: там счёт администраторов берётся до перехода, здесь код берётся после
+       проверки состояния цели, потому что неверный код не имеет права испортить ни ленту, ни
+       привязку.
+
+    Отдельных `session.revoke` на каждую закрытую строку нет (`ADR-025` п. 6): реестр §8.7 даёт на
+    такое решение одно имя `totp.revoked`, а число закрытых строк уходит в детали — ровно как у
+    `account.state_changed`.
+    """
+    fields = await form_fields(request)
+    moment = utc_now()
+    target = _account_or_none(store, user_id)
+    if target is None:
+        return object_gone_response()
+
+    if target.state == "archived":
+        return _redirect("refused_totp_state")
+    enrollment = store.active_enrollment(target.id)
+    if enrollment is None:
+        return _redirect("refused_no_totp")
+
+    actor = store.user_of_id(principal.session.user_id)
+    if actor is None:
+        # Строка администратора есть всегда: §4.1 не удаляет записи, а сеанс живёт ровно столько,
+        # сколько его учётная запись. Отсутствующая строка — испорченные данные, и отвечать на них
+        # исполнением действия нельзя.
+        return object_gone_response()
+
+    denial = confirm_second_factor(
+        store,
+        actor,
+        session_ip(request),
+        fields.get(FIELD_CODE, ""),
+        ring=request_key_ring(request),
+        moment=moment,
+        audit_stage=TOTP_RESET_STAGE,
+        render=lambda detail, code: _render_totp_reset(
+            request, principal, target, enrollment, detail=detail, status_code=code
+        ),
+        denied=lambda detail, _until, _reason: _render_totp_reset(
+            request, principal, target, enrollment, detail=detail, status_code=403
+        ),
+    )
+    if denial is not None:
+        return denial
+
+    confirmed = enrollment.confirmed_at is not None
+    revoke_enrollment(enrollment, now=moment)
+    revoked = revoke_sessions(store.user_sessions(target.id, not_expired_before=moment), now=moment)
+    codes_invalidated = store.invalidate_unused_backup_codes(target.id)
+    store.append_audit(
+        action="totp.revoked",
+        at=moment,
+        actor=principal.session.user_id,
+        entity="user",
+        entity_id=target.id,
+        details={
+            "reason": "admin_reset",
+            "enrollment_id": str(enrollment.id),
+            "confirmed": confirmed,
+            "sessions_revoked": len(revoked),
+            "backup_codes_invalidated": codes_invalidated,
+        },
+    )
+    store.commit()
+    log.info(
+        "totp_reset_by_admin",
+        target=str(target.id),
+        admin_id=str(principal.session.user_id),
+        enrollment_id=str(enrollment.id),
+        sessions_revoked=len(revoked),
+        backup_codes_invalidated=codes_invalidated,
+    )
+    return _redirect("totp_reset")

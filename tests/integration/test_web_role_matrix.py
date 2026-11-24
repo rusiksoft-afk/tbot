@@ -47,6 +47,7 @@ from apps.web.routes.admin_users import (
     ADMIN_ACCOUNT_ARCHIVE_PATH,
     ADMIN_ACCOUNT_ROLE_PATH,
     ADMIN_ACCOUNT_SUSPEND_PATH,
+    ADMIN_ACCOUNT_TOTP_RESET_PATH,
     ADMIN_ACCOUNT_UNSUSPEND_PATH,
     ADMIN_INVITATION_REVOKE_PATH,
     ADMIN_INVITATIONS_PATH,
@@ -323,6 +324,21 @@ ROUTE_POLICY: Final[dict[tuple[str, str], Policy]] = {
         "администраторов до правки и тот же страж последнего администратора, только по будущей "
         "роли (§8.7, `ADR-020` п. 6); живые сеансы цели не отзываются — роль читается на каждый "
         "охраняемый запрос (`ADR-017` п. 7); в матрице — несуществующий `id`",
+    ),
+    (ADMIN_ACCOUNT_TOTP_RESET_PATH, "GET"): Policy(
+        TIER_ADMIN,
+        frozenset({404}),
+        "страница сброса второго фактора: `GET` ничего не меняет (§9.1), показывает состояние "
+        "привязки цели и требует код администратора (§8.1, §9.3 п. 6); в матрице — несуществующий "
+        "`id`",
+    ),
+    (ADMIN_ACCOUNT_TOTP_RESET_PATH, "POST"): Policy(
+        TIER_ADMIN,
+        frozenset({404}),
+        "сброс 2FA администратором (§9.3 п. 6, §8.1 случай «без восстановления по почте»): цепочка "
+        "допуска та же, плюс обязательный код второго фактора администратора; вместе с привязкой "
+        "отзываются живые сеансы цели и аннулируются неиспользованные резервные коды (§8.2, "
+        "`ADR-016` п. 6); в матрице — несуществующий `id`",
     ),
     (INVITE_PATH, "GET"): Policy(
         TIER_CEREMONY,

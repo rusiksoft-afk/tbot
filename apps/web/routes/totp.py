@@ -140,6 +140,7 @@ from apps.web.security.sessions import (
 )
 from apps.web.store import Store
 from packages.common.clock import utc_now
+from packages.common.crypto import KeyRing
 from packages.common.logging import get_logger
 from packages.identity.backup_codes import (
     BACKUP_CODE_LENGTH,
@@ -244,6 +245,14 @@ MAX_BACKUP_CODE_CHARS: Final = 32
 CODE_FAILURE_DETAIL: Final = "Код не подходит. Возьмите новый код из следующего окна."
 
 EMPTY_CODE_DETAIL: Final = "Нужно ввести шестизначный код из генератора."
+
+#: Отдельный текст для случая «второго фактора у записи нет»: он не похож на неудачную попытку
+#: кода (§8.2 считает попытки **кода**: «5 неудачных кодов подряд»), и смешать их означало бы
+#: двигать ленту `totp_failures` там, где попытки не было.
+NO_CONFIRMED_ENROLLMENT_DETAIL: Final = (
+    "У вашей учётной записи нет подтверждённого второго фактора: действие требует код "
+    "администратора (§8.1, §9.3 п. 6)."
+)
 
 #: Правило блокировки — без счётчика попыток (§9.3 п. 2: «счётчик попыток не показывается, но
 #: блокировка объясняется»). Текст описывает правило, а не текущее состояние: «осталось N попыток»
@@ -704,6 +713,69 @@ def _rejection_answer(
     if banned is not None:
         return denied(_address_explanation(banned), banned, LOCK_REASON_RATE)
     return render(failure_detail, 401)
+
+
+def confirm_second_factor(
+    store: Store,
+    user: User,
+    address: str | None,
+    code: str,
+    *,
+    ring: KeyRing,
+    moment: datetime,
+    audit_stage: str,
+    render: Callable[[str, int], HTMLResponse],
+    denied: Callable[[str, datetime, str], HTMLResponse],
+    failure_detail: str = CODE_FAILURE_DETAIL,
+) -> Response | None:
+    """Код второго фактора для опасного действия: `None` — код пройден, иначе — готовый отказ.
+
+    Нужен там, где действие требует владения вторым фактором **здесь и сейчас**, а не в момент
+    входа: §8.1 («сброс администратора требует TOTP администратора») и §9.3 п. 6 («сброс 2FA …
+    с TOTP администратора и предупреждением»). Полный шаг сеанса этого не заменяет: код доказывает,
+    что устройство разблокировки в руках ровно в момент действия, а не что-то было введено полчаса
+    назад; сеанс к тому же может остаться разблокированным на чужом столе.
+
+    Возврат готового ответа, а не кода причины: отказ обязан нести ленту `totp_failures`, окно
+    адреса и строку `totp.verify_failed` той же фиксацией, а вся последовательность уже собрана в
+    `_rejection_answer` — второй копии решения «принят код или нет» здесь нет: проверка та же
+    `verify_enrollment_code` с атомарным `claim` шага (`ADR-013`), поэтому и повторный код не
+    пройдёт здесь тоже.
+
+    «Подтверждённой привязки нет» отвечает `403` и ленту не двигает: лента считает попытки кода
+    (§8.2), а попытки не было — за записью нечего закрывать. Порядок внутри тот же, что у страницы
+    кода: пустое поле — `400`, чужой/просроченный/израсходованный код — один отказ (`§8.8`).
+    """
+    enrollment = store.active_enrollment(user.id)
+    if enrollment is None or enrollment.confirmed_at is None:
+        return render(NO_CONFIRMED_ENROLLMENT_DETAIL, 403)
+    value = code.strip()
+    if not value:
+        return render(EMPTY_CODE_DETAIL, 400)
+
+    def claim(step: int) -> bool:
+        """Занять шаг кода в той же транзакции запроса (`ADR-013`)."""
+        return store.claim_totp_step(enrollment.id, step=step)
+
+    result = verify_enrollment_code(enrollment, value, ring=ring, now=moment, claim=claim)
+    if result.status == "accepted":
+        return None
+    log.warning(
+        "second_factor_code_rejected",
+        stage=audit_stage,
+        reason=result.status,
+        user_id=str(user.id),
+    )
+    return _rejection_answer(
+        store,
+        user,
+        address,
+        moment=moment,
+        audit_stage=audit_stage,
+        render=render,
+        denied=denied,
+        failure_detail=failure_detail,
+    )
 
 
 @router.get(TOTP_CODE_PATH, response_class=HTMLResponse)

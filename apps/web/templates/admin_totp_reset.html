@@ -1,0 +1,51 @@
+{% extends "base.html" %}
+{# Страница сброса второго фактора администратором (§9.3 п. 6 «сброс 2FA», §8.1 «сброс
+   администратором требует TOTP администратора», §8.7 «отзыв 2FA»).
+
+   Три вещи, которые страница обязана сделать до действия (§9.1 «объяснение состояния»,
+   §9.3 п. 6 «с предупреждением): назвать объект, назвать следствие (сеансы, резервные коды,
+   повторная привязка) и назвать требуемый код администратора. Поле кода — не украшение: §8.1
+   требует TOTP администратора именно для сброса, а полный шаг сеанса этого не доказывает (код
+   ввели при входе, а не сейчас).
+
+   `GET` ничего не меняет: изменение делает только `POST` со скрытым полем токена (§8.3,
+   `ADR-008`). Кнопки нет, когда действие невозможно (архивная запись, привязки нет): подтверждать
+   действие, которое сервер заведомо отвергнет, — тот же дефект, что у страницы смены роли. #}
+{% block content %}
+<h1>{{ page_title }}</h1>
+{% if detail %}
+<p role="alert">{{ detail }}</p>
+{% endif %}
+{% for hint in hints %}
+<p role="alert">{{ hint }}</p>
+{% endfor %}
+<table>
+  <caption>{{ object_kind }}, которой сбрасывают второй фактор</caption>
+  <tbody>
+    <tr>
+      <th scope="row">Кому</th>
+      <td>{{ object_label }}</td>
+    </tr>
+    <tr>
+      <th scope="row">Состояние</th>
+      <td>{{ object_state }}</td>
+    </tr>
+    <tr>
+      <th scope="row">Второй фактор</th>
+      <td>{{ totp_state }}</td>
+    </tr>
+  </tbody>
+</table>
+{% if change_allowed %}
+<form method="post" action="{{ action_url }}">
+  <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+  <p>
+    <label for="admin_totp_code">Код вашего второго фактора</label>
+    <input id="admin_totp_code" name="{{ field_code }}" type="text" inputmode="numeric"
+           autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required>
+  </p>
+  <p><button type="submit">Сбросить второй фактор</button></p>
+</form>
+{% endif %}
+<p><a href="{{ cancel_url }}">Отменить и вернуться к списку</a></p>
+{% endblock %}
