@@ -415,19 +415,31 @@ def test_решение_не_ссылается_на_несуществующу�
     assert used is not None, "запрос максимального идентификатора не вернул строку"
     absent_id = int(used[0])
 
+    # Ключ на этой вставке обязателен, и это не придирка, а замер CI `45373614300`: `CHECK`
+    # (`ck_web_audit_outbox_notify_has_dedup_key`) исполняется раньше внешнего ключа, поэтому
+    # `notify` без ключа отвечает `23514`, и проверка `23503` просто не наступила бы — пал бы не
+    # тот контроль, а сама проверка ссылки исчезла бы молча.
+    broken_link_key = f"{GROUND_LOGIN}:{user_id}:{'a' * 32}"
+
     with pytest.raises(IntegrityError) as captured:
-        _insert_raw(session, audit_id=absent_id, user_id=user_id, marker=marker)
+        _insert_raw(
+            session,
+            audit_id=absent_id,
+            user_id=user_id,
+            dedup_key=broken_link_key,
+            marker=marker,
+        )
     assert _sqlstate(captured.value) == SQLSTATE_FOREIGN_KEY_VIOLATION, (
         f"ожидался отказ внешнего ключа ({SQLSTATE_FOREIGN_KEY_VIOLATION}), получено "
         f"{_sqlstate(captured.value)}: {captured.value}"
     )
     session.rollback()
 
-    key = f"{GROUND_LOGIN}:{user_id}:{'f' * 32}"
+    writer_key = f"{GROUND_LOGIN}:{user_id}:{'f' * 32}"
     with pytest.raises(NotifyAuditLinkError):
         append_notify_decision(
             session,
-            decision=_decision(marker, user_id=user_id, dedup_key=key),
+            decision=_decision(marker, user_id=user_id, dedup_key=writer_key),
             audit_id=absent_id,
             at=utc_now(),
         )
@@ -498,8 +510,13 @@ def test_ограничения_базы_отклоняют_значения_в�
 
     Проверка параметризована ровно потому, что разные ограничения дают один и тот же код `23514`:
     если бы в файле прав или в ревизии пропало одно из них, общая проверка «база ругается» осталась
-    бы зелёной. Отдельно держится «`notify` без ключа»: без него страж повтора нечего проверяет, и
+    бы зелёной. Отдельно держится «`notify` без ключа»: без него стражу повтора нечего проверять, и
     база обязана не принимать такое решение, даже если приложение его не производит.
+
+    Порядок отказа заметен и сам по себе (замер CI `45373614300`): строка, которая нарушает и
+    `CHECK`, и ссылку на журнал, отвечает `23514`, а не `23503`. Значит, проверка внешнего ключа
+    обязана давать корректный остальной набор полей — иначе вместо ожидаемого отказа ссылки
+    приходит отказ домена, и проверка ссылки превращается в проверку `CHECK`.
     """
     marker = _marker()
     user_id = _probe_user(session, marker)
